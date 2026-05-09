@@ -37,7 +37,7 @@ class HistoricalAnalogRetriever:
                     evidence_id="evidence_no_template",
                     evidence_type="template",
                     title="未匹配到历史事件模板",
-                    content="MVP 未为该输入匹配到可审计的历史事件窗口，因此不会基于模板生成收益区间。",
+                    content="系统未为该输入匹配到可审计的历史事件窗口，因此不会基于模板生成收益区间。",
                     confidence=0.8,
                     source_uri="local://scenario_engine/templates.py",
                 )
@@ -58,8 +58,27 @@ class HistoricalAnalogRetriever:
                 symbol_evidence_ids=symbol_evidence_ids,
             )
 
+        as_of = pd.Timestamp(spec.as_of_date)
         for idx, (start_date, end_date, title) in enumerate(template["historical_windows"], start=1):
             evidence_id = f"evidence_template_window_{idx}"
+            if pd.Timestamp(end_date) > as_of:
+                evidences.append(
+                    Evidence(
+                        evidence_id=evidence_id,
+                        evidence_type="historical_window",
+                        title=title,
+                        content=(
+                            f"{title} 的窗口结束日 {end_date} 晚于基准日期 {spec.as_of_date}，"
+                            "为避免未来数据泄露，未用于本次量化。"
+                        ),
+                        confidence=0.9,
+                        source_uri="local://scenario_engine/templates.py",
+                        start_date=start_date,
+                        end_date=end_date,
+                        metrics={"skipped": True, "reason": "window_end_after_as_of_date"},
+                    )
+                )
+                continue
             available_count = 0
             window_metrics = {}
             for position in portfolio.positions:

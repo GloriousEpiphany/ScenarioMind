@@ -99,7 +99,7 @@ class ScenarioSimulator:
                     bull_return_range=bull_range,
                     bear_return_range=bear_range,
                     expected_contribution_range=contribution_range,
-                    key_drivers=key_drivers or ["缺少可审计数据，MVP 不量化该持仓影响"],
+                    key_drivers=key_drivers or ["缺少可审计数据，系统不量化该持仓影响"],
                     hedge_candidates=[],
                     evidence_ids=sorted(set(evidence_ids)),
                     confidence=confidence,

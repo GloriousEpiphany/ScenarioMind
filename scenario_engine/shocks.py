@@ -21,7 +21,7 @@ class ShockMapper:
             if shock.factor in self.QUANTIFIABLE_FACTORS:
                 status[shock.factor] = "quantifiable"
                 continue
-            reason = self.FACTOR_REQUIREMENTS.get(shock.factor, "当前 MVP 没有该冲击因子的本地可审计代理数据。")
+            reason = self.FACTOR_REQUIREMENTS.get(shock.factor, "当前版本没有该冲击因子的本地可审计代理数据。")
             status[shock.factor] = "not_quantified"
             evidences.append(
                 Evidence(

@@ -66,6 +66,55 @@ class ScenarioDataProvider:
             return None
         return {"date": row[0], "close": float(row[1])}
 
+    def get_first_price_after(self, symbol: str, after_date: str) -> Optional[dict]:
+        conn = self.db.connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT date, close
+            FROM stock_daily
+            WHERE symbol = ? AND date > ?
+            ORDER BY date ASC
+            LIMIT 1
+            """,
+            (symbol, after_date),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {"date": row[0], "close": float(row[1])}
+
+    def get_nth_price_after(self, symbol: str, after_date: str, trading_days: int) -> Optional[dict]:
+        if trading_days <= 0:
+            return self.get_latest_price_on_or_before(symbol, after_date)
+        conn = self.db.connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT date, close
+            FROM stock_daily
+            WHERE symbol = ? AND date > ?
+            ORDER BY date ASC
+            LIMIT 1 OFFSET ?
+            """,
+            (symbol, after_date, trading_days - 1),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {"date": row[0], "close": float(row[1])}
+
+    def get_forward_return(self, symbol: str, as_of_date: str, trading_days: int) -> Optional[dict]:
+        start = self.get_latest_price_on_or_before(symbol, as_of_date)
+        end = self.get_nth_price_after(symbol, as_of_date, trading_days)
+        if not start or not end or start["close"] <= 0:
+            return None
+        return {
+            "start_date": start["date"],
+            "end_date": end["date"],
+            "return": (end["close"] / start["close"]) - 1.0,
+        }
+
     def get_available_stock_symbols(self, limit: int = 500) -> list[str]:
         conn = self.db.connect()
         cursor = conn.cursor()

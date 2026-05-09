@@ -1,4 +1,4 @@
-"""JSON Schema contracts for Scenario Lab MVP.
+"""JSON Schema contracts for Scenario Lab.
 
 These schemas are intentionally hand-written to avoid adding a runtime
 dependency. They are used by tests and can be exported by callers that need a
@@ -111,7 +111,7 @@ def get_scenario_report_schema() -> dict:
 
 
 def validate_required_contract(data: dict, schema: dict, path: str = "$") -> list[str]:
-    """Validate the subset of JSON Schema used by the MVP contracts.
+    """Validate the subset of JSON Schema used by the project contracts.
 
     This is not a full JSON Schema implementation. It enforces required fields,
     object/array shape, enum values, and simple numeric bounds so the project

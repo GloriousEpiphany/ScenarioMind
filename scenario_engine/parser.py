@@ -1,4 +1,4 @@
-"""Deterministic scenario parser for the MVP."""
+"""Deterministic scenario parser."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from .templates import DEFAULT_MISSING, SCENARIO_TEMPLATES
 class ScenarioParser:
     """Rule-based parser.
 
-    The MVP deliberately avoids pretending to understand every financial event.
+    The parser deliberately avoids pretending to understand every financial event.
     Unknown details are surfaced as missing information instead of being filled
     with fabricated values.
     """

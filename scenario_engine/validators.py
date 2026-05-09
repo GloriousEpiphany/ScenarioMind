@@ -21,6 +21,11 @@ class ScenarioValidator:
             if impact.quantification_status == "not_quantified" and impact.base_return_range is not None:
                 issues.append(f"{impact.symbol} is marked not_quantified but has numeric range")
 
+        for path in report.paths:
+            for evidence_id in path.evidence_ids:
+                if evidence_id not in known_evidence_ids:
+                    issues.append(f"{path.path_id} references missing evidence id: {evidence_id}")
+
         if report.portfolio_total_impact.get("base_range") is not None:
             if report.portfolio_total_impact.get("quantified_position_weight", 0) <= 0:
                 issues.append("portfolio total impact has range but no quantified weight")

@@ -7,6 +7,7 @@ import pandas as pd
 from scenario_engine import ScenarioEngine, get_scenario_report_schema, get_scenario_spec_schema
 from scenario_engine.parser import ScenarioParser
 from scenario_engine.templates import SCENARIO_TEMPLATES
+from Agents_Experience.core.scenario_tools import ScenarioTools
 from src.stock_app.database import Database
 
 
@@ -311,6 +312,308 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 )
         finally:
             engine.close()
+
+    def test_template_windows_after_as_of_are_not_used(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果疫情冲击，我的持仓会怎样？",
+                as_of_date="2019-12-31",
+                symbols=["000001", "600519"],
+                weights=[0.5, 0.5],
+            )
+        finally:
+            engine.close()
+        skipped = [
+            evidence for evidence in report.evidence
+            if evidence.metrics.get("reason") == "window_end_after_as_of_date"
+        ]
+        self.assertTrue(skipped)
+        self.assertIn("为避免未来数据泄露", skipped[0].content)
+
+    def test_reverse_stress_finds_market_shock_candidate(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            report = engine.reverse_stress(
+                loss_threshold=0.05,
+                as_of_date="2020-03-20",
+                symbols=["000001", "600519"],
+                weights=[0.6, 0.4],
+                mode="standard",
+            )
+        finally:
+            engine.close()
+        self.assertTrue(report.candidates)
+        self.assertLessEqual(report.candidates[0].estimated_portfolio_impact[0], -0.05)
+        conn = self.db.connect()
+        row = conn.execute(
+            "SELECT reverse_stress_id FROM scenario_reverse_stress WHERE reverse_stress_id = ?",
+            (report.reverse_stress_id,),
+        ).fetchone()
+        self.assertEqual(row[0], report.reverse_stress_id)
+
+    def test_rebalance_compare_reports_downside_delta(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            comparison = engine.compare_rebalance_plan(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                current_symbols=["000001", "600519"],
+                current_weights=[1.0, 0.0],
+                proposed_symbols=["000001", "600519"],
+                proposed_weights=[0.0, 1.0],
+            )
+        finally:
+            engine.close()
+        self.assertEqual(comparison.delta["status"], "comparable")
+        self.assertIsNotNone(comparison.delta["low_delta"])
+        self.assertIn("What-If 调仓比较报告", comparison.markdown)
+        conn = self.db.connect()
+        row = conn.execute(
+            "SELECT comparison_id FROM scenario_rebalance_comparisons WHERE comparison_id = ?",
+            (comparison.comparison_id,),
+        ).fetchone()
+        self.assertEqual(row[0], comparison.comparison_id)
+
+    def test_backtest_template_persists_walk_forward_metrics(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            report = engine.backtest_template(
+                template_name="中美贸易摩擦升级",
+                start_date="2020-01-02",
+                end_date="2020-02-28",
+                horizon="1w",
+                symbols=["000001", "600519"],
+                max_observations=3,
+            )
+        finally:
+            engine.close()
+        self.assertEqual(report.metrics["observation_count"], 3)
+        self.assertIn("hit_rate", report.metrics)
+        self.assertIn("Walk-Forward 回测报告", report.markdown)
+        conn = self.db.connect()
+        row = conn.execute(
+            "SELECT backtest_id FROM scenario_backtests WHERE backtest_id = ?",
+            (report.backtest_id,),
+        ).fetchone()
+        self.assertEqual(row[0], report.backtest_id)
+
+    def test_agent_review_is_recorded_in_report_audit(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+        finally:
+            engine.close()
+        reviewers = {item["reviewer"] for item in report.audit["agent_review"]}
+        self.assertIn("Critic Agent", reviewers)
+        self.assertIn("Bull Agent", reviewers)
+        self.assertIn("Policy Agent", reviewers)
+        self.assertIn("Report Agent", reviewers)
+        self.assertIn("AGENT_REVIEW_READY", report.audit["state_trace"])
+        self.assertIn("## 多角色审查", report.markdown)
+
+    def test_agent_scenario_tools_expose_audited_engine_results(self):
+        tools = ScenarioTools(db_path=self.db_path, persist=False)
+        try:
+            parsed = tools.parse_scenario("如果沪深300下跌5%，我的持仓会怎样？", "2020-03-20")
+            self.assertEqual(parsed["shocks"][0]["factor"], "market_index")
+            result = tools.simulate_factor_shocks(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+        finally:
+            tools.close()
+        self.assertEqual(result["audit"]["validation_status"], "passed")
+        self.assertIn("agent_review", result["audit"])
+
+    def test_batch_backtest_runs_all_builtin_templates_and_persists(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            report = engine.backtest_all_templates(
+                start_date="2020-01-02",
+                end_date="2020-01-02",
+                horizon="1w",
+                symbols=["000001", "600519"],
+                max_observations_per_template=1,
+            )
+        finally:
+            engine.close()
+        self.assertEqual(report.metrics["template_count"], len(SCENARIO_TEMPLATES))
+        self.assertGreaterEqual(report.metrics["template_count"], 10)
+        self.assertEqual(len(report.reports), len(SCENARIO_TEMPLATES))
+        conn = self.db.connect()
+        row = conn.execute(
+            "SELECT batch_id FROM scenario_backtest_batches WHERE batch_id = ?",
+            (report.batch_id,),
+        ).fetchone()
+        self.assertEqual(row[0], report.batch_id)
+
+    def test_scenario_memory_and_replay_are_persisted(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            report = engine.run(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001", "600519"],
+                weights=[0.5, 0.5],
+            )
+            replay = engine.replay_scenario(report.scenario_id, "2020-04-10")
+        finally:
+            engine.close()
+        self.assertEqual(replay.scenario_id, report.scenario_id)
+        self.assertIsNotNone(replay.memory_record)
+        conn = self.db.connect()
+        memory_count = conn.execute(
+            "SELECT COUNT(*) FROM scenario_memory WHERE scenario_id = ?",
+            (report.scenario_id,),
+        ).fetchone()[0]
+        self.assertGreaterEqual(memory_count, 2)
+        lesson_count = conn.execute(
+            "SELECT COUNT(*) FROM scenario_trade_lessons WHERE scenario_id = ?",
+            (report.scenario_id,),
+        ).fetchone()[0]
+        self.assertGreaterEqual(lesson_count, 1)
+
+    def test_user_operation_requires_confirmation_and_creates_memory(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            report = engine.run(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+            with self.assertRaises(ValueError):
+                engine.record_user_operation(
+                    scenario_id=report.scenario_id,
+                    operation_date="2020-03-23",
+                    operation_type="reduce",
+                    symbol="000001",
+                    weight_before=1.0,
+                    weight_after=0.5,
+                    rationale="用户决定降低情景风险敞口",
+                    user_confirmed=False,
+                )
+            record = engine.record_user_operation(
+                scenario_id=report.scenario_id,
+                operation_date="2020-03-23",
+                operation_type="reduce",
+                symbol="000001",
+                weight_before=1.0,
+                weight_after=0.5,
+                rationale="用户决定降低情景风险敞口",
+                user_confirmed=True,
+            )
+        finally:
+            engine.close()
+        self.assertEqual(record.operation_type, "reduce")
+        conn = self.db.connect()
+        op_count = conn.execute(
+            "SELECT COUNT(*) FROM scenario_user_operations WHERE scenario_id = ?",
+            (report.scenario_id,),
+        ).fetchone()[0]
+        memory_count = conn.execute(
+            "SELECT COUNT(*) FROM scenario_memory WHERE scenario_id = ? AND memory_type = 'user_operation'",
+            (report.scenario_id,),
+        ).fetchone()[0]
+        self.assertEqual(op_count, 1)
+        self.assertEqual(memory_count, 1)
+
+    def test_workflow_checkpoints_are_durable_and_confirmable(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+            conn = self.db.connect()
+            row = conn.execute(
+                """
+                SELECT checkpoint_id, requires_human_confirmation, confirmed
+                FROM scenario_workflow_checkpoints
+                WHERE scenario_id = ? AND state = 'PARSED'
+                """,
+                (report.scenario_id,),
+            ).fetchone()
+            confirmed = engine.confirm_checkpoint(row[0])
+        finally:
+            engine.close()
+        self.assertEqual(row[1], 1)
+        self.assertEqual(row[2], 0)
+        self.assertTrue(confirmed.confirmed)
+
+    def test_agent_tool_save_scenario_report_persists_validated_report_only(self):
+        tools = ScenarioTools(db_path=self.db_path, persist=True)
+        try:
+            report = tools.simulate_factor_shocks(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+            saved = tools.save_scenario_report(report)
+            with self.assertRaises(ValueError):
+                tools.save_scenario_report({"scenario_id": "fake", "audit": {"validation_status": "failed"}})
+        finally:
+            tools.close()
+        self.assertEqual(saved["status"], "saved")
+        conn = self.db.connect()
+        row = conn.execute(
+            "SELECT scenario_id FROM scenario_tool_saved_reports WHERE scenario_id = ?",
+            (report["scenario_id"],),
+        ).fetchone()
+        self.assertEqual(row[0], report["scenario_id"])
+
+    def test_agent_tools_record_user_operation_and_confirm_checkpoint(self):
+        tools = ScenarioTools(db_path=self.db_path, persist=True)
+        try:
+            report = tools.simulate_factor_shocks(
+                user_query="如果央行降息25bp，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+            conn = self.db.connect()
+            checkpoint_id = conn.execute(
+                "SELECT checkpoint_id FROM scenario_workflow_checkpoints WHERE scenario_id = ? AND state = 'PARSED'",
+                (report["scenario_id"],),
+            ).fetchone()[0]
+            confirmed = tools.confirm_checkpoint(checkpoint_id)
+            operation = tools.record_user_operation(
+                scenario_id=report["scenario_id"],
+                operation_date="2020-03-23",
+                operation_type="watch",
+                rationale="用户选择继续观察，不进行交易。",
+                user_confirmed=True,
+            )
+        finally:
+            tools.close()
+        self.assertTrue(confirmed["confirmed"])
+        self.assertEqual(operation["operation_type"], "watch")
+
+    def test_reverse_stress_records_audited_risk_amplifier_boundary(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.reverse_stress(
+                loss_threshold=0.05,
+                as_of_date="2020-03-20",
+                symbols=["000001", "600519"],
+                weights=[0.6, 0.4],
+                mode="standard",
+            )
+        finally:
+            engine.close()
+        self.assertTrue(any(item.evidence_id == "evidence_reverse_stress_grid" for item in report.evidence))
+        self.assertTrue(any("流动性和波动率压力只作为本地风险放大标记" in item for item in report.uncertainty))
 
 
 if __name__ == "__main__":

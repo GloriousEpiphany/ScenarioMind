@@ -52,7 +52,7 @@ class FactorExposureEstimator:
                     evidence_id=evidence_id,
                     evidence_type="factor_regression",
                     title=f"{position.symbol} 因子暴露数据不足",
-                    content="该标的本地历史价格少于 30 个交易日，MVP 不估计 beta。",
+                    content="该标的本地历史价格少于 30 个交易日，系统不估计 beta。",
                     confidence=0.8,
                 )
                 evidences.append(evidence)
@@ -74,7 +74,7 @@ class FactorExposureEstimator:
                 title=f"{position.symbol} 简化市场因子暴露",
                 content=(
                     f"使用截至 {portfolio.as_of_date} 的本地日线数据估计，样本数 {len(merged)}。"
-                    "MVP 仅估计市场 beta、动量、波动率和流动性变化，不包含行业/风格完整风险模型。"
+                    "当前版本仅估计市场 beta、动量、波动率和流动性变化，不包含行业/风格完整风险模型。"
                 ),
                 confidence=0.68 if beta is not None else 0.45,
                 metrics={

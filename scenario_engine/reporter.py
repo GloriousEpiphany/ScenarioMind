@@ -41,7 +41,7 @@ class ReportComposer:
         quantified_weight = total_impact.get("quantified_position_weight", 0.0)
         if base_range is None:
             return (
-                "MVP 未找到足够的本地历史事件窗口、可估计因子暴露或其他可审计量化依据，"
+                "系统未找到足够的本地历史事件窗口、可估计因子暴露或其他可审计量化依据，"
                 "因此不输出组合收益区间。报告仅保留场景解析、缺失项和可审计限制。"
             )
         return (
@@ -55,7 +55,7 @@ class ReportComposer:
         if total_impact.get("quantified_position_weight", 0.0) < 0.999:
             items.append("部分持仓缺少可审计价格或历史窗口数据，未纳入量化区间")
         if any(impact.quantification_status == "not_quantified" for impact in impacts):
-            items.append("MVP 未接入申万行业指数、利率、汇率、商品和北向资金数据，相关冲击不能直接量化")
+            items.append("当前版本未接入申万行业指数、利率、汇率、商品和北向资金数据，相关冲击不能直接量化")
         return sorted(set(items))
 
     def _recommendations(self, impacts: list[PortfolioImpact], total_impact: dict) -> list[dict]:
@@ -80,7 +80,7 @@ class ReportComposer:
 
     def _to_markdown(self, report: ScenarioReport) -> str:
         industry_note = (
-            "MVP 当前没有接入行业分类数据库，不能计算真实行业集中度；"
+            "当前版本没有接入行业分类数据库，不能计算真实行业集中度；"
             f"仅展示场景影响对象：{', '.join(report.scenario_spec.affected_entities) or '未明确'}。"
         )
         lines = [
@@ -128,7 +128,7 @@ class ReportComposer:
                 lines.append(f"- {path_name}: {low:.2%} ~ {high:.2%}")
             else:
                 lines.append(f"- {path_name}: 未量化")
-        lines.append("- Reflexive: MVP 仅在证据充足时展示；当前未建模反身性路径，不输出数值。")
+        lines.append("- Reflexive: 仅在证据充足时展示；当前未建模反身性路径，不输出数值。")
         lines.extend(["", "## 传导路径", ""])
         for path in report.paths:
             lines.append(f"### {path.name}")
@@ -148,6 +148,13 @@ class ReportComposer:
         for note in report.audit.get("a_share_constraints", []):
             lines.append(f"- A股约束：{note}")
         lines.append(f"- 校验状态：{report.audit.get('validation_status')}")
+        if report.audit.get("agent_review"):
+            lines.extend(["", "## 多角色审查", ""])
+            for item in report.audit["agent_review"]:
+                lines.append(f"### {item.get('reviewer')}")
+                lines.append(f"- 状态：{item.get('status')}")
+                for finding in item.get("findings", []):
+                    lines.append(f"- {finding}")
         lines.extend(["", "## 证据", ""])
         for item in report.evidence:
             lines.append(f"- `{item.evidence_id}` {item.title}：{item.content}")

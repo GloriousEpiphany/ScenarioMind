@@ -26,7 +26,7 @@ class AShareConstraintAnalyzer:
         by_symbol: dict[str, list[str]] = {}
         portfolio_notes = [
             "A 股普通股票通常实行 T+1：当日买入不能当日卖出；本情景报告不模拟盘中即时成交。",
-            "MVP 不进行下单，不保证任何候选动作可在目标价格成交。",
+            "情景引擎不进行下单，不保证任何候选动作可在目标价格成交。",
         ]
 
         for position in portfolio.positions:
@@ -34,7 +34,7 @@ class AShareConstraintAnalyzer:
             history = self.data_provider.get_stock_history(position.symbol, portfolio.as_of_date, lookback_days=30)
             latest = self.data_provider.get_latest_price_on_or_before(position.symbol, portfolio.as_of_date)
             if latest is None:
-                notes.append("本地库中基准日前无有效价格，可能是缺数据或停牌，MVP 不量化该标的。")
+                notes.append("本地库中基准日前无有效价格，可能是缺数据或停牌，系统不量化该标的。")
                 evidence = Evidence(
                     evidence_id=f"evidence_constraints_{position.symbol}",
                     evidence_type="market_rule",

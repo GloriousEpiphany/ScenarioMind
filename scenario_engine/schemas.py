@@ -1,4 +1,4 @@
-"""Data contracts for the Scenario Lab MVP."""
+"""Data contracts for the Scenario Lab."""
 
 from __future__ import annotations
 
@@ -129,6 +129,182 @@ class ScenarioReport:
     uncertainty: list[str]
     audit: dict[str, Any]
     markdown: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ReverseStressCandidate:
+    candidate_id: str
+    factor_shocks: list[ShockSpec]
+    estimated_portfolio_impact: Optional[tuple[float, float]]
+    affected_symbols: list[str]
+    evidence_ids: list[str]
+    explanation: str
+    confidence: float
+    quantification_status: str
+
+
+@dataclass
+class ReverseStressReport:
+    reverse_stress_id: str
+    as_of_date: str
+    loss_threshold: float
+    horizon: str
+    candidates: list[ReverseStressCandidate]
+    evidence: list[Evidence]
+    uncertainty: list[str]
+    audit: dict[str, Any]
+    markdown: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RebalanceComparison:
+    comparison_id: str
+    scenario_id: str
+    as_of_date: str
+    current_report: ScenarioReport
+    proposed_report: ScenarioReport
+    delta: dict[str, Any]
+    audit: dict[str, Any]
+    markdown: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class BacktestObservation:
+    observation_id: str
+    template_name: str
+    as_of_date: str
+    horizon: str
+    predicted_range: Optional[tuple[float, float]]
+    realized_return: Optional[float]
+    hit: Optional[bool]
+    symbols: list[str]
+    evidence_ids: list[str]
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BacktestReport:
+    backtest_id: str
+    template_name: str
+    start_date: str
+    end_date: str
+    horizon: str
+    observations: list[BacktestObservation]
+    metrics: dict[str, Any]
+    audit: dict[str, Any]
+    markdown: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class BatchBacktestReport:
+    batch_id: str
+    start_date: str
+    end_date: str
+    horizon: str
+    reports: list[BacktestReport]
+    metrics: dict[str, Any]
+    audit: dict[str, Any]
+    markdown: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class AgentReviewItem:
+    reviewer: str
+    status: str
+    findings: list[str]
+    evidence_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ScenarioMemoryRecord:
+    memory_id: str
+    scenario_id: str
+    memory_type: str
+    as_of_date: str
+    title: str
+    content: str
+    tags: list[str]
+    source_report_id: str
+    created_at: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ScenarioReplayReport:
+    replay_id: str
+    scenario_id: str
+    review_date: str
+    realized_return: Optional[float]
+    predicted_range: Optional[tuple[float, float]]
+    hit: Optional[bool]
+    memory_record: Optional[ScenarioMemoryRecord]
+    audit: dict[str, Any]
+    markdown: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class UserOperationRecord:
+    operation_id: str
+    scenario_id: str
+    operation_date: str
+    operation_type: str
+    symbol: Optional[str]
+    weight_before: Optional[float]
+    weight_after: Optional[float]
+    quantity: Optional[int]
+    rationale: str
+    user_confirmed: bool
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class TradeLessonRecord:
+    lesson_id: str
+    scenario_id: str
+    review_date: str
+    lesson_type: str
+    content: str
+    evidence: dict[str, Any]
+    created_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class WorkflowCheckpoint:
+    checkpoint_id: str
+    scenario_id: str
+    state: str
+    requires_human_confirmation: bool
+    confirmed: bool
+    payload: dict[str, Any]
+    created_at: str
+    updated_at: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
