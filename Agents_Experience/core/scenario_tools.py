@@ -194,5 +194,242 @@ class ScenarioTools:
     def confirm_checkpoint(self, checkpoint_id: str) -> dict[str, Any]:
         return self.engine.confirm_checkpoint(checkpoint_id).to_dict()
 
+    def search_knowledge_graph(self, query: str, top_k: int = 10) -> dict[str, Any]:
+        return self.engine.search_knowledge_graph(query, top_k=top_k).to_dict()
+
+    def import_knowledge_graph(
+        self,
+        items: list[dict[str, Any]],
+        source_uri: str,
+        operator: str = "system",
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.import_knowledge_graph(items=items, source_uri=source_uri, operator=operator, role=role).to_dict()
+
+    def ingest_graph_text_document(
+        self,
+        title: str,
+        content: str,
+        source_uri: str,
+        metadata: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.ingest_graph_text_document(
+            title=title,
+            content=content,
+            source_uri=source_uri,
+            metadata=metadata,
+            user_id=user_id,
+            role=role,
+        )
+
+    def monitor_event(
+        self,
+        event_text: str,
+        as_of_date: str,
+        symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        threshold: float = 0.35,
+        auto_run: bool = False,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.monitor_event(
+            event_text=event_text,
+            as_of_date=as_of_date,
+            symbols=symbols,
+            weights=weights,
+            threshold=threshold,
+            auto_run=auto_run,
+            user_id=user_id,
+            role=role,
+        ).to_dict()
+
+    def register_event_source(
+        self,
+        source_id: str,
+        source_type: str,
+        description: str,
+        status: str = "active",
+        metadata: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.register_event_source(
+            source_id=source_id,
+            source_type=source_type,
+            description=description,
+            status=status,
+            metadata=metadata,
+            user_id=user_id,
+            role=role,
+        ).to_dict()
+
+    def ingest_event_source(
+        self,
+        source_id: str,
+        as_of_date: str,
+        symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        auto_run: bool = False,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.ingest_event_source(
+            source_id=source_id,
+            as_of_date=as_of_date,
+            symbols=symbols,
+            weights=weights,
+            auto_run=auto_run,
+            user_id=user_id,
+            role=role,
+        ).to_dict()
+
+    def batch_portfolio_stress(
+        self,
+        user_query: str,
+        as_of_date: str,
+        portfolios: list[dict[str, Any]],
+        horizon: str | None = None,
+        mode: str = "quick",
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.batch_portfolio_stress(
+            user_query=user_query,
+            as_of_date=as_of_date,
+            portfolios=portfolios,
+            horizon=horizon,
+            mode=mode,
+            user_id=user_id,
+            role=role,
+        ).to_dict()
+
+    def register_external_data_source(
+        self,
+        source_name: str,
+        connector_type: str,
+        available: bool,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.register_external_data_source(
+            source_name=source_name,
+            connector_type=connector_type,
+            available=available,
+            reason=reason,
+            metadata=metadata,
+        ).to_dict()
+
+    def register_mcp_event_connector(self, source_name: str, connector) -> dict[str, Any]:
+        return self.engine.register_mcp_event_connector(source_name, connector).to_dict()
+
+    def register_mcp_jsonrpc_event_connector(
+        self,
+        source_name: str,
+        transport,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.register_mcp_jsonrpc_event_connector(
+            source_name=source_name,
+            transport=transport,
+            tool_name=tool_name,
+            arguments=arguments,
+        ).to_dict()
+
+    def register_gdelt_doc_news_source(
+        self,
+        source_id: str,
+        query: str,
+        max_records: int = 25,
+        timespan: str = "24h",
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.register_gdelt_doc_news_source(
+            source_id=source_id,
+            query=query,
+            max_records=max_records,
+            timespan=timespan,
+            user_id=user_id,
+            role=role,
+        ).to_dict()
+
+    def external_data_status(self, source_name: str) -> dict[str, Any]:
+        return self.engine.external_data_status(source_name).to_dict()
+
+    def multi_asset_coverage(self, as_of_date: str) -> dict[str, Any]:
+        return self.engine.multi_asset_coverage(as_of_date).to_dict()
+
+    def register_asset_proxy(
+        self,
+        factor: str,
+        asset_type: str,
+        symbol: str,
+        table_name: str,
+        direction: float = 1.0,
+        description: str = "",
+        metadata: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.register_asset_proxy(
+            factor=factor,
+            asset_type=asset_type,
+            symbol=symbol,
+            table_name=table_name,
+            direction=direction,
+            description=description,
+            metadata=metadata,
+            user_id=user_id,
+            role=role,
+        )
+
+    def check_access(self, user_id: str, role: str, action: str) -> dict[str, Any]:
+        return self.engine.check_access(user_id=user_id, role=role, action=action).to_dict()
+
+    def audit_action(
+        self,
+        user_id: str,
+        action: str,
+        resource_id: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.audit_action(user_id=user_id, action=action, resource_id=resource_id, payload=payload).to_dict()
+
+    def version_report(
+        self,
+        report_id: str,
+        report_type: str,
+        content: str,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.version_report(
+            report_id=report_id,
+            report_type=report_type,
+            content=content,
+            user_id=user_id,
+            role=role,
+        ).to_dict()
+
+    def export_report(
+        self,
+        report_id: str,
+        export_format: str,
+        output_dir: str = "Exports",
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.export_report(
+            report_id=report_id,
+            export_format=export_format,
+            output_dir=output_dir,
+            user_id=user_id,
+            role=role,
+        ).to_dict()
+
     def close(self) -> None:
         self.engine.close()

@@ -13,6 +13,20 @@ from .schemas import (
     BatchBacktestReport,
     RebalanceComparison,
     ReverseStressReport,
+    BatchPortfolioStressReport,
+    EventMonitorResult,
+    EventSourceRecord,
+    ExternalDataSourceStatus,
+    GraphImportReport,
+    GraphSearchResult,
+    MultiAssetCoverageReport,
+    AccessDecision,
+    AuditLogRecord,
+    EventSourceIngestResult,
+    GraphTextDocument,
+    ReportVersion,
+    ReportExport,
+    TraceRecord,
     ScenarioMemoryRecord,
     ScenarioReplayReport,
     ScenarioReport,
@@ -41,7 +55,7 @@ class ScenarioRepository:
                 report.as_of_date,
                 report.scenario_spec.horizon,
                 "succeeded",
-                "deterministic_v1",
+                "deterministic_v2",
                 report.markdown,
                 json.dumps(report.to_dict(), ensure_ascii=False),
             ),
@@ -393,6 +407,379 @@ class ScenarioRepository:
         )
         conn.commit()
 
+    def save_graph_search(self, result: GraphSearchResult) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT INTO scenario_graph_searches
+            (query, result_json, created_at)
+            VALUES (?, ?, datetime('now'))
+            """,
+            (result.query, json.dumps(result.to_dict(), ensure_ascii=False)),
+        )
+        conn.commit()
+
+    def save_graph_import(self, report: GraphImportReport) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO scenario_graph_imports
+            (import_id, report_json, created_at)
+            VALUES (?, ?, datetime('now'))
+            """,
+            (report.import_id, json.dumps(report.to_dict(), ensure_ascii=False)),
+        )
+        conn.commit()
+
+    def load_graph_import_reports(self) -> list[dict]:
+        conn = self.data_provider.db.connect()
+        rows = conn.execute(
+            "SELECT report_json FROM scenario_graph_imports ORDER BY created_at, import_id"
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def save_graph_text_document(self, document: GraphTextDocument) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_graph_text_documents
+            (document_id, title, content, source_uri, created_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                document.document_id,
+                document.title,
+                document.content,
+                document.source_uri,
+                document.created_at,
+                json.dumps(document.metadata, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def load_graph_text_documents(self) -> list[dict]:
+        conn = self.data_provider.db.connect()
+        rows = conn.execute(
+            """
+            SELECT document_id, title, content, source_uri, created_at, metadata_json
+            FROM scenario_graph_text_documents
+            ORDER BY created_at, document_id
+            """
+        ).fetchall()
+        return [
+            {
+                "document_id": row[0],
+                "title": row[1],
+                "content": row[2],
+                "source_uri": row[3],
+                "created_at": row[4],
+                "metadata": json.loads(row[5] or "{}"),
+            }
+            for row in rows
+        ]
+
+    def save_event_source(self, record: EventSourceRecord) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_event_sources
+            (source_id, source_type, status, description, created_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.source_id,
+                record.source_type,
+                record.status,
+                record.description,
+                record.created_at,
+                json.dumps(record.metadata, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def get_event_source(self, source_id: str) -> EventSourceRecord:
+        conn = self.data_provider.db.connect()
+        row = conn.execute(
+            """
+            SELECT source_id, source_type, status, description, created_at, metadata_json
+            FROM scenario_event_sources
+            WHERE source_id = ?
+            """,
+            (source_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"event source not found: {source_id}")
+        return EventSourceRecord(
+            source_id=row[0],
+            source_type=row[1],
+            status=row[2],
+            description=row[3],
+            created_at=row[4],
+            metadata=json.loads(row[5] or "{}"),
+        )
+
+    def save_event_monitor_result(self, result: EventMonitorResult) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_event_monitors
+            (event_id, event_text, as_of_date, matched_template, similarity,
+             trigger_level, result_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                result.event_id,
+                result.event_text,
+                result.as_of_date,
+                result.matched_template,
+                result.similarity,
+                result.trigger_level,
+                json.dumps(result.to_dict(), ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def save_batch_portfolio_stress(self, report: BatchPortfolioStressReport) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_batch_portfolio_stress
+            (batch_id, user_query, as_of_date, report_json, report_markdown, summary_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                report.batch_id,
+                report.user_query,
+                report.as_of_date,
+                json.dumps(report.to_dict(), ensure_ascii=False),
+                report.markdown,
+                json.dumps(report.summary, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def save_external_data_status(self, status: ExternalDataSourceStatus) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_external_data_sources
+            (source_name, connector_type, status, reason, last_checked_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                status.source_name,
+                status.connector_type,
+                status.status,
+                status.reason,
+                status.last_checked_at,
+                json.dumps(status.metadata, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def save_asset_proxy(self, proxy: dict) -> dict:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_asset_proxies
+            (factor, asset_type, symbol, table_name, direction, description, created_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)
+            """,
+            (
+                proxy["factor"],
+                proxy["asset_type"],
+                proxy["symbol"],
+                proxy["table_name"],
+                proxy["direction"],
+                proxy.get("description", ""),
+                json.dumps(proxy.get("metadata", {}), ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+        return proxy
+
+    def list_asset_proxies(self) -> list[dict]:
+        conn = self.data_provider.db.connect()
+        rows = conn.execute(
+            """
+            SELECT factor, asset_type, symbol, table_name, direction, description, created_at, metadata_json
+            FROM scenario_asset_proxies
+            ORDER BY factor, asset_type, symbol
+            """
+        ).fetchall()
+        return [
+            {
+                "factor": row[0],
+                "asset_type": row[1],
+                "symbol": row[2],
+                "table_name": row[3],
+                "direction": row[4],
+                "description": row[5],
+                "created_at": row[6],
+                "metadata": json.loads(row[7] or "{}"),
+            }
+            for row in rows
+        ]
+
+    def get_external_data_status(self, source_name: str) -> ExternalDataSourceStatus | None:
+        conn = self.data_provider.db.connect()
+        row = conn.execute(
+            """
+            SELECT source_name, connector_type, status, reason, last_checked_at, metadata_json
+            FROM scenario_external_data_sources
+            WHERE source_name = ?
+            """,
+            (source_name,),
+        ).fetchone()
+        if not row:
+            return None
+        return ExternalDataSourceStatus(
+            source_name=row[0],
+            connector_type=row[1],
+            status=row[2],
+            reason=row[3],
+            last_checked_at=row[4],
+            metadata=json.loads(row[5] or "{}"),
+        )
+
+    def save_multi_asset_coverage(self, report: MultiAssetCoverageReport) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT INTO scenario_multi_asset_coverage
+            (as_of_date, report_json, created_at)
+            VALUES (?, ?, datetime('now'))
+            """,
+            (report.as_of_date, json.dumps(report.to_dict(), ensure_ascii=False)),
+        )
+        conn.commit()
+
+    def save_access_decision(self, decision: AccessDecision) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT INTO scenario_access_decisions
+            (user_id, role, action, allowed, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (decision.user_id, decision.role, decision.action, 1 if decision.allowed else 0, decision.reason),
+        )
+        conn.commit()
+
+    def save_audit_log(self, record: AuditLogRecord) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT INTO scenario_enterprise_audit_logs
+            (audit_id, user_id, action, resource_id, payload_hash, created_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.audit_id,
+                record.user_id,
+                record.action,
+                record.resource_id,
+                record.payload_hash,
+                record.created_at,
+                json.dumps(record.metadata, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def save_trace_record(self, record: TraceRecord) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT INTO scenario_trace_spans
+            (trace_id, span_id, parent_span_id, name, input_hash, output_hash,
+             model_snapshot_id, data_snapshot_id, created_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.trace_id,
+                record.span_id,
+                record.parent_span_id,
+                record.name,
+                record.input_hash,
+                record.output_hash,
+                record.model_snapshot_id,
+                record.data_snapshot_id,
+                record.created_at,
+                json.dumps(record.metadata, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def save_report_export(self, export: ReportExport) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT INTO scenario_report_exports
+            (export_id, report_id, export_format, file_path, content_hash, created_at, audit_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                export.export_id,
+                export.report_id,
+                export.export_format,
+                export.file_path,
+                export.content_hash,
+                export.created_at,
+                json.dumps(export.audit, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def get_report_markdown(self, report_id: str) -> str:
+        conn = self.data_provider.db.connect()
+        row = conn.execute(
+            "SELECT report_markdown FROM scenario_runs WHERE scenario_id = ?",
+            (report_id,),
+        ).fetchone()
+        if row and row[0]:
+            return row[0]
+        row = conn.execute(
+            """
+            SELECT content FROM scenario_report_versions
+            WHERE report_id = ?
+            ORDER BY version_number DESC
+            LIMIT 1
+            """,
+            (report_id,),
+        ).fetchone()
+        if row and row[0]:
+            return row[0]
+        raise ValueError(f"report not found: {report_id}")
+
+    def save_report_version(self, version: ReportVersion) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_report_versions
+            (version_id, report_id, version_number, report_type, content_hash, content, created_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                version.version_id,
+                version.report_id,
+                version.version_number,
+                version.report_type,
+                version.content_hash,
+                version.content,
+                version.created_at,
+                json.dumps(version.metadata, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def next_report_version_number(self, report_id: str) -> int:
+        conn = self.data_provider.db.connect()
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 FROM scenario_report_versions WHERE report_id = ?",
+            (report_id,),
+        ).fetchone()
+        return int(row[0])
+
     def save_validated_report_dict(self, report: dict) -> dict:
         scenario_id = report.get("scenario_id")
         audit = report.get("audit") or {}
@@ -673,6 +1060,189 @@ class ScenarioRepository:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_graph_searches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT,
+                result_json TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_graph_imports (
+                import_id TEXT PRIMARY KEY,
+                report_json TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_graph_text_documents (
+                document_id TEXT PRIMARY KEY,
+                title TEXT,
+                content TEXT,
+                source_uri TEXT,
+                created_at TEXT,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_event_sources (
+                source_id TEXT PRIMARY KEY,
+                source_type TEXT,
+                status TEXT,
+                description TEXT,
+                created_at TEXT,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_event_monitors (
+                event_id TEXT PRIMARY KEY,
+                event_text TEXT,
+                as_of_date TEXT,
+                matched_template TEXT,
+                similarity REAL,
+                trigger_level TEXT,
+                result_json TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_batch_portfolio_stress (
+                batch_id TEXT PRIMARY KEY,
+                user_query TEXT,
+                as_of_date TEXT,
+                report_json TEXT,
+                report_markdown TEXT,
+                summary_json TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_external_data_sources (
+                source_name TEXT PRIMARY KEY,
+                connector_type TEXT,
+                status TEXT,
+                reason TEXT,
+                last_checked_at TEXT,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_asset_proxies (
+                factor TEXT,
+                asset_type TEXT,
+                symbol TEXT,
+                table_name TEXT,
+                direction REAL,
+                description TEXT,
+                created_at TEXT,
+                metadata_json TEXT,
+                PRIMARY KEY (factor, asset_type, symbol, table_name)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_multi_asset_coverage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                as_of_date TEXT,
+                report_json TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_access_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                role TEXT,
+                action TEXT,
+                allowed INTEGER,
+                reason TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_enterprise_audit_logs (
+                audit_id TEXT PRIMARY KEY,
+                user_id TEXT,
+                action TEXT,
+                resource_id TEXT,
+                payload_hash TEXT,
+                created_at TEXT,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_trace_spans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT,
+                span_id TEXT,
+                parent_span_id TEXT,
+                name TEXT,
+                input_hash TEXT,
+                output_hash TEXT,
+                model_snapshot_id TEXT,
+                data_snapshot_id TEXT,
+                created_at TEXT,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_report_versions (
+                version_id TEXT PRIMARY KEY,
+                report_id TEXT,
+                version_number INTEGER,
+                report_type TEXT,
+                content_hash TEXT,
+                content TEXT,
+                created_at TEXT,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_report_exports (
+                export_id TEXT PRIMARY KEY,
+                report_id TEXT,
+                export_format TEXT,
+                file_path TEXT,
+                content_hash TEXT,
+                created_at TEXT,
+                audit_json TEXT
+            )
+            """
+        )
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(scenario_report_versions)").fetchall()
+        }
+        if "content" not in columns:
+            conn.execute("ALTER TABLE scenario_report_versions ADD COLUMN content TEXT")
         conn.commit()
 
     def _memory_id(self, scenario_id: str, memory_type: str, date_value: str) -> str:

@@ -25,6 +25,7 @@ class ScenarioSimulator:
         symbol_evidence_ids: dict[str, list[str]],
         exposures: list[FactorExposure],
         constraints_by_symbol: dict[str, list[str]] | None = None,
+        proxy_model_impacts: dict[str, list[dict]] | None = None,
     ) -> tuple[list[PortfolioImpact], dict, list[TransmissionPath], list[Evidence]]:
         exposure_by_symbol = {item.symbol: item for item in exposures}
         impacts: list[PortfolioImpact] = []
@@ -47,6 +48,7 @@ class ScenarioSimulator:
         total_high = 0.0
         quantified_weight = 0.0
         constraints_by_symbol = constraints_by_symbol or {}
+        proxy_model_impacts = proxy_model_impacts or {}
 
         for position in portfolio.positions:
             returns = symbol_returns.get(position.symbol, [])
@@ -77,6 +79,16 @@ class ScenarioSimulator:
                     key_drivers.append("用户明确输入的大盘冲击与本地 market_beta")
                     confidence = max(confidence, 0.58)
                     status = "market_beta"
+
+            for proxy_impact in proxy_model_impacts.get(position.symbol, []):
+                proxy_range = tuple(proxy_impact["range"])
+                base_range = self._combine_ranges(base_range, proxy_range)
+                bear_range = self._combine_ranges(bear_range, (proxy_range[0] * 1.25, proxy_range[0]))
+                bull_range = self._combine_ranges(bull_range, (proxy_range[1], proxy_range[1] * 1.25))
+                evidence_ids.append(proxy_impact["evidence_id"])
+                key_drivers.append(proxy_impact["driver"])
+                confidence = max(confidence, proxy_impact.get("confidence", 0.5))
+                status = "multi_asset_proxy"
 
             constraint_notes = constraints_by_symbol.get(position.symbol, [])
             if constraint_notes:
@@ -112,6 +124,7 @@ class ScenarioSimulator:
             "quantified_position_weight": quantified_weight,
             "cash_weight": portfolio.cash_weight,
             "method": "historical_template_and_market_beta" if quantified_weight > 0 else "not_quantified",
+            "multi_asset_proxy_used": any(proxy_model_impacts.values()),
         }
         paths = self._build_paths(spec, impacts)
         return impacts, total_impact, paths, simulator_evidence

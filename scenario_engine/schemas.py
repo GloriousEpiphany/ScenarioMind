@@ -308,3 +308,221 @@ class WorkflowCheckpoint:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class KnowledgeNode:
+    node_id: str
+    node_type: str
+    name: str
+    description: str
+    source: str
+    confidence: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class KnowledgeEdge:
+    edge_id: str
+    source_node_id: str
+    target_node_id: str
+    relation_type: str
+    description: str
+    evidence_id: str
+    confidence: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class GraphSearchResult:
+    query: str
+    matched_nodes: list[KnowledgeNode]
+    matched_edges: list[KnowledgeEdge]
+    evidence: list[Evidence]
+    audit: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class EventMonitorResult:
+    event_id: str
+    event_text: str
+    as_of_date: str
+    matched_template: Optional[str]
+    similarity: float
+    trigger_level: str
+    recommended_action: str
+    scenario_report: Optional[ScenarioReport]
+    evidence: list[Evidence]
+    audit: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class BatchPortfolioStressReport:
+    batch_id: str
+    user_query: str
+    as_of_date: str
+    portfolio_reports: list[ScenarioReport]
+    summary: dict[str, Any]
+    audit: dict[str, Any]
+    markdown: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ExternalDataSourceStatus:
+    source_name: str
+    connector_type: str
+    status: str
+    reason: str
+    last_checked_at: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class GraphImportReport:
+    import_id: str
+    imported_nodes: list[KnowledgeNode]
+    imported_edges: list[KnowledgeEdge]
+    rejected_items: list[dict[str, Any]]
+    audit: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class EventSourceRecord:
+    source_id: str
+    source_type: str
+    status: str
+    description: str
+    created_at: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class MultiAssetCoverageReport:
+    as_of_date: str
+    assets: list[dict[str, Any]]
+    audit: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class AccessDecision:
+    user_id: str
+    role: str
+    action: str
+    allowed: bool
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class AuditLogRecord:
+    audit_id: str
+    user_id: str
+    action: str
+    resource_id: str
+    payload_hash: str
+    created_at: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ReportVersion:
+    version_id: str
+    report_id: str
+    version_number: int
+    report_type: str
+    content_hash: str
+    content: str
+    created_at: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ReportExport:
+    export_id: str
+    report_id: str
+    export_format: str
+    file_path: str
+    content_hash: str
+    created_at: str
+    audit: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class EventSourceIngestResult:
+    source_id: str
+    source_type: str
+    status: str
+    event_count: int
+    monitor_results: list[EventMonitorResult]
+    audit: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class GraphTextDocument:
+    document_id: str
+    title: str
+    content: str
+    source_uri: str
+    created_at: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class TraceRecord:
+    trace_id: str
+    span_id: str
+    parent_span_id: Optional[str]
+    name: str
+    input_hash: str
+    output_hash: str
+    model_snapshot_id: str
+    data_snapshot_id: str
+    created_at: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)

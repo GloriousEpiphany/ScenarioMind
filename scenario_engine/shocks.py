@@ -14,11 +14,13 @@ class ShockMapper:
         "tariff": "需要行业/出口暴露或供应链映射数据；当前本地库未提供。",
     }
 
-    def map(self, spec: ScenarioSpec) -> tuple[list[Evidence], dict[str, str]]:
+    def map(self, spec: ScenarioSpec, extra_quantifiable_factors: set[str] | None = None) -> tuple[list[Evidence], dict[str, str]]:
+        quantifiable = set(self.QUANTIFIABLE_FACTORS)
+        quantifiable.update(extra_quantifiable_factors or set())
         evidences: list[Evidence] = []
         status: dict[str, str] = {}
         for shock in spec.shocks:
-            if shock.factor in self.QUANTIFIABLE_FACTORS:
+            if shock.factor in quantifiable:
                 status[shock.factor] = "quantifiable"
                 continue
             reason = self.FACTOR_REQUIREMENTS.get(shock.factor, "当前版本没有该冲击因子的本地可审计代理数据。")

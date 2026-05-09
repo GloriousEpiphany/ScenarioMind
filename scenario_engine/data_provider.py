@@ -48,6 +48,13 @@ class ScenarioDataProvider:
                 return df
         return pd.DataFrame()
 
+    def get_asset_history(self, table_name: str, symbol: str, end_date: str, lookback_days: int = 252) -> pd.DataFrame:
+        if table_name == "stock_daily":
+            return self.get_stock_history(symbol, end_date, lookback_days=lookback_days)
+        if table_name == "index_daily":
+            return self._get_index_history(symbol, end_date, lookback_days)
+        raise ValueError("table_name must be stock_daily or index_daily")
+
     def get_latest_price_on_or_before(self, symbol: str, as_of_date: str) -> Optional[dict]:
         conn = self.db.connect()
         cursor = conn.cursor()
