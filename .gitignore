@@ -1,0 +1,160 @@
+# ==============================================================================
+# StockM1 / IGE
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Python bytecode and caches
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ------------------------------------------------------------------------------
+# Build and packaging artifacts
+# ------------------------------------------------------------------------------
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ------------------------------------------------------------------------------
+# Virtual environments
+# ------------------------------------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# ------------------------------------------------------------------------------
+# Test, coverage, lint, type-checker caches
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ------------------------------------------------------------------------------
+# Jupyter / notebook checkpoints
+# ------------------------------------------------------------------------------
+.ipynb_checkpoints/
+
+# ------------------------------------------------------------------------------
+# Local environment and secrets
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.sample
+Agents_Experience/.env
+Agents_Experience/.env.*
+!Agents_Experience/.env.example
+
+# Local user/API configuration. Contains model endpoint and key-like settings.
+Agents_Experience/user_setting.ini
+
+# Streamlit secrets are local; config.toml is allowed.
+.streamlit/secrets.toml
+
+# ------------------------------------------------------------------------------
+# Project data stores and generated market data
+# ------------------------------------------------------------------------------
+data/*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+
+# Keep possible checked-in placeholders.
+!data/.gitkeep
+
+# ------------------------------------------------------------------------------
+# Agent run outputs
+# ------------------------------------------------------------------------------
+Agents_Experience/logs/
+Agents_Experience/results/
+Agents_Experience/**/*.log
+Agents_Experience/**/*_portfolio_*.csv
+Agents_Experience/**/*_decision_*.log
+
+# Historical/manual run dumps that should not be versioned.
+images/Qwen3-max_251116完整结果记录/
+
+# ------------------------------------------------------------------------------
+# Generic logs and runtime files
+# ------------------------------------------------------------------------------
+logs/
+*.log
+*.log.*
+*.pid
+*.seed
+*.pid.lock
+
+# ------------------------------------------------------------------------------
+# Temporary files
+# ------------------------------------------------------------------------------
+tmp/
+temp/
+.tmp/
+.temp/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+
+# ------------------------------------------------------------------------------
+# IDE and editor files
+# ------------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ------------------------------------------------------------------------------
+# OS metadata
+# ------------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ------------------------------------------------------------------------------
+# Optional local exports. Do not ignore all CSV files globally, because future
+# fixtures or small sample datasets may be intentionally committed.
+# ------------------------------------------------------------------------------
+exports/
+reports/
