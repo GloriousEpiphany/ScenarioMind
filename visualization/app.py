@@ -38,6 +38,7 @@ from visualization.agent_charts import (
 from visualization.agent_config_manager import AgentConfigManager
 from visualization.agent_runner import AgentRunner
 from visualization.agent_simulator_page import show_agent_simulator_page
+from visualization.scenario_page import show_scenario_page
 from src.stock_app.data_downloader import DataDownloader
 from src.stock_app.database import Database
 import time
@@ -137,8 +138,8 @@ def main():
     st.sidebar.title("导航菜单")
     page = st.sidebar.radio(
         "选择页面",
-        ["📊 股票列表", "📈 股票详细分析", "🔍 多股票对比", "📉 技术指标分析", "📊 统计分析", 
-         "💻 AI Agent模拟炒股", "💻 AI Agent交易结果", "⬇️ 下载股票数据"]
+        ["📊 股票列表", "📈 股票详细分析", "🔍 多股票对比", "📉 技术指标分析", "📊 统计分析",
+         "🧭 情景推演实验室", "💻 AI Agent模拟炒股", "💻 AI Agent交易结果", "⬇️ 下载股票数据"]
     )
     
     # 根据选择显示不同页面
@@ -152,6 +153,8 @@ def main():
         show_indicators_page()
     elif page == "📊 统计分析":
         show_statistics_page()
+    elif page == "🧭 情景推演实验室":
+        show_scenario_page()
     elif page == "💻 AI Agent模拟炒股":
         show_agent_simulator_page()
     elif page == "💻 AI Agent交易结果":
