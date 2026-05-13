@@ -1,6 +1,8 @@
 import os
 import tempfile
+import time
 import unittest
+import zipfile
 
 import pandas as pd
 
@@ -623,6 +625,8 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 symbols=["000001"],
                 weights=[1.0],
                 auto_run=True,
+                user_id="analyst_001",
+                role="analyst",
             )
         finally:
             engine.close()
@@ -646,6 +650,8 @@ class ScenarioEngineTestCase(unittest.TestCase):
                     {"symbols": ["000001"], "weights": [1.0]},
                     {"symbols": ["600519"], "weights": [1.0]},
                 ],
+                user_id="analyst_001",
+                role="analyst",
             )
         finally:
             engine.close()
@@ -667,6 +673,8 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 "manual",
                 available=True,
                 reason="用户手工输入事件文本，可审计但不是实时新闻源。",
+                user_id="admin_001",
+                role="admin",
             )
         finally:
             engine.close()
@@ -698,7 +706,8 @@ class ScenarioEngineTestCase(unittest.TestCase):
                     },
                 ],
                 source_uri="manual://test/graph",
-                operator="analyst_001",
+                operator="admin_001",
+                role="admin",
             )
             search = engine.search_knowledge_graph("半导体 出口链", top_k=10)
         finally:
@@ -710,6 +719,39 @@ class ScenarioEngineTestCase(unittest.TestCase):
         conn = self.db.connect()
         row = conn.execute("SELECT import_id FROM scenario_graph_imports WHERE import_id = ?", (report.import_id,)).fetchone()
         self.assertEqual(row[0], report.import_id)
+
+    def test_v2_graph_search_returns_multi_hop_paths(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            engine.import_knowledge_graph(
+                items=[
+                    {
+                        "source": {"node_type": "policy", "name": "出口管制"},
+                        "target": {"node_type": "industry", "name": "半导体"},
+                        "relation_type": "affects",
+                    },
+                    {
+                        "source": {"node_type": "industry", "name": "半导体"},
+                        "target": {"node_type": "supply_chain", "name": "设备材料"},
+                        "relation_type": "supplies",
+                    },
+                    {
+                        "source": {"node_type": "supply_chain", "name": "设备材料"},
+                        "target": {"node_type": "theme", "name": "国产替代"},
+                        "relation_type": "maps_to_theme",
+                    },
+                ],
+                source_uri="manual://test/multihop_graph",
+                operator="admin_001",
+                role="admin",
+            )
+            result = engine.search_knowledge_graph("出口管制", top_k=3, hop_depth=3)
+        finally:
+            engine.close()
+        names = {node.name for node in result.matched_nodes}
+        self.assertIn("国产替代", names)
+        self.assertEqual(result.audit["hop_depth"], 3)
+        self.assertGreaterEqual(result.audit["path_count"], 1)
 
     def test_v2_graph_import_is_durable_across_engine_restart(self):
         engine = ScenarioEngine(self.db_path, persist=True)
@@ -792,10 +834,12 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 source_id="manual_stream",
                 source_type="manual",
                 description="用户手工录入事件文本，不声明实时新闻抓取。",
-                metadata={"operator": "analyst_001"},
+                metadata={"operator": "admin_001"},
+                user_id="admin_001",
+                role="admin",
             )
             with self.assertRaises(ValueError):
-                engine.register_event_source("bad", "crawler", "unsupported")
+                engine.register_event_source("bad", "crawler", "unsupported", user_id="admin_001", role="admin")
         finally:
             engine.close()
         self.assertEqual(record.status, "active")
@@ -851,7 +895,12 @@ class ScenarioEngineTestCase(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 engine.ingest_event_source("runtime_mcp", "2020-03-20", user_id="analyst_001", role="analyst")
-            status = engine.register_mcp_event_connector("runtime_mcp", lambda: ["海外市场暴跌导致风险偏好下降"])
+            status = engine.register_mcp_event_connector(
+                "runtime_mcp",
+                lambda: ["海外市场暴跌导致风险偏好下降"],
+                user_id="admin_001",
+                role="admin",
+            )
             ingest = engine.ingest_event_source("runtime_mcp", "2020-03-20", user_id="analyst_001", role="analyst")
         finally:
             engine.close()
@@ -888,6 +937,8 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 transport=transport,
                 tool_name="fetch_news_events",
                 arguments={"query": "market slump"},
+                user_id="admin_001",
+                role="admin",
             )
             ingest = engine.ingest_event_source("jsonrpc_mcp", "2020-03-20", user_id="analyst_001", role="analyst")
         finally:
@@ -959,12 +1010,170 @@ class ScenarioEngineTestCase(unittest.TestCase):
         count = conn.execute("SELECT COUNT(*) FROM scenario_multi_asset_coverage").fetchone()[0]
         self.assertGreaterEqual(count, 1)
 
+    def test_v2_registered_asset_proxy_updates_multi_asset_coverage(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            proxy = engine.register_asset_proxy(
+                factor="market_index",
+                asset_type="etf",
+                symbol="000300",
+                table_name="index_daily",
+                direction=1.0,
+                description="用沪深300指数作为ETF风险代理",
+                user_id="admin_001",
+                role="admin",
+            )
+            report = engine.multi_asset_coverage("2020-03-20")
+        finally:
+            engine.close()
+        etf = next(item for item in report.assets if item["asset_type"] == "etf")
+        self.assertEqual(proxy["asset_type"], "etf")
+        self.assertEqual(etf["status"], "available")
+        self.assertEqual(etf["proxy_status"], "registered_proxy")
+        self.assertGreater(etf["record_count"], 0)
+
+    def test_v2_real_multi_asset_price_import_enters_proxy_coverage(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        gold_rows = [
+            {"date": "2020-03-18", "close": 350.0},
+            {"date": "2020-03-19", "close": 352.0},
+            {"date": "2020-03-20", "close": 355.0},
+        ]
+        try:
+            imported = engine.import_multi_asset_prices(
+                asset_type="gold",
+                symbol="AU_PROXY",
+                rows=gold_rows,
+                source_uri="manual://audited/gold_prices",
+                user_id="admin_001",
+                role="admin",
+            )
+            proxy = engine.register_asset_proxy(
+                factor="gold_price",
+                asset_type="gold",
+                symbol="AU_PROXY",
+                table_name="scenario_multi_asset_prices",
+                direction=1.0,
+                description="用户导入的黄金代理价格",
+                user_id="admin_001",
+                role="admin",
+            )
+            report = engine.multi_asset_coverage("2020-03-20")
+        finally:
+            engine.close()
+        gold = next(item for item in report.assets if item["asset_type"] == "gold")
+        self.assertEqual(imported["saved_rows"], 3)
+        self.assertEqual(proxy["table_name"], "scenario_multi_asset_prices")
+        self.assertEqual(gold["status"], "available")
+        self.assertEqual(gold["record_count"], 3)
+
+    def test_v2_poll_event_sources_creates_persisted_dashboard_alert(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            engine.register_event_source(
+                source_id="manual_alerts",
+                source_type="manual",
+                description="手工录入但可审计的事件流",
+                metadata={"events": ["海外市场暴跌导致风险偏好下降"]},
+                user_id="admin_001",
+                role="admin",
+            )
+            report = engine.poll_event_sources(
+                as_of_date="2020-03-20",
+                source_ids=["manual_alerts"],
+                alert_channel="dashboard",
+                user_id="analyst_001",
+                role="analyst",
+            )
+            conn = self.db.connect()
+            row = conn.execute(
+                "SELECT channel, matched_template FROM scenario_event_alerts WHERE alert_id = ?",
+                (report.alerts[0].alert_id,),
+            ).fetchone()
+            poll_row = conn.execute(
+                "SELECT poll_id FROM scenario_event_polls WHERE poll_id = ?",
+                (report.poll_id,),
+            ).fetchone()
+        finally:
+            engine.close()
+        self.assertEqual(len(report.alerts), 1)
+        self.assertEqual(report.alerts[0].matched_template, "海外市场大跌")
+        self.assertEqual(row, ("dashboard", "海外市场大跌"))
+        self.assertEqual(poll_row[0], report.poll_id)
+
+    def test_v2_poll_event_sources_does_not_overwrite_repeated_polls(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            engine.register_event_source(
+                source_id="manual_repeat_alerts",
+                source_type="manual",
+                description="重复轮询事件流",
+                metadata={"events": ["海外市场暴跌导致风险偏好下降"]},
+                user_id="admin_001",
+                role="admin",
+            )
+            first = engine.poll_event_sources(
+                as_of_date="2020-03-20",
+                source_ids=["manual_repeat_alerts"],
+                user_id="analyst_001",
+                role="analyst",
+            )
+            second = engine.poll_event_sources(
+                as_of_date="2020-03-20",
+                source_ids=["manual_repeat_alerts"],
+                user_id="analyst_001",
+                role="analyst",
+            )
+            conn = self.db.connect()
+            count = conn.execute(
+                "SELECT COUNT(*) FROM scenario_event_polls WHERE poll_id IN (?, ?)",
+                (first.poll_id, second.poll_id),
+            ).fetchone()[0]
+        finally:
+            engine.close()
+        self.assertNotEqual(first.poll_id, second.poll_id)
+        self.assertEqual(count, 2)
+
+    def test_v2_event_monitoring_scheduler_runs_registered_source_automatically(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            engine.register_event_source(
+                source_id="manual_scheduled_alerts",
+                source_type="manual",
+                description="调度轮询事件流",
+                metadata={"events": ["海外市场暴跌导致风险偏好下降"]},
+                user_id="admin_001",
+                role="admin",
+            )
+            start = engine.start_event_monitoring(
+                as_of_date="2020-03-20",
+                interval_seconds=0.05,
+                source_ids=["manual_scheduled_alerts"],
+                user_id="analyst_001",
+                role="analyst",
+            )
+            deadline = time.time() + 2.0
+            while time.time() < deadline and engine.event_scheduler.run_count < 1:
+                time.sleep(0.02)
+            stop = engine.stop_event_monitoring(user_id="analyst_001", role="analyst")
+            conn = self.db.connect()
+            alert_count = conn.execute(
+                "SELECT COUNT(*) FROM scenario_event_alerts WHERE source_id = ?",
+                ("manual_scheduled_alerts",),
+            ).fetchone()[0]
+        finally:
+            engine.close()
+        self.assertTrue(start["running"])
+        self.assertFalse(stop["running"])
+        self.assertGreaterEqual(stop["run_count"], 1)
+        self.assertGreaterEqual(alert_count, 1)
+
     def test_v2_registered_multi_asset_proxy_enters_quant_chain(self):
         engine = ScenarioEngine(self.db_path, persist=True)
         try:
             proxy = engine.register_asset_proxy(
                 factor="interest_rate",
-                asset_type="bond_proxy",
+                asset_type="bond",
                 symbol="000300",
                 table_name="index_daily",
                 direction=-1.0,
@@ -1019,8 +1228,8 @@ class ScenarioEngineTestCase(unittest.TestCase):
             denied = engine.check_access("viewer_001", "viewer", "run_batch")
             allowed = engine.check_access("admin_001", "admin", "manage_graph")
             audit = engine.audit_action("admin_001", "export_report", "report_001", {"format": "markdown"})
-            version1 = engine.version_report("report_001", "scenario_report", "# 第一版报告")
-            version2 = engine.version_report("report_001", "scenario_report", "# 第二版报告")
+            version1 = engine.version_report("report_001", "scenario_report", "# 第一版报告", user_id="admin_001", role="admin")
+            version2 = engine.version_report("report_001", "scenario_report", "# 第二版报告", user_id="admin_001", role="admin")
         finally:
             engine.close()
         self.assertFalse(denied.allowed)
@@ -1030,7 +1239,10 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertEqual(version1.content, "# 第一版报告")
         conn = self.db.connect()
         decision_count = conn.execute("SELECT COUNT(*) FROM scenario_access_decisions").fetchone()[0]
-        audit_row = conn.execute("SELECT audit_id FROM scenario_enterprise_audit_logs WHERE audit_id = ?", (audit.audit_id,)).fetchone()
+        audit_row = conn.execute(
+            "SELECT audit_id, metadata_json FROM scenario_enterprise_audit_logs WHERE audit_id = ?",
+            (audit.audit_id,),
+        ).fetchone()
         version_count = conn.execute("SELECT COUNT(*) FROM scenario_report_versions WHERE report_id = ?", ("report_001",)).fetchone()[0]
         content_row = conn.execute(
             "SELECT content FROM scenario_report_versions WHERE version_id = ?",
@@ -1038,12 +1250,20 @@ class ScenarioEngineTestCase(unittest.TestCase):
         ).fetchone()
         self.assertGreaterEqual(decision_count, 2)
         self.assertEqual(audit_row[0], audit.audit_id)
+        self.assertIn("payload_snapshot", audit_row[1])
+        self.assertIn("format", audit_row[1])
         self.assertEqual(version_count, 2)
         self.assertEqual(content_row[0], "# 第一版报告")
 
     def test_v2_access_control_is_enforced_for_sensitive_operations(self):
         engine = ScenarioEngine(self.db_path, persist=True)
         try:
+            with self.assertRaises(ValueError):
+                engine.batch_portfolio_stress(
+                    user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                    as_of_date="2020-03-20",
+                    portfolios=[{"symbols": ["000001"], "weights": [1.0]}],
+                )
             with self.assertRaises(PermissionError):
                 engine.batch_portfolio_stress(
                     user_query="如果沪深300下跌5%，我的持仓会怎样？",
@@ -1100,16 +1320,46 @@ class ScenarioEngineTestCase(unittest.TestCase):
             self.assertIn(b"/UniGB-UCS2-H", pdf_bytes)
         with open(docx.file_path, "rb") as fh:
             self.assertEqual(fh.read(2), b"PK")
+        with zipfile.ZipFile(docx.file_path) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8")
+        self.assertIn("如果沪深300下跌5%，我的持仓会怎样？", xml)
+        self.assertIn("deterministic_v2_local_data_kg_and_audit_no_llm_numeric_generation", xml)
+
+    def test_v2_report_export_does_not_truncate_long_pdf_to_first_page_only(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        long_content = "# 长报告\n" + "\n".join(f"第{i}行 风险说明" for i in range(140))
+        try:
+            version = engine.version_report(
+                "long_report",
+                "scenario_report",
+                long_content,
+                user_id="admin_001",
+                role="admin",
+            )
+            pdf = engine.export_report(
+                "long_report",
+                "pdf",
+                output_dir=self.tmpdir.name,
+                user_id="admin_001",
+                role="admin",
+            )
+        finally:
+            engine.close()
+        data = open(pdf.file_path, "rb").read()
+        self.assertEqual(version.report_id, "long_report")
+        self.assertGreaterEqual(data.count(b"/Type /Page"), 3)
 
     def test_agent_tools_expose_v2_capabilities(self):
         tools = ScenarioTools(db_path=self.db_path, persist=True)
         try:
             graph = tools.search_knowledge_graph("新能源 补贴", top_k=5)
-            event = tools.monitor_event("新能源补贴退坡影响需求预期", "2020-03-20")
+            event = tools.monitor_event("新能源补贴退坡影响需求预期", "2020-03-20", user_id="analyst_001", role="analyst")
             batch = tools.batch_portfolio_stress(
                 user_query="如果沪深300下跌5%，我的持仓会怎样？",
                 as_of_date="2020-03-20",
                 portfolios=[{"symbols": ["000001"], "weights": [1.0]}],
+                user_id="analyst_001",
+                role="analyst",
             )
             status = tools.external_data_status("unregistered_mcp")
             coverage = tools.multi_asset_coverage("2020-03-20")

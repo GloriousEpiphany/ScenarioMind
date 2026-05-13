@@ -133,6 +133,19 @@ class QwenAgent(BaseAgent):
             total_return=portfolio_info['total_profit_rate'],
             position_ratio=position_ratio
         )
+        if context and context.get("data_context"):
+            daily_prompt += (
+                "\n\n【V2 数据聚合上下文】\n"
+                "以下内容只来自已配置并可审计的数据源；如果标记为无已验证输入，"
+                "不得自行编造新闻、财报、宏观数据或情绪依据。\n"
+                f"{context['data_context']}\n"
+            )
+            if context.get("data_context_audit"):
+                daily_prompt += "\n【V2 数据审计摘要】\n" + json.dumps(
+                    context["data_context_audit"],
+                    ensure_ascii=False,
+                    indent=2,
+                )
         
         # 构建消息
         messages = [
@@ -228,6 +241,7 @@ class QwenAgent(BaseAgent):
             decision = self._parse_decision(final_response, tool_call_results)
             decision['raw_response'] = final_response
             decision['tool_calls'] = tool_call_results
+            decision['data_context_audit'] = context.get("data_context_audit") if context else None
             decision['success'] = True
             
             final_decision = decision

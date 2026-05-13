@@ -194,8 +194,8 @@ class ScenarioTools:
     def confirm_checkpoint(self, checkpoint_id: str) -> dict[str, Any]:
         return self.engine.confirm_checkpoint(checkpoint_id).to_dict()
 
-    def search_knowledge_graph(self, query: str, top_k: int = 10) -> dict[str, Any]:
-        return self.engine.search_knowledge_graph(query, top_k=top_k).to_dict()
+    def search_knowledge_graph(self, query: str, top_k: int = 10, hop_depth: int = 3) -> dict[str, Any]:
+        return self.engine.search_knowledge_graph(query, top_k=top_k, hop_depth=hop_depth).to_dict()
 
     def import_knowledge_graph(
         self,
@@ -286,6 +286,30 @@ class ScenarioTools:
             role=role,
         ).to_dict()
 
+    def poll_event_sources(
+        self,
+        as_of_date: str,
+        symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        source_ids: list[str] | None = None,
+        auto_run: bool = False,
+        alert_threshold: float = 0.35,
+        alert_channel: str = "dashboard",
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.poll_event_sources(
+            as_of_date=as_of_date,
+            symbols=symbols,
+            weights=weights,
+            source_ids=source_ids,
+            auto_run=auto_run,
+            alert_threshold=alert_threshold,
+            alert_channel=alert_channel,
+            user_id=user_id,
+            role=role,
+        ).to_dict()
+
     def batch_portfolio_stress(
         self,
         user_query: str,
@@ -313,6 +337,8 @@ class ScenarioTools:
         available: bool,
         reason: str,
         metadata: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        role: str | None = None,
     ) -> dict[str, Any]:
         return self.engine.register_external_data_source(
             source_name=source_name,
@@ -320,10 +346,18 @@ class ScenarioTools:
             available=available,
             reason=reason,
             metadata=metadata,
+            user_id=user_id,
+            role=role,
         ).to_dict()
 
-    def register_mcp_event_connector(self, source_name: str, connector) -> dict[str, Any]:
-        return self.engine.register_mcp_event_connector(source_name, connector).to_dict()
+    def register_mcp_event_connector(
+        self,
+        source_name: str,
+        connector,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.register_mcp_event_connector(source_name, connector, user_id=user_id, role=role).to_dict()
 
     def register_mcp_jsonrpc_event_connector(
         self,
@@ -331,12 +365,16 @@ class ScenarioTools:
         transport,
         tool_name: str,
         arguments: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        role: str | None = None,
     ) -> dict[str, Any]:
         return self.engine.register_mcp_jsonrpc_event_connector(
             source_name=source_name,
             transport=transport,
             tool_name=tool_name,
             arguments=arguments,
+            user_id=user_id,
+            role=role,
         ).to_dict()
 
     def register_gdelt_doc_news_source(
@@ -387,6 +425,24 @@ class ScenarioTools:
             role=role,
         )
 
+    def import_multi_asset_prices(
+        self,
+        asset_type: str,
+        symbol: str,
+        rows: list[dict[str, Any]],
+        source_uri: str,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.import_multi_asset_prices(
+            asset_type=asset_type,
+            symbol=symbol,
+            rows=rows,
+            source_uri=source_uri,
+            user_id=user_id,
+            role=role,
+        )
+
     def check_access(self, user_id: str, role: str, action: str) -> dict[str, Any]:
         return self.engine.check_access(user_id=user_id, role=role, action=action).to_dict()
 
@@ -430,6 +486,35 @@ class ScenarioTools:
             user_id=user_id,
             role=role,
         ).to_dict()
+
+    def start_event_monitoring(
+        self,
+        as_of_date: str,
+        interval_seconds: float,
+        symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        source_ids: list[str] | None = None,
+        auto_run: bool = False,
+        alert_threshold: float = 0.35,
+        alert_channel: str = "dashboard",
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        return self.engine.start_event_monitoring(
+            as_of_date=as_of_date,
+            interval_seconds=interval_seconds,
+            symbols=symbols,
+            weights=weights,
+            source_ids=source_ids,
+            auto_run=auto_run,
+            alert_threshold=alert_threshold,
+            alert_channel=alert_channel,
+            user_id=user_id,
+            role=role,
+        )
+
+    def stop_event_monitoring(self, user_id: str | None = None, role: str | None = None) -> dict[str, Any]:
+        return self.engine.stop_event_monitoring(user_id=user_id, role=role)
 
     def close(self) -> None:
         self.engine.close()

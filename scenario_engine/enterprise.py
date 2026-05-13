@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime
 from typing import Any
 
@@ -29,7 +30,8 @@ class AccessControl:
 
 class EnterpriseAudit:
     def build_log(self, user_id: str, action: str, resource_id: str, payload: dict[str, Any] | None = None) -> AuditLogRecord:
-        payload_text = repr(sorted((payload or {}).items()))
+        payload_snapshot = self._snapshot(payload or {})
+        payload_text = json.dumps(payload_snapshot, ensure_ascii=False, sort_keys=True, default=str)
         payload_digest = hashlib.sha1(payload_text.encode("utf-8")).hexdigest()
         created_at = datetime.now().isoformat(timespec="microseconds")
         audit_digest = hashlib.sha1(f"{user_id}|{action}|{resource_id}|{payload_digest}|{created_at}".encode("utf-8")).hexdigest()
@@ -40,8 +42,24 @@ class EnterpriseAudit:
             resource_id=resource_id,
             payload_hash=payload_digest,
             created_at=created_at,
-            metadata={"payload_keys": sorted((payload or {}).keys())},
+            metadata={
+                "payload_keys": sorted((payload or {}).keys()),
+                "payload_snapshot": payload_snapshot,
+                "input_snapshot": payload_snapshot.get("input"),
+                "output_snapshot": payload_snapshot.get("output", payload_snapshot),
+                "model_snapshot_id": payload_snapshot.get("model_snapshot_id", "not_applicable"),
+                "data_snapshot_id": payload_snapshot.get("data_snapshot_id", "not_applicable"),
+                "human_confirmation": payload_snapshot.get("human_confirmation", "not_required"),
+                "audit_contract": "input_model_data_output_or_operator_action_snapshot",
+            },
         )
+
+    def _snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+            return payload
+        except TypeError:
+            return json.loads(json.dumps(payload, ensure_ascii=False, default=str))
 
 
 class ReportVersioner:

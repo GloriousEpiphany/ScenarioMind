@@ -15,6 +15,8 @@ from .schemas import (
     EventMonitorResult,
     EventSourceRecord,
     EventSourceIngestResult,
+    EventAlertRecord,
+    EventPollingReport,
     ExternalDataSourceStatus,
     GraphImportReport,
     GraphSearchResult,
@@ -36,6 +38,7 @@ from .schemas import (
     TraceRecord,
 )
 from .external_data import McpJsonRpcEventConnector
+from .event_scheduler import EventPollingScheduler
 
 __all__ = [
     "ScenarioEngine",
@@ -45,6 +48,8 @@ __all__ = [
     "EventMonitorResult",
     "EventSourceRecord",
     "EventSourceIngestResult",
+    "EventAlertRecord",
+    "EventPollingReport",
     "ExternalDataSourceStatus",
     "GraphImportReport",
     "GraphSearchResult",
@@ -65,6 +70,7 @@ __all__ = [
     "WorkflowCheckpoint",
     "TraceRecord",
     "McpJsonRpcEventConnector",
+    "EventPollingScheduler",
     "get_scenario_report_schema",
     "get_scenario_spec_schema",
 ]

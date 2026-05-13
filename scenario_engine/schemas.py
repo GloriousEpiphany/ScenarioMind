@@ -499,6 +499,38 @@ class EventSourceIngestResult:
 
 
 @dataclass
+class EventAlertRecord:
+    alert_id: str
+    event_id: str
+    source_id: str
+    as_of_date: str
+    trigger_level: str
+    matched_template: Optional[str]
+    similarity: float
+    channel: str
+    message: str
+    created_at: str
+    acknowledged: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class EventPollingReport:
+    poll_id: str
+    as_of_date: str
+    source_ids: list[str]
+    ingests: list[EventSourceIngestResult]
+    alerts: list[EventAlertRecord]
+    audit: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class GraphTextDocument:
     document_id: str
     title: str

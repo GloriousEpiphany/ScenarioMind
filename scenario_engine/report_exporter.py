@@ -48,22 +48,38 @@ class ReportExporter:
 
     def _write_pdf(self, path: Path, markdown: str) -> None:
         text = self._plain_text(markdown)
-        safe_lines = [line for line in text.splitlines()]
-        content_lines = ["BT", "/F1 10 Tf", "50 780 Td", "14 TL"]
-        for line in safe_lines[:50]:
-            encoded = line[:100].encode("utf-16-be").hex().upper()
-            content_lines.append(f"<FEFF{encoded}> Tj")
-            content_lines.append("T*")
-        content_lines.append("ET")
-        stream = "\n".join(content_lines).encode("ascii")
+        safe_lines = self._wrap_lines(text, width=92)
+        pages = [safe_lines[i : i + 50] for i in range(0, len(safe_lines), 50)] or [[]]
         objects = [
             b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
-            b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
-            b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n",
-            b"4 0 obj << /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [6 0 R] >> endobj\n",
-            b"5 0 obj << /Length " + str(len(stream)).encode("ascii") + b" >> stream\n" + stream + b"\nendstream endobj\n",
-            b"6 0 obj << /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> >> endobj\n",
+            None,
+            b"3 0 obj << /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [4 0 R] >> endobj\n",
+            b"4 0 obj << /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> >> endobj\n",
         ]
+        page_object_ids = []
+        next_id = 5
+        for page_lines in pages:
+            page_id = next_id
+            content_id = next_id + 1
+            next_id += 2
+            page_object_ids.append(page_id)
+            content_lines = ["BT", "/F1 10 Tf", "50 780 Td", "14 TL"]
+            for line in page_lines:
+                encoded = line.encode("utf-16-be").hex().upper()
+                content_lines.append(f"<FEFF{encoded}> Tj")
+                content_lines.append("T*")
+            content_lines.append("ET")
+            stream = "\n".join(content_lines).encode("ascii")
+            objects.append(
+                f"{page_id} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >> endobj\n".encode("ascii")
+            )
+            objects.append(
+                f"{content_id} 0 obj << /Length {len(stream)} >> stream\n".encode("ascii")
+                + stream
+                + b"\nendstream endobj\n"
+            )
+        kids = " ".join(f"{page_id} 0 R" for page_id in page_object_ids)
+        objects[1] = f"2 0 obj << /Type /Pages /Kids [{kids}] /Count {len(page_object_ids)} >> endobj\n".encode("ascii")
         data = bytearray(b"%PDF-1.4\n")
         offsets = [0]
         for obj in objects:
@@ -97,6 +113,19 @@ class ReportExporter:
         text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
         text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
         return html.unescape(text)
+
+    def _wrap_lines(self, text: str, width: int) -> list[str]:
+        wrapped: list[str] = []
+        for line in text.splitlines():
+            if not line:
+                wrapped.append("")
+                continue
+            current = line
+            while len(current) > width:
+                wrapped.append(current[:width])
+                current = current[width:]
+            wrapped.append(current)
+        return wrapped
 
     def _content_types(self) -> str:
         return (

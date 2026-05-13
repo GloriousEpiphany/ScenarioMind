@@ -174,7 +174,7 @@ class TradingEngine:
         
         # 执行买入
         self.portfolio.cash -= total_cost
-        self.portfolio.add_position(symbol, stock_name, quantity, price)
+        self.portfolio.add_position(symbol, stock_name, quantity, price, trade_date=self.portfolio.current_date)
         
         # 记录交易
         self._record_transaction(
@@ -210,6 +210,10 @@ class TradingEngine:
         if position.quantity < quantity:
             console.print(f"[red]持仓不足！持有 {position.quantity}股，卖出 {quantity}股[/red]")
             return False
+        sellable_quantity = self.portfolio.get_sellable_quantity(symbol, self.portfolio.current_date)
+        if sellable_quantity < quantity:
+            console.print(f"[red]T+1限制！当前可卖 {sellable_quantity}股，申请卖出 {quantity}股[/red]")
+            return False
         
         # 获取当日价格
         if price is None:
@@ -226,7 +230,9 @@ class TradingEngine:
         
         # 执行卖出
         self.portfolio.cash += total_amount
-        self.portfolio.reduce_position(symbol, quantity)
+        if not self.portfolio.reduce_position(symbol, quantity, current_date=self.portfolio.current_date):
+            console.print("[red]卖出失败：T+1或持仓校验未通过[/red]")
+            return False
         
         # 记录交易
         self._record_transaction(
@@ -374,7 +380,7 @@ class TradingEngine:
                 table.add_row(
                     pos.symbol,
                     pos.name,
-                    str(pos.quantity),
+                    f"{pos.quantity} / 可卖 {self.portfolio.get_sellable_quantity(pos.symbol, self.portfolio.current_date)}",
                     f"{pos.avg_cost:.2f}",
                     f"{pos.current_price:.2f}",
                     f"{pos.market_value:,.2f}",

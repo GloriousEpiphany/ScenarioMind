@@ -24,7 +24,9 @@ class LocalKnowledgeGraph:
         self.documents: dict[str, GraphTextDocument] = {}
         self._seed_from_templates()
 
-    def search(self, query: str, top_k: int = 10) -> GraphSearchResult:
+    def search(self, query: str, top_k: int = 10, hop_depth: int = 3) -> GraphSearchResult:
+        if hop_depth < 1 or hop_depth > 5:
+            raise ValueError("hop_depth must be between 1 and 5")
         tokens = self._tokens(query)
         scored_nodes = []
         for node in self.nodes.values():
@@ -34,14 +36,7 @@ class LocalKnowledgeGraph:
         scored_nodes.sort(key=lambda item: item[0], reverse=True)
         seed_nodes = [item[1] for item in scored_nodes[:top_k]]
         node_ids = {node.node_id for node in seed_nodes}
-        matched_edges = [
-            edge for edge in self.edges.values()
-            if edge.source_node_id in node_ids or edge.target_node_id in node_ids
-        ]
-        expanded_node_ids = set(node_ids)
-        for edge in matched_edges:
-            expanded_node_ids.add(edge.source_node_id)
-            expanded_node_ids.add(edge.target_node_id)
+        expanded_node_ids, matched_edges, paths = self._expand_paths(node_ids, hop_depth)
         matched_nodes = [self.nodes[node_id] for node_id in expanded_node_ids if node_id in self.nodes]
         matched_documents = self._search_documents(tokens, top_k=top_k)
         evidence = [
@@ -49,7 +44,7 @@ class LocalKnowledgeGraph:
                 evidence_id="evidence_local_knowledge_graph",
                 evidence_type="knowledge_graph",
                 title="本地情景知识图谱",
-                content="检索结果来自本地可审计 Property Graph 的节点、边、一跳邻居扩展和文本证据召回。",
+                content="检索结果来自本地可审计 Property Graph 的节点、边、多跳路径扩展和文本证据召回。",
                 confidence=0.75,
                 source_uri="local://scenario_engine/templates.py",
                 metrics={
@@ -57,6 +52,8 @@ class LocalKnowledgeGraph:
                     "matched_edges": len(matched_edges),
                     "matched_documents": len(matched_documents),
                     "matched_document_ids": [item.document_id for item in matched_documents],
+                    "path_count": len(paths),
+                    "paths": paths[:20],
                 },
             )
         ]
@@ -82,13 +79,15 @@ class LocalKnowledgeGraph:
                 "top_k": top_k,
                 "external_graph_used": False,
                 "vector_store": "local_token_retrieval",
-                "hop_depth": 1,
+                "hop_depth": hop_depth,
+                "retrieval_layers": ["property_graph", "multi_hop_paths", "local_text_documents"],
+                "path_count": len(paths),
                 "validation_status": "passed",
             },
         )
 
     def enrich_spec(self, spec: ScenarioSpec) -> tuple[list[KnowledgeEdge], list[Evidence]]:
-        result = self.search(" ".join([spec.event_name, *spec.affected_entities]), top_k=20)
+        result = self.search(" ".join([spec.event_name, *spec.affected_entities]), top_k=20, hop_depth=3)
         return result.matched_edges, result.evidence
 
     def import_relationships(self, items: list[dict], source_uri: str, operator: str) -> GraphImportReport:
@@ -253,6 +252,35 @@ class LocalKnowledgeGraph:
             confidence=0.66 if source_uri.startswith("local://") else 0.55,
             metadata={"source_uri": source_uri},
         )
+
+    def _expand_paths(self, seed_node_ids: set[str], hop_depth: int) -> tuple[set[str], list[KnowledgeEdge], list[list[str]]]:
+        expanded = set(seed_node_ids)
+        edges_by_id: dict[str, KnowledgeEdge] = {}
+        paths: list[list[str]] = []
+        frontier = [(node_id, [node_id]) for node_id in seed_node_ids]
+        for _ in range(hop_depth):
+            next_frontier = []
+            for node_id, path in frontier:
+                for edge in self.edges.values():
+                    neighbor = None
+                    if edge.source_node_id == node_id:
+                        neighbor = edge.target_node_id
+                    elif edge.target_node_id == node_id:
+                        neighbor = edge.source_node_id
+                    if neighbor is None:
+                        continue
+                    edges_by_id[edge.edge_id] = edge
+                    if neighbor in path:
+                        continue
+                    next_path = [*path, neighbor]
+                    paths.append([self.nodes[item].name for item in next_path if item in self.nodes])
+                    if neighbor not in expanded:
+                        expanded.add(neighbor)
+                        next_frontier.append((neighbor, next_path))
+            frontier = next_frontier
+            if not frontier:
+                break
+        return expanded, list(edges_by_id.values()), paths
 
     def _validated_node(self, raw: dict, source_uri: str) -> KnowledgeNode:
         node_type = raw.get("node_type")

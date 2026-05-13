@@ -26,6 +26,8 @@ from .schemas import (
     GraphTextDocument,
     ReportVersion,
     ReportExport,
+    EventAlertRecord,
+    EventPollingReport,
     TraceRecord,
     ScenarioMemoryRecord,
     ScenarioReplayReport,
@@ -518,6 +520,19 @@ class ScenarioRepository:
             metadata=json.loads(row[5] or "{}"),
         )
 
+    def list_event_source_ids(self, status: str | None = None) -> list[str]:
+        conn = self.data_provider.db.connect()
+        if status is None:
+            rows = conn.execute(
+                "SELECT source_id FROM scenario_event_sources ORDER BY source_id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT source_id FROM scenario_event_sources WHERE status = ? ORDER BY source_id",
+                (status,),
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def save_event_monitor_result(self, result: EventMonitorResult) -> None:
         conn = self.data_provider.db.connect()
         conn.execute(
@@ -535,6 +550,49 @@ class ScenarioRepository:
                 result.similarity,
                 result.trigger_level,
                 json.dumps(result.to_dict(), ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def save_event_alert(self, alert: EventAlertRecord) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_event_alerts
+            (alert_id, event_id, source_id, as_of_date, trigger_level, matched_template,
+             similarity, channel, message, created_at, acknowledged, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                alert.alert_id,
+                alert.event_id,
+                alert.source_id,
+                alert.as_of_date,
+                alert.trigger_level,
+                alert.matched_template,
+                alert.similarity,
+                alert.channel,
+                alert.message,
+                alert.created_at,
+                1 if alert.acknowledged else 0,
+                json.dumps(alert.metadata, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    def save_event_polling_report(self, report: EventPollingReport) -> None:
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT INTO scenario_event_polls
+            (poll_id, as_of_date, source_ids_json, report_json, created_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                report.poll_id,
+                report.as_of_date,
+                json.dumps(report.source_ids, ensure_ascii=False),
+                json.dumps(report.to_dict(), ensure_ascii=False),
             ),
         )
         conn.commit()
@@ -620,6 +678,15 @@ class ScenarioRepository:
             }
             for row in rows
         ]
+
+    def save_multi_asset_prices(self, asset_type: str, symbol: str, rows: list[dict], source_uri: str) -> dict:
+        saved = self.data_provider.save_multi_asset_prices(asset_type, symbol, rows, source_uri)
+        return {
+            "asset_type": asset_type,
+            "symbol": symbol,
+            "saved_rows": saved,
+            "source_uri": source_uri,
+        }
 
     def get_external_data_status(self, source_name: str) -> ExternalDataSourceStatus | None:
         conn = self.data_provider.db.connect()
@@ -1119,6 +1186,35 @@ class ScenarioRepository:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS scenario_event_alerts (
+                alert_id TEXT PRIMARY KEY,
+                event_id TEXT,
+                source_id TEXT,
+                as_of_date TEXT,
+                trigger_level TEXT,
+                matched_template TEXT,
+                similarity REAL,
+                channel TEXT,
+                message TEXT,
+                created_at TEXT,
+                acknowledged INTEGER,
+                metadata_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_event_polls (
+                poll_id TEXT PRIMARY KEY,
+                as_of_date TEXT,
+                source_ids_json TEXT,
+                report_json TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS scenario_batch_portfolio_stress (
                 batch_id TEXT PRIMARY KEY,
                 user_query TEXT,
@@ -1154,6 +1250,19 @@ class ScenarioRepository:
                 created_at TEXT,
                 metadata_json TEXT,
                 PRIMARY KEY (factor, asset_type, symbol, table_name)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_multi_asset_prices (
+                asset_type TEXT,
+                symbol TEXT,
+                date TEXT,
+                close REAL,
+                source_uri TEXT,
+                metadata_json TEXT,
+                PRIMARY KEY (asset_type, symbol, date)
             )
             """
         )

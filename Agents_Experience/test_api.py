@@ -1,8 +1,16 @@
 """
 测试Qwen API连接
 """
+import os
+import sys
+
+if "pytest" in sys.modules and os.getenv("STOCKM1_RUN_INTEGRATION_TESTS") != "1":
+    import pytest
+
+    pytest.skip("Qwen API integration test requires STOCKM1_RUN_INTEGRATION_TESTS=1", allow_module_level=True)
+
 from openai import OpenAI
-from config import QWEN_API_BASE, QWEN_API_KEY, QWEN_MODEL
+from Agents_Experience.config import QWEN_API_BASE, QWEN_API_KEY, QWEN_MODEL
 
 
 def test_api_connection():

@@ -20,10 +20,47 @@ class MultiAssetCoverage:
     def __init__(self, data_provider: ScenarioDataProvider):
         self.data_provider = data_provider
 
-    def coverage(self, as_of_date: str) -> MultiAssetCoverageReport:
+    def coverage(self, as_of_date: str, asset_proxies: list[dict] | None = None) -> MultiAssetCoverageReport:
         conn = self.data_provider.db.connect()
         rows = []
+        proxies_by_asset = {}
+        for proxy in asset_proxies or []:
+            proxies_by_asset.setdefault(proxy.get("asset_type"), []).append(proxy)
         for asset_type, label, table in self.REQUIRED_ASSETS:
+            proxies = proxies_by_asset.get(asset_type, [])
+            if proxies:
+                proxy_rows = []
+                total_records = 0
+                for proxy in proxies:
+                    history = self.data_provider.get_asset_history(
+                        proxy["table_name"],
+                        proxy["symbol"],
+                        as_of_date,
+                        lookback_days=5000,
+                    )
+                    count = len(history)
+                    total_records += count
+                    proxy_rows.append(
+                        {
+                            "factor": proxy["factor"],
+                            "symbol": proxy["symbol"],
+                            "table_name": proxy["table_name"],
+                            "record_count": count,
+                            "description": proxy.get("description", ""),
+                        }
+                    )
+                rows.append(
+                    {
+                        "asset_type": asset_type,
+                        "label": label,
+                        "status": "available" if total_records > 0 else "not_available",
+                        "proxy_status": "registered_proxy" if total_records > 0 else "registered_but_missing_history",
+                        "record_count": total_records,
+                        "proxies": proxy_rows,
+                        "reason": "已注册本地可审计代理资产。" if total_records > 0 else "代理已注册但截至日期前无历史数据。",
+                    }
+                )
+                continue
             if table is None:
                 rows.append(
                     {
@@ -52,6 +89,7 @@ class MultiAssetCoverage:
             audit={
                 "method": "local_database_asset_coverage_check",
                 "data_boundary": f"records on or before {as_of_date}",
+                "registered_proxy_count": len(asset_proxies or []),
                 "validation_status": "passed",
             },
         )

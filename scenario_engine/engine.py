@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 
 from .analogs import HistoricalAnalogRetriever
 from .agent_review import ScenarioAgentReview
@@ -11,6 +12,7 @@ from .batch import BatchPortfolioStressTester
 from .constraints import AShareConstraintAnalyzer
 from .data_provider import ScenarioDataProvider
 from .event_monitor import EventMonitor
+from .event_scheduler import EventPollingScheduler
 from .enterprise import AccessControl, EnterpriseAudit, ReportVersioner
 from .external_data import ExternalDataRegistry, McpJsonRpcEventConnector
 from .factors import FactorExposureEstimator
@@ -37,6 +39,8 @@ from .schemas import (
     EventMonitorResult,
     EventSourceRecord,
     EventSourceIngestResult,
+    EventAlertRecord,
+    EventPollingReport,
     ExternalDataSourceStatus,
     GraphImportReport,
     GraphSearchResult,
@@ -55,6 +59,16 @@ from .schemas import TradeLessonRecord, UserOperationRecord, WorkflowCheckpoint
 
 
 class ScenarioEngine:
+    STRICT_ACCESS_ACTIONS = {
+        "run_batch",
+        "manage_graph",
+        "register_source",
+        "monitor_event",
+        "export_report",
+    }
+    ALLOWED_ASSET_TYPES = {"index", "etf", "future", "bond", "gold", "fx"}
+    ALLOWED_PROXY_FACTORS = {"interest_rate", "cny_fx", "oil_price", "market_index", "gold_price", "bond_yield"}
+
     def __init__(self, db_path: str | None = None, persist: bool = True):
         self.data_provider = ScenarioDataProvider(db_path)
         self.parser = ScenarioParser()
@@ -81,6 +95,7 @@ class ScenarioEngine:
         self.enterprise_audit = EnterpriseAudit()
         self.report_versioner = ReportVersioner()
         self.report_exporter = ReportExporter()
+        self.event_scheduler: EventPollingScheduler | None = None
         if self.repository is not None:
             for document in self.repository.load_graph_text_documents():
                 self.knowledge_graph.apply_text_document(document)
@@ -312,8 +327,8 @@ class ScenarioEngine:
         report = self.repository.replay_scenario(scenario_id, review_date)
         return report
 
-    def search_knowledge_graph(self, query: str, top_k: int = 10) -> GraphSearchResult:
-        result = self.knowledge_graph.search(query, top_k=top_k)
+    def search_knowledge_graph(self, query: str, top_k: int = 10, hop_depth: int = 3) -> GraphSearchResult:
+        result = self.knowledge_graph.search(query, top_k=top_k, hop_depth=hop_depth)
         if self.repository is not None:
             self.repository.save_graph_search(result)
         return result
@@ -559,6 +574,174 @@ class ScenarioEngine:
         )
         return ingest
 
+    def poll_event_sources(
+        self,
+        as_of_date: str,
+        symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        source_ids: list[str] | None = None,
+        auto_run: bool = False,
+        alert_threshold: float = 0.35,
+        alert_channel: str = "dashboard",
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> EventPollingReport:
+        """Poll registered event sources once and persist triggered alerts.
+
+        This is the runnable unit behind "automatic" monitoring. A scheduler or
+        service loop can call it periodically; the method itself does not invent
+        source content and only uses registered manual/file/MCP/GDELT sources.
+        """
+        self._require_access(user_id, role, "monitor_event")
+        if self.repository is None:
+            raise ValueError("poll_event_sources requires persist=True")
+        selected_sources = source_ids or self.repository.list_event_source_ids(status="active")
+        ingests: list[EventSourceIngestResult] = []
+        alerts: list[EventAlertRecord] = []
+        for source_id in selected_sources:
+            ingest = self.ingest_event_source(
+                source_id=source_id,
+                as_of_date=as_of_date,
+                symbols=symbols,
+                weights=weights,
+                auto_run=auto_run,
+                user_id=user_id,
+                role=role,
+            )
+            ingests.append(ingest)
+            for result in ingest.monitor_results:
+                if result.trigger_level == "triggered" and result.similarity >= alert_threshold:
+                    alert = self._build_event_alert(
+                        result=result,
+                        source_id=source_id,
+                        channel=alert_channel,
+                        metadata={"auto_run": auto_run, "source_type": ingest.source_type},
+                    )
+                    self.repository.save_event_alert(alert)
+                    alerts.append(alert)
+        created_at = datetime.now().isoformat(timespec="microseconds")
+        poll_id = "event_poll_" + hashlib.sha1(
+            f"{as_of_date}|{','.join(selected_sources)}|{len(alerts)}|{created_at}".encode("utf-8")
+        ).hexdigest()[:12]
+        report = EventPollingReport(
+            poll_id=poll_id,
+            as_of_date=as_of_date,
+            source_ids=selected_sources,
+            ingests=ingests,
+            alerts=alerts,
+            audit={
+                "method": "registered_event_source_poll_once",
+                "alert_threshold": alert_threshold,
+                "alert_channel": alert_channel,
+                "source_count": len(selected_sources),
+                "alert_count": len(alerts),
+                "created_at": created_at,
+                "mcp_protocol_basis": "JSON-RPC tools/call per modelcontextprotocol.io specification",
+                "validation_status": "passed",
+            },
+        )
+        self.repository.save_event_polling_report(report)
+        self.repository.save_audit_log(
+            self.enterprise_audit.build_log(
+                user_id=user_id or "system",
+                action="poll_event_sources",
+                resource_id=report.poll_id,
+                payload={"source_ids": selected_sources, "alert_count": len(alerts)},
+            )
+        )
+        return report
+
+    def _build_event_alert(
+        self,
+        result: EventMonitorResult,
+        source_id: str,
+        channel: str,
+        metadata: dict | None = None,
+    ) -> EventAlertRecord:
+        created_at = datetime.now().isoformat(timespec="microseconds")
+        alert_id = "alert_" + hashlib.sha1(
+            f"{result.event_id}|{source_id}|{channel}|{created_at}".encode("utf-8")
+        ).hexdigest()[:12]
+        message = (
+            f"事件源 {source_id} 触发情景模板：{result.matched_template}；"
+            f"相似度 {result.similarity:.2f}。建议动作：{result.recommended_action}。"
+        )
+        return EventAlertRecord(
+            alert_id=alert_id,
+            event_id=result.event_id,
+            source_id=source_id,
+            as_of_date=result.as_of_date,
+            trigger_level=result.trigger_level,
+            matched_template=result.matched_template,
+            similarity=result.similarity,
+            channel=channel,
+            message=message,
+            created_at=created_at,
+            metadata=metadata or {},
+        )
+
+    def start_event_monitoring(
+        self,
+        as_of_date: str,
+        interval_seconds: float,
+        symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        source_ids: list[str] | None = None,
+        auto_run: bool = False,
+        alert_threshold: float = 0.35,
+        alert_channel: str = "dashboard",
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict:
+        self._require_access(user_id, role, "monitor_event")
+        if self.repository is None:
+            raise ValueError("start_event_monitoring requires persist=True")
+        if self.event_scheduler is not None and self.event_scheduler.status()["running"]:
+            raise RuntimeError("event monitoring scheduler is already running")
+        self.event_scheduler = EventPollingScheduler(
+            engine=self,
+            as_of_date=as_of_date,
+            interval_seconds=interval_seconds,
+            symbols=symbols,
+            weights=weights,
+            source_ids=source_ids,
+            auto_run=auto_run,
+            alert_threshold=alert_threshold,
+            alert_channel=alert_channel,
+            user_id=user_id,
+            role=role,
+        )
+        status = self.event_scheduler.start()
+        self.repository.save_audit_log(
+            self.enterprise_audit.build_log(
+                user_id=user_id or "system",
+                action="start_event_monitoring",
+                resource_id="event_scheduler",
+                payload=status,
+            )
+        )
+        return status
+
+    def stop_event_monitoring(
+        self,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict:
+        self._require_access(user_id, role, "monitor_event")
+        if self.event_scheduler is None:
+            return {"running": False, "run_count": 0, "last_poll_id": None, "last_error": None}
+        status = self.event_scheduler.stop()
+        if self.repository is not None:
+            self.repository.save_audit_log(
+                self.enterprise_audit.build_log(
+                    user_id=user_id or "system",
+                    action="stop_event_monitoring",
+                    resource_id="event_scheduler",
+                    payload=status,
+                )
+            )
+        return status
+
     def _monitor_and_ingest_event_text(
         self,
         event_text: str,
@@ -597,7 +780,8 @@ class ScenarioEngine:
         return result
 
     def multi_asset_coverage(self, as_of_date: str) -> MultiAssetCoverageReport:
-        report = self.multi_asset_coverage_checker.coverage(as_of_date)
+        asset_proxies = self.repository.list_asset_proxies() if self.repository is not None else []
+        report = self.multi_asset_coverage_checker.coverage(as_of_date, asset_proxies=asset_proxies)
         if self.repository is not None:
             self.repository.save_multi_asset_coverage(report)
         return report
@@ -682,13 +866,31 @@ class ScenarioEngine:
         available: bool,
         reason: str,
         metadata: dict | None = None,
+        user_id: str | None = None,
+        role: str | None = None,
     ) -> ExternalDataSourceStatus:
+        self._require_access(user_id, role, "register_source")
         status = self.external_data_registry.register(source_name, connector_type, available, reason, metadata)
         if self.repository is not None:
             self.repository.save_external_data_status(status)
+            self.repository.save_audit_log(
+                self.enterprise_audit.build_log(
+                    user_id=user_id or "system",
+                    action="register_external_data_source",
+                    resource_id=source_name,
+                    payload=status.to_dict(),
+                )
+            )
         return status
 
-    def register_mcp_event_connector(self, source_name: str, connector) -> ExternalDataSourceStatus:
+    def register_mcp_event_connector(
+        self,
+        source_name: str,
+        connector,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> ExternalDataSourceStatus:
+        self._require_access(user_id, role, "register_source")
         self.external_data_registry.register_event_connector(source_name, connector)
         status = self.external_data_registry.register(
             source_name=source_name,
@@ -699,6 +901,14 @@ class ScenarioEngine:
         )
         if self.repository is not None:
             self.repository.save_external_data_status(status)
+            self.repository.save_audit_log(
+                self.enterprise_audit.build_log(
+                    user_id=user_id or "system",
+                    action="register_mcp_event_connector",
+                    resource_id=source_name,
+                    payload=status.to_dict(),
+                )
+            )
         return status
 
     def register_mcp_jsonrpc_event_connector(
@@ -707,10 +917,14 @@ class ScenarioEngine:
         transport,
         tool_name: str,
         arguments: dict | None = None,
+        user_id: str | None = None,
+        role: str | None = None,
     ) -> ExternalDataSourceStatus:
         return self.register_mcp_event_connector(
             source_name=source_name,
             connector=McpJsonRpcEventConnector(transport=transport, tool_name=tool_name, arguments=arguments),
+            user_id=user_id,
+            role=role,
         )
 
     def register_gdelt_doc_news_source(
@@ -753,10 +967,13 @@ class ScenarioEngine:
         self._require_access(user_id, role, "manage_graph")
         if self.repository is None:
             raise ValueError("register_asset_proxy requires persist=True")
-        if factor not in {"interest_rate", "cny_fx", "oil_price", "market_index"}:
+        if factor not in self.ALLOWED_PROXY_FACTORS:
             raise ValueError("unsupported proxy factor")
+        if asset_type not in self.ALLOWED_ASSET_TYPES:
+            raise ValueError(f"asset_type must be one of: {sorted(self.ALLOWED_ASSET_TYPES)}")
         if table_name not in {"stock_daily", "index_daily"}:
-            raise ValueError("table_name must be stock_daily or index_daily")
+            if table_name != "scenario_multi_asset_prices":
+                raise ValueError("table_name must be stock_daily, index_daily or scenario_multi_asset_prices")
         if direction == 0:
             raise ValueError("direction cannot be zero")
         history = self.data_provider.get_asset_history(table_name, symbol, datetime.now().strftime("%Y-%m-%d"), lookback_days=5000)
@@ -782,6 +999,31 @@ class ScenarioEngine:
             )
         )
         return proxy
+
+    def import_multi_asset_prices(
+        self,
+        asset_type: str,
+        symbol: str,
+        rows: list[dict],
+        source_uri: str,
+        user_id: str | None = None,
+        role: str | None = None,
+    ) -> dict:
+        self._require_access(user_id, role, "manage_graph")
+        if self.repository is None:
+            raise ValueError("import_multi_asset_prices requires persist=True")
+        if asset_type not in self.ALLOWED_ASSET_TYPES:
+            raise ValueError(f"asset_type must be one of: {sorted(self.ALLOWED_ASSET_TYPES)}")
+        result = self.repository.save_multi_asset_prices(asset_type, symbol, rows, source_uri)
+        self.repository.save_audit_log(
+            self.enterprise_audit.build_log(
+                user_id=user_id or "system",
+                action="import_multi_asset_prices",
+                resource_id=f"{asset_type}:{symbol}",
+                payload=result,
+            )
+        )
+        return result
 
     def external_data_status(self, source_name: str) -> ExternalDataSourceStatus:
         if self.repository is not None:
@@ -840,6 +1082,8 @@ class ScenarioEngine:
         return self.run(**kwargs)
 
     def close(self) -> None:
+        if self.event_scheduler is not None and self.event_scheduler.status()["running"]:
+            self.event_scheduler.stop()
         self.data_provider.db.close()
 
     def _checkpoint(
@@ -861,10 +1105,10 @@ class ScenarioEngine:
         self.repository.save_checkpoint(checkpoint)
 
     def _require_access(self, user_id: str | None, role: str | None, action: str) -> None:
-        if role is None:
+        if role is None and user_id is None and action not in self.STRICT_ACCESS_ACTIONS:
             return
-        if not user_id:
-            raise ValueError("user_id and role must be provided together for access-controlled operations")
+        if not user_id or not role:
+            raise ValueError("user_id and role are required for access-controlled operations")
         decision = self.check_access(user_id, role, action)
         if not decision.allowed:
             raise PermissionError(f"access denied for {role}:{action}")

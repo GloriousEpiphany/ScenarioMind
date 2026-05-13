@@ -206,6 +206,7 @@ class TradingTools:
                         "股票代码": pos.symbol,
                         "股票名称": pos.name,
                         "持仓数量": pos.quantity,
+                        "T+1可卖数量": portfolio.get_sellable_quantity(pos.symbol, current_date),
                         "成本价": round(pos.avg_cost, 2),
                         "当前价": round(pos.current_price, 2),
                         "市值": round(pos.market_value, 2),
@@ -269,6 +270,12 @@ class TradingTools:
                 if position.quantity < quantity:
                     return json.dumps({
                         "error": f"持仓不足！持有 {position.quantity} 股，卖出 {quantity} 股"
+                    }, ensure_ascii=False)
+
+                sellable_quantity = portfolio.get_sellable_quantity(symbol, current_date)
+                if sellable_quantity < quantity:
+                    return json.dumps({
+                        "error": f"T+1限制：{symbol} 当前可卖 {sellable_quantity} 股，申请卖出 {quantity} 股"
                     }, ensure_ascii=False)
                 
                 # 获取当前价格

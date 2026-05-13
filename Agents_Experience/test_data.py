@@ -3,10 +3,16 @@
 """
 import sys
 import os
+
+if "pytest" in sys.modules and os.getenv("STOCKM1_RUN_INTEGRATION_TESTS") != "1":
+    import pytest
+
+    pytest.skip("local database integration test requires STOCKM1_RUN_INTEGRATION_TESTS=1", allow_module_level=True)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import DATABASE_PATH, MVP_STOCK_POOL, MVP_START_DATE, MVP_END_DATE
-from core.data_provider import MarketDataProvider
+from Agents_Experience.config import DATABASE_PATH, MVP_STOCK_POOL, MVP_START_DATE, MVP_END_DATE
+from Agents_Experience.core.data_provider import MarketDataProvider
 
 
 def test_database():

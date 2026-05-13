@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
 from typing import Optional
 
 import pandas as pd
@@ -53,7 +54,49 @@ class ScenarioDataProvider:
             return self.get_stock_history(symbol, end_date, lookback_days=lookback_days)
         if table_name == "index_daily":
             return self._get_index_history(symbol, end_date, lookback_days)
-        raise ValueError("table_name must be stock_daily or index_daily")
+        if table_name == "scenario_multi_asset_prices":
+            return self._get_multi_asset_history(symbol, end_date, lookback_days)
+        raise ValueError("table_name must be stock_daily, index_daily or scenario_multi_asset_prices")
+
+    def save_multi_asset_prices(self, asset_type: str, symbol: str, rows: list[dict], source_uri: str) -> int:
+        if asset_type not in {"etf", "future", "bond", "gold", "fx", "index"}:
+            raise ValueError("unsupported multi-asset type")
+        if not symbol.strip() or not source_uri.strip():
+            raise ValueError("symbol and source_uri are required")
+        if not rows:
+            raise ValueError("at least one price row is required")
+        conn = self.db.connect()
+        saved = 0
+        for row in rows:
+            date = str(row.get("date") or "").strip()
+            close = row.get("close")
+            if not date:
+                raise ValueError("price row missing date")
+            try:
+                parsed = datetime.strptime(date, "%Y-%m-%d")
+                close_value = float(close)
+            except Exception as exc:
+                raise ValueError(f"invalid multi-asset price row for {symbol}: {row}") from exc
+            if close_value <= 0:
+                raise ValueError("close must be positive")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scenario_multi_asset_prices
+                (asset_type, symbol, date, close, source_uri, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    asset_type,
+                    symbol.strip(),
+                    parsed.strftime("%Y-%m-%d"),
+                    close_value,
+                    source_uri.strip(),
+                    json.dumps(row.get("metadata") or {}, ensure_ascii=False),
+                ),
+            )
+            saved += 1
+        conn.commit()
+        return saved
 
     def get_latest_price_on_or_before(self, symbol: str, as_of_date: str) -> Optional[dict]:
         conn = self.db.connect()
@@ -143,5 +186,23 @@ class ScenarioDataProvider:
         if df.empty:
             return df
         df = df.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        return df.tail(lookback_days)
+
+    def _get_multi_asset_history(self, symbol: str, end_date: str, lookback_days: int) -> pd.DataFrame:
+        start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=lookback_days * 2)).strftime("%Y-%m-%d")
+        conn = self.db.connect()
+        df = pd.read_sql_query(
+            """
+            SELECT date, close
+            FROM scenario_multi_asset_prices
+            WHERE symbol = ? AND date >= ? AND date <= ?
+            ORDER BY date
+            """,
+            conn,
+            params=(symbol, start_date, end_date),
+        )
+        if df.empty:
+            return df
         df["date"] = pd.to_datetime(df["date"])
         return df.tail(lookback_days)

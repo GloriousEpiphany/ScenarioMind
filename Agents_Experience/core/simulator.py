@@ -13,6 +13,7 @@ from src.stock_app.portfolio import Portfolio, Position
 from .data_provider import MarketDataProvider
 from .tools import TradingTools
 from ..utils.logger import DualLogger
+from ..data_sources import DataAggregator, build_default_data_aggregator
 
 
 class TradingSimulator:
@@ -24,7 +25,8 @@ class TradingSimulator:
                  initial_capital: float,
                  start_date: str,
                  end_date: str,
-                 db_path: str = None):
+                 db_path: str = None,
+                 data_aggregator: DataAggregator = None):
         """
         初始化模拟器
         
@@ -45,6 +47,7 @@ class TradingSimulator:
         # 初始化数据提供者和工具
         self.data_provider = MarketDataProvider(db_path)
         self.tools = TradingTools(self.data_provider, stock_pool)
+        self.data_aggregator = data_aggregator or build_default_data_aggregator()
         
         # 初始化投资组合
         self.portfolio = Portfolio(f"Agent_{agent.agent_id}", initial_capital)
@@ -147,6 +150,10 @@ class TradingSimulator:
         
         # 生成最终报告
         return self._generate_report()
+
+    def close(self):
+        """Close resources owned by the simulator."""
+        self.data_provider.db.close()
     
     def _get_trading_dates(self) -> List[str]:
         """获取交易日列表"""
@@ -194,11 +201,19 @@ class TradingSimulator:
         
         # 调用Agent决策
         try:
+            aggregated_context = self.data_aggregator.aggregate(
+                date=current_date,
+                stock_codes=self.stock_pool,
+            )
             decision = self.agent.make_decision(
                 current_date=current_date,
                 portfolio_info=portfolio_info,
                 tools=self.tools,
-                context={'portfolio': self.portfolio}
+                context={
+                    'portfolio': self.portfolio,
+                    'data_context': aggregated_context.text,
+                    'data_context_audit': aggregated_context.audit,
+                }
             )
             return decision
         except Exception as e:
@@ -253,7 +268,7 @@ class TradingSimulator:
             
             # 执行交易
             self.portfolio.cash -= total_cost
-            self.portfolio.add_position(symbol, stock_name, quantity, price)
+            self.portfolio.add_position(symbol, stock_name, quantity, price, trade_date=date)
             
             # 记录交易
             self.trade_log.append({
@@ -278,6 +293,8 @@ class TradingSimulator:
             position = self.portfolio.get_position(symbol)
             if not position or position.quantity < quantity:
                 return False
+            if self.portfolio.get_sellable_quantity(symbol, date) < quantity:
+                return False
             
             # 获取价格
             price_info = self.data_provider.get_stock_price_on_date(symbol, date)
@@ -294,7 +311,8 @@ class TradingSimulator:
             
             # 执行交易
             self.portfolio.cash += total_revenue
-            self.portfolio.reduce_position(symbol, quantity)
+            if not self.portfolio.reduce_position(symbol, quantity, current_date=date):
+                return False
             
             # 记录交易
             self.trade_log.append({
