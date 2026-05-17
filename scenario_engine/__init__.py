@@ -1,9 +1,9 @@
 """Scenario Lab for StockM1.
 
-The package intentionally keeps scenario calculations deterministic and auditable:
-LLMs may be added later as parsers/report writers, but numeric impacts are
-computed only from local market data, user-provided shocks, or documented
-templates.
+The package uses optional LLM structured parsing for natural-language scenarios
+while keeping numeric impacts deterministic and auditable. Portfolio ranges are
+computed only from local market data, user-provided shocks, registered proxies,
+or documented templates.
 """
 
 from .engine import ScenarioEngine

@@ -14,6 +14,38 @@ from Agents_Experience.core.scenario_tools import ScenarioTools
 from src.stock_app.database import Database
 
 
+class FakeScenarioLLMClient:
+    model = "fake-scenario-parser"
+
+    def parse_scenario(self, user_query, as_of_date, horizon=None):
+        return {
+            "parsed": {
+                "event_type": "policy",
+                "event_name": "LLM解析的出口管制升级",
+                "region": "GLOBAL",
+                "horizon": horizon or "3m",
+                "affected_entities": ["半导体", "国产替代", "出口链"],
+                "shocks": [
+                    {
+                        "factor": "semiconductor_export_restriction",
+                        "direction": "up",
+                        "magnitude": None,
+                        "unit": "qualitative",
+                        "timing": "unknown",
+                        "source": "llm_structured_parser",
+                    }
+                ],
+                "missing_information": ["限制清单", "执行日期"],
+                "confidence": 0.71,
+            },
+            "metadata": {
+                "provider": "fake_openai_compatible",
+                "model": "fake-scenario-parser",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+            },
+        }
+
+
 class ScenarioEngineTestCase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -86,6 +118,15 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertIn("可量化冲击幅度", spec.missing_information)
         self.assertEqual(spec.shocks, [])
 
+    def test_llm_parser_structures_scenario_without_owning_numeric_impacts(self):
+        parser = ScenarioParser(llm_client=FakeScenarioLLMClient())
+        spec = parser.parse("如果美国扩大半导体出口限制，我的持仓会怎样？", "2020-03-20")
+        self.assertEqual(spec.event_name, "LLM解析的出口管制升级")
+        self.assertEqual(spec.horizon, "3m")
+        self.assertEqual(spec.shocks[0].source, "llm_structured_parser")
+        self.assertIn("限制清单", spec.missing_information)
+        self.assertEqual(parser.last_llm_metadata["model"], "fake-scenario-parser")
+
     def test_unknown_scenario_is_not_quantified_without_evidence(self):
         engine = ScenarioEngine(self.db_path, persist=False)
         try:
@@ -100,6 +141,25 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertIsNone(report.portfolio_total_impact["base_range"])
         self.assertTrue(all(item.base_return_range is None for item in report.portfolio_impacts))
         self.assertEqual(report.audit["validation_status"], "passed")
+
+    def test_engine_audits_llm_parser_and_keeps_unknown_llm_shock_unquantified(self):
+        engine = ScenarioEngine(self.db_path, persist=False, use_llm=True, llm_client=FakeScenarioLLMClient())
+        try:
+            report = engine.run(
+                user_query="如果美国扩大半导体出口限制，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001", "600519"],
+                weights=[0.5, 0.5],
+            )
+        finally:
+            engine.close()
+        self.assertTrue(report.audit["llm"]["used"])
+        self.assertEqual(report.audit["scenario_parser"], "llm_structured_output_with_rule_normalizer")
+        self.assertIn("no_llm_numeric_generation", report.audit["method"])
+        self.assertIn("semiconductor_export_restriction", report.audit["shock_status"])
+        self.assertEqual(report.audit["shock_status"]["semiconductor_export_restriction"], "scenario_proxy")
+        if report.portfolio_total_impact["base_range"] is not None:
+            self.assertTrue(report.evidence)
 
     def test_template_scenario_uses_only_local_historical_window_returns(self):
         engine = ScenarioEngine(self.db_path, persist=False)
@@ -239,7 +299,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 spec = parser.parse(query, "2020-03-20")
                 self.assertNotEqual(spec.event_type, "unknown")
 
-    def test_non_market_shock_is_mapped_but_not_fabricated(self):
+    def test_non_market_shock_uses_audited_scenario_proxy_without_fabricated_data(self):
         engine = ScenarioEngine(self.db_path, persist=False)
         try:
             report = engine.run(
@@ -251,9 +311,11 @@ class ScenarioEngineTestCase(unittest.TestCase):
         finally:
             engine.close()
         shock_status = report.audit["shock_status"]
-        self.assertEqual(shock_status.get("interest_rate"), "not_quantified")
-        self.assertEqual(shock_status.get("cny_fx"), "not_quantified")
+        self.assertEqual(shock_status.get("interest_rate"), "scenario_proxy")
+        self.assertEqual(shock_status.get("cny_fx"), "scenario_proxy")
         self.assertTrue(any(e.evidence_type == "shock_mapping" for e in report.evidence))
+        self.assertTrue(any(e.evidence_type == "scenario_proxy_model" for e in report.evidence))
+        self.assertIsNotNone(report.portfolio_total_impact["base_range"])
 
     def test_report_contains_required_mvp_sections(self):
         engine = ScenarioEngine(self.db_path, persist=False)

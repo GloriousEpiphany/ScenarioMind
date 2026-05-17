@@ -1,7 +1,10 @@
 """
 数据下载模块 - 使用akshare下载A股历史数据
 """
-import akshare as ak
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
 import pandas as pd
 from datetime import datetime
 from typing import Optional, List
@@ -25,6 +28,8 @@ class DataDownloader:
             DataFrame: 包含股票代码、名称等信息
         """
         try:
+            if ak is None:
+                raise RuntimeError("akshare 未安装，无法下载股票列表。")
             self.console.print("[cyan]正在获取A股股票列表...[/cyan]")
             # 获取沪深A股列表
             stock_list = ak.stock_info_a_code_name()
@@ -50,6 +55,8 @@ class DataDownloader:
             DataFrame: 包含日期、开盘价、最高价、最低价、收盘价、成交量等
         """
         try:
+            if ak is None:
+                raise RuntimeError("akshare 未安装，无法下载股票日线数据。")
             if end_date is None:
                 end_date = datetime.now().strftime('%Y%m%d')
             
@@ -118,6 +125,8 @@ class DataDownloader:
             DataFrame: 指数日线数据
         """
         try:
+            if ak is None:
+                raise RuntimeError("akshare 未安装，无法下载指数日线数据。")
             if end_date is None:
                 end_date = datetime.now().strftime('%Y%m%d')
             

@@ -144,6 +144,14 @@ class ReportComposer:
         lines.extend(["", "## 审计", ""])
         lines.append(f"- 方法：{report.audit.get('method')}")
         lines.append(f"- 数据边界：{report.audit.get('data_boundary')}")
+        llm_audit = report.audit.get("llm") or {}
+        if llm_audit:
+            lines.append(
+                "- LLM 解析："
+                f"{'已使用' if llm_audit.get('used') else '未使用'}"
+                f"（parser={report.audit.get('scenario_parser')}, model={llm_audit.get('model') or '无'}）"
+            )
+            lines.append(f"- LLM 数值边界：{llm_audit.get('numeric_generation_policy')}")
         lines.append(f"- 冲击映射：{report.audit.get('shock_status')}")
         for note in report.audit.get("a_share_constraints", []):
             lines.append(f"- A股约束：{note}")

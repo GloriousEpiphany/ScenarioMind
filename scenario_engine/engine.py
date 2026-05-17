@@ -17,6 +17,7 @@ from .enterprise import AccessControl, EnterpriseAudit, ReportVersioner
 from .external_data import ExternalDataRegistry, McpJsonRpcEventConnector
 from .factors import FactorExposureEstimator
 from .knowledge_graph import LocalKnowledgeGraph
+from .llm import ScenarioLLMClient, llm_enabled_from_environment
 from .multi_asset import MultiAssetCoverage
 from .news_connectors import GdeltDocNewsConnector
 from .parser import ScenarioParser
@@ -69,9 +70,42 @@ class ScenarioEngine:
     ALLOWED_ASSET_TYPES = {"index", "etf", "future", "bond", "gold", "fx"}
     ALLOWED_PROXY_FACTORS = {"interest_rate", "cny_fx", "oil_price", "market_index", "gold_price", "bond_yield"}
 
-    def __init__(self, db_path: str | None = None, persist: bool = True):
+    def __init__(
+        self,
+        db_path: str | None = None,
+        persist: bool = True,
+        use_llm: bool | None = None,
+        llm_client=None,
+    ):
         self.data_provider = ScenarioDataProvider(db_path)
-        self.parser = ScenarioParser()
+        self.llm_client = llm_client
+        self.llm_status = {
+            "enabled": False,
+            "available": False,
+            "reason": "not_requested",
+            "model": None,
+            "provider": None,
+        }
+        if self.llm_client is None and (use_llm is True or (use_llm is None and llm_enabled_from_environment())):
+            try:
+                self.llm_client = ScenarioLLMClient.from_environment()
+            except Exception as exc:
+                self.llm_client = None
+                self.llm_status["reason"] = f"llm_unavailable: {exc}"
+            if self.llm_client is None:
+                if self.llm_status.get("reason") == "not_requested":
+                    self.llm_status["reason"] = "missing_api_configuration"
+        if self.llm_client is not None:
+            self.llm_status.update(
+                {
+                    "enabled": True,
+                    "available": True,
+                    "reason": "configured",
+                    "model": getattr(self.llm_client, "model", "custom_llm_client"),
+                    "provider": "openai_compatible_chat_completions",
+                }
+            )
+        self.parser = ScenarioParser(llm_client=self.llm_client)
         self.portfolio_builder = PortfolioBuilder(self.data_provider)
         self.analog_retriever = HistoricalAnalogRetriever(self.data_provider, self.parser)
         self.factor_estimator = FactorExposureEstimator(self.data_provider)
@@ -121,6 +155,7 @@ class ScenarioEngine:
             raise ValueError("mode must be one of: quick, standard, deep")
         factor_lookback = {"quick": 60, "standard": 120, "deep": 240}[mode]
         spec = self.parser.parse(user_query, as_of_date, horizon=horizon)
+        parser_audit = self._parser_audit()
         self._checkpoint(spec.scenario_id, "CREATED", {"user_query": user_query, "as_of_date": as_of_date})
         self._checkpoint(
             spec.scenario_id,
@@ -162,9 +197,14 @@ class ScenarioEngine:
 
         evidence = shock_evidence + constraints.evidences + analogs.evidences + graph_evidence + exposure_evidence + proxy_evidence + simulator_evidence
         audit = {
-            "method": "deterministic_v2_local_data_kg_and_audit_no_llm_numeric_generation",
+            "method": (
+                "llm_structured_parser_plus_deterministic_v2_local_data_kg_and_audit_no_llm_numeric_generation"
+                if parser_audit["used"]
+                else "deterministic_v2_local_data_kg_and_audit_no_llm_numeric_generation"
+            ),
             "data_boundary": f"only local data on or before {as_of_date}",
-            "scenario_parser": "rule_based_templates",
+            "scenario_parser": parser_audit["scenario_parser"],
+            "llm": parser_audit,
             "mode": mode,
             "factor_lookback_days": factor_lookback,
             "shock_status": shock_status,
@@ -172,7 +212,7 @@ class ScenarioEngine:
             "validation_status": "pending",
             "graph_context_edges": [edge.to_dict() for edge in graph_edges[:20]],
             "external_data_policy": "local_only_unless_registered_and_audited",
-            "model_snapshot_id": "scenario_engine_deterministic_v2",
+            "model_snapshot_id": parser_audit["model_snapshot_id"],
             "data_snapshot_id": self._data_snapshot_id(as_of_date),
             "registered_asset_proxies": asset_proxies,
             "state_trace": [
@@ -212,6 +252,7 @@ class ScenarioEngine:
                 input_payload={"user_query": user_query, "as_of_date": as_of_date, "symbols": symbols},
                 output_payload=report.to_dict(),
                 data_snapshot_id=report.audit["data_snapshot_id"],
+                model_snapshot_id=report.audit["model_snapshot_id"],
             )
         return report
 
@@ -1234,7 +1275,49 @@ class ScenarioEngine:
         digest = hashlib.sha1(f"{as_of_date}|stock_daily:{stock_count}|index_daily:{index_count}".encode("utf-8")).hexdigest()[:12]
         return f"data_snapshot_{digest}"
 
-    def _trace(self, name: str, trace_id: str, input_payload: dict, output_payload: dict, data_snapshot_id: str) -> None:
+    def _parser_audit(self) -> dict:
+        metadata = self.parser.last_llm_metadata or {}
+        error = self.parser.last_llm_error
+        if metadata:
+            model = metadata.get("model") or self.llm_status.get("model") or "custom_llm_client"
+            return {
+                "enabled": True,
+                "used": True,
+                "available": True,
+                "scenario_parser": "llm_structured_output_with_rule_normalizer",
+                "provider": metadata.get("provider") or self.llm_status.get("provider"),
+                "model": model,
+                "usage": metadata.get("usage", {}),
+                "error": None,
+                "numeric_generation_policy": "forbidden_for_portfolio_impacts",
+                "fallback": "not_used",
+                "model_snapshot_id": f"scenario_engine_llm_parser_{model}",
+            }
+        enabled = bool(self.llm_status.get("enabled"))
+        return {
+            "enabled": enabled,
+            "used": False,
+            "available": bool(self.llm_status.get("available")),
+            "scenario_parser": "rule_based_templates",
+            "provider": self.llm_status.get("provider"),
+            "model": self.llm_status.get("model"),
+            "usage": {},
+            "error": error,
+            "numeric_generation_policy": "forbidden_for_portfolio_impacts",
+            "fallback": "rule_based_templates",
+            "model_snapshot_id": "scenario_engine_deterministic_v2",
+            "reason": self.llm_status.get("reason"),
+        }
+
+    def _trace(
+        self,
+        name: str,
+        trace_id: str,
+        input_payload: dict,
+        output_payload: dict,
+        data_snapshot_id: str,
+        model_snapshot_id: str = "scenario_engine_deterministic_v2",
+    ) -> None:
         if self.repository is None:
             return
         import hashlib
@@ -1251,7 +1334,7 @@ class ScenarioEngine:
                 name=name,
                 input_hash=input_hash,
                 output_hash=output_hash,
-                model_snapshot_id="scenario_engine_deterministic_v2",
+                model_snapshot_id=model_snapshot_id,
                 data_snapshot_id=data_snapshot_id,
                 created_at=datetime.now().isoformat(timespec="microseconds"),
                 metadata={"otel_compatible_fields": ["trace_id", "span_id", "parent_span_id", "name"]},

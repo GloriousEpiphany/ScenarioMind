@@ -1,24 +1,51 @@
-"""Deterministic scenario parser."""
+"""Scenario parser with optional LLM structured parsing."""
 
 from __future__ import annotations
 
 import hashlib
 import re
 from datetime import datetime
+from typing import Any
 
+from .llm import ALLOWED_DIRECTIONS, ALLOWED_HORIZONS, LLMCallResult
 from .schemas import Assumption, ScenarioSpec, ShockSpec
 from .templates import DEFAULT_MISSING, SCENARIO_TEMPLATES
 
 
 class ScenarioParser:
-    """Rule-based parser.
+    """Parse natural-language scenarios into ScenarioSpec.
 
-    The parser deliberately avoids pretending to understand every financial event.
-    Unknown details are surfaced as missing information instead of being filled
-    with fabricated values.
+    Rules remain the fallback and normalization layer. When an LLM client is
+    supplied, it is constrained to structured scenario parsing and cannot own
+    numeric impact generation.
     """
 
+    def __init__(self, llm_client: Any | None = None):
+        self.llm_client = llm_client
+        self.last_llm_metadata: dict[str, Any] | None = None
+        self.last_llm_error: str | None = None
+
     def parse(self, user_query: str, as_of_date: str, horizon: str | None = None) -> ScenarioSpec:
+        self.last_llm_metadata = None
+        self.last_llm_error = None
+        spec = self._parse_rules(user_query, as_of_date, horizon=horizon)
+        if self.llm_client is None:
+            return spec
+        try:
+            result = self.llm_client.parse_scenario(user_query, as_of_date, horizon=horizon)
+            if isinstance(result, LLMCallResult):
+                parsed = result.parsed
+                metadata = result.metadata
+            else:
+                parsed = result.get("parsed", result)
+                metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
+            spec = self._merge_llm_spec(spec, parsed)
+            self.last_llm_metadata = metadata or {"provider": "custom_llm_client"}
+        except Exception as exc:
+            self.last_llm_error = str(exc)
+        return spec
+
+    def _parse_rules(self, user_query: str, as_of_date: str, horizon: str | None = None) -> ScenarioSpec:
         query = (user_query or "").strip()
         if not query:
             raise ValueError("user_query cannot be empty")
@@ -32,6 +59,8 @@ class ScenarioParser:
         affected = list(matched_template["affected_entities"]) if matched_template else []
         missing = list(matched_template["missing"]) if matched_template else list(DEFAULT_MISSING)
         shocks = self._extract_shocks(query)
+        if matched_template and not shocks:
+            shocks = self._template_default_shocks(matched_template)
         parsed_horizon = horizon or self._extract_horizon(query) or "1m"
 
         if not shocks:
@@ -65,6 +94,91 @@ class ScenarioParser:
             missing_information=sorted(set(missing)),
             confidence=confidence,
         )
+
+    def _merge_llm_spec(self, base: ScenarioSpec, parsed: dict[str, Any]) -> ScenarioSpec:
+        if not isinstance(parsed, dict):
+            raise ValueError("LLM parser output must be a dict")
+
+        llm_shocks = self._normalize_llm_shocks(parsed.get("shocks"))
+        shocks = llm_shocks or base.shocks
+        assumptions = list(base.assumptions)
+        assumptions.append(
+            Assumption(
+                key="scenario_parser",
+                value="llm_structured_output",
+                source="llm",
+                confidence=self._bounded_float(parsed.get("confidence"), default=0.55),
+                needs_user_confirmation=bool(parsed.get("missing_information")),
+            )
+        )
+        horizon = str(parsed.get("horizon") or base.horizon)
+        if horizon not in ALLOWED_HORIZONS:
+            horizon = base.horizon
+        affected = self._string_list(parsed.get("affected_entities")) or base.affected_entities
+        missing = sorted(set(base.missing_information + self._string_list(parsed.get("missing_information"))))
+        return ScenarioSpec(
+            scenario_id=base.scenario_id,
+            user_query=base.user_query,
+            as_of_date=base.as_of_date,
+            horizon=horizon,
+            event_type=str(parsed.get("event_type") or base.event_type).strip() or base.event_type,
+            event_name=str(parsed.get("event_name") or base.event_name).strip() or base.event_name,
+            region=str(parsed.get("region") or base.region).strip() or base.region,
+            affected_entities=affected,
+            shocks=shocks,
+            assumptions=assumptions,
+            missing_information=missing,
+            confidence=max(base.confidence, self._bounded_float(parsed.get("confidence"), default=base.confidence)),
+        )
+
+    def _normalize_llm_shocks(self, raw: Any) -> list[ShockSpec]:
+        if not isinstance(raw, list):
+            return []
+        shocks: list[ShockSpec] = []
+        for index, item in enumerate(raw, start=1):
+            if not isinstance(item, dict):
+                continue
+            factor = str(item.get("factor") or "").strip()
+            if not factor:
+                continue
+            direction = str(item.get("direction") or "unknown").strip()
+            if direction not in ALLOWED_DIRECTIONS:
+                direction = "unknown"
+            unit = str(item.get("unit") or "unknown").strip()
+            timing = str(item.get("timing") or "unknown").strip()
+            source = str(item.get("source") or "llm_structured_parser").strip()
+            magnitude = item.get("magnitude")
+            if magnitude in ("", "unknown", "null"):
+                magnitude = None
+            if magnitude is not None:
+                try:
+                    magnitude = float(magnitude)
+                except (TypeError, ValueError):
+                    magnitude = None
+            shocks.append(
+                ShockSpec(
+                    shock_id=str(item.get("shock_id") or f"shock_llm_{index}_{factor}"),
+                    factor=factor,
+                    direction=direction,
+                    magnitude=magnitude,
+                    unit=unit,
+                    timing=timing,
+                    source=source,
+                )
+            )
+        return self._deduplicate_shocks(shocks)
+
+    def _string_list(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return sorted({str(item).strip() for item in value if str(item).strip()})
+
+    def _bounded_float(self, value: Any, default: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(0.0, min(1.0, number))
 
     def get_template_for_spec(self, spec: ScenarioSpec) -> dict | None:
         for template in SCENARIO_TEMPLATES:
@@ -102,12 +216,18 @@ class ScenarioParser:
             (r"(油价|原油).{0,8}(上涨|下跌|上升|下降)\s*(\d+(?:\.\d+)?)\s*%", "oil_price"),
             (r"(沪深300|上证指数|大盘|市场).{0,8}(上涨|下跌|上升|下降|暴跌)\s*(\d+(?:\.\d+)?)\s*%", "market_index"),
             (r"(关税).{0,8}(上调|加征|提高|下降|降低)\s*(\d+(?:\.\d+)?)\s*%", "tariff"),
+            (r"(上调|加征|提高|下降|降低)\s*(\d+(?:\.\d+)?)\s*%?\s*(关税)", "tariff"),
         ]
         for pattern, factor in pct_patterns:
             match = re.search(pattern, query)
             if not match:
                 continue
-            action = match.group(2)
+            if factor == "tariff" and match.group(3) == "关税":
+                action = match.group(1)
+                magnitude = match.group(2)
+            else:
+                action = match.group(2)
+                magnitude = match.group(3)
             direction = "down" if action in {"下跌", "下降", "降低"} else "up"
             if action == "暴跌":
                 direction = "down"
@@ -116,7 +236,7 @@ class ScenarioParser:
                     shock_id=f"shock_{factor}",
                     factor=factor,
                     direction=direction,
-                    magnitude=float(match.group(3)),
+                    magnitude=float(magnitude),
                     unit="pct",
                     timing="instant",
                     source="user_input",
@@ -124,6 +244,35 @@ class ScenarioParser:
             )
 
         return self._deduplicate_shocks(shocks)
+
+    def _template_default_shocks(self, template: dict) -> list[ShockSpec]:
+        factor_by_name = {
+            "中美贸易摩擦升级": "tariff",
+            "疫情冲击": "risk_appetite",
+            "地产政策放松": "real_estate_policy",
+            "海外市场大跌": "risk_appetite",
+            "央行降息": "interest_rate",
+            "央行加息或流动性收紧": "interest_rate",
+            "人民币汇率贬值": "cny_fx",
+            "油价上涨": "oil_price",
+            "白酒行业监管": "industry_regulation",
+            "新能源补贴退坡": "subsidy_policy",
+        }
+        factor = factor_by_name.get(template["name"])
+        if not factor:
+            return []
+        direction = "down" if template["name"] in {"央行降息", "地产政策放松"} else "up"
+        return [
+            ShockSpec(
+                shock_id=f"shock_template_{factor}",
+                factor=factor,
+                direction=direction,
+                magnitude=None,
+                unit="qualitative",
+                timing="unknown",
+                source="template_default",
+            )
+        ]
 
     def _deduplicate_shocks(self, shocks: list[ShockSpec]) -> list[ShockSpec]:
         seen = set()

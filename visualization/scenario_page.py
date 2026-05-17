@@ -13,140 +13,106 @@ from scenario_engine.templates import SCENARIO_TEMPLATES
 
 
 def show_scenario_page():
-    st.header("弈境 ScenarioMind - 情景推演实验室")
-    st.caption("V2 版本：支持本地知识图谱、事件监控、批量压力测试、多资产覆盖检查和企业审计；不会调用 LLM 编造收益区间。")
+    st.header("情景推演实验室")
+    st.caption("输入一个担心的事件，系统直接回答：我的持仓会受什么影响、风险暴露在哪里、有哪些可选调仓方向。")
 
     with st.sidebar:
-        st.subheader("情景参数")
-        operation = st.selectbox(
-            "功能",
-            [
-                "情景推演",
-                "反向压力测试",
-                "调仓比较",
-                "模板回测",
-                "全模板回测",
-                "情景复盘",
-                "记录用户操作",
-                "知识图谱检索",
-                "导入知识图谱关系",
-                "导入图谱文本证据",
-                "事件监控",
-                "登记事件源",
-                "登记GDELT新闻源",
-                "事件源读取监控",
-                "批量组合压力测试",
-                "多资产覆盖",
-                "登记资产代理",
-                "权限检查",
-                "报告版本化",
-                "报告导出",
-                "外部数据状态",
-            ],
-            index=0,
-        )
+        st.subheader("分析设置")
         as_of_date = st.date_input("基准日期", value=date(2020, 3, 20)).strftime("%Y-%m-%d")
-        query = st.text_area(
-            "情景假设",
-            value="如果中美贸易战升级，对半导体板块加征25%关税，我的持仓会怎样？",
-            height=90,
-        )
-        symbols_text = st.text_input("持仓股票代码（逗号分隔）", value="000001,600519")
-        weights_text = st.text_input("权重（逗号分隔，可留空等权）", value="0.5,0.5")
-        cash_weight = st.number_input("现金权重", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
-        horizon = st.selectbox("时间范围", ["1w", "1m", "3m", "6m", "1y"], index=1)
-        mode_label = st.selectbox("模式", ["快速", "标准", "深度"], index=1)
-        loss_threshold = st.number_input("反向压力损失阈值", min_value=0.01, max_value=0.50, value=0.08, step=0.01)
-        proposed_symbols_text = st.text_input("假设组合股票代码", value=symbols_text)
-        proposed_weights_text = st.text_input("假设组合权重", value=weights_text)
-        proposed_cash_weight = st.number_input("假设组合现金权重", min_value=0.0, max_value=1.0, value=cash_weight, step=0.05)
-        template_name = st.selectbox("回测模板", [item["name"] for item in SCENARIO_TEMPLATES], index=0)
-        backtest_start = st.text_input("回测开始日期", value="2020-01-02")
-        backtest_end = st.text_input("回测结束日期", value=as_of_date)
-        scenario_id_input = st.text_input("情景ID（复盘/操作记录）", value="")
-        review_date = st.text_input("复盘日期", value=as_of_date)
-        user_operation_type = st.selectbox("用户操作类型", ["watch", "reduce", "increase", "rebalance", "hedge", "cash_raise", "no_action"], index=0)
-        user_operation_symbol = st.text_input("操作标的（可留空）", value="")
-        user_operation_rationale = st.text_area("操作理由", value="", height=70)
-        user_operation_confirmed = st.checkbox("确认这是用户真实操作记录，而不是系统建议", value=False)
-        graph_query = st.text_input("知识图谱检索词", value="关税 半导体 出口链")
-        graph_import_text = st.text_area(
-            "知识图谱关系 JSON",
-            value='[{"source":{"node_type":"industry","name":"半导体"},"target":{"node_type":"supply_chain","name":"出口链"},"relation_type":"supplies","description":"用户确认的产业链关系"}]',
-            height=110,
-        )
-        graph_doc_title = st.text_input("图谱文本标题", value="用户确认的事件文本")
-        graph_doc_source_uri = st.text_input("图谱文本来源 URI", value="manual://streamlit/graph_text")
-        graph_doc_content = st.text_area("图谱文本内容", value="出口管制导致国产替代需求上升", height=80)
-        event_text = st.text_area("事件文本", value="海外市场暴跌导致风险偏好下降", height=70)
-        event_source_id = st.text_input("事件源ID", value="manual_event_stream")
-        event_source_type = st.selectbox("事件源类型", ["manual", "file", "mcp"], index=0)
-        event_source_status = st.selectbox("事件源状态", ["active", "inactive", "unavailable"], index=0)
-        event_source_file_path = st.text_input("事件源文件路径", value="")
-        gdelt_query = st.text_input("GDELT 查询", value="overseas markets slump")
-        gdelt_timespan = st.text_input("GDELT 时间范围", value="24h")
-        gdelt_max_records = st.number_input("GDELT 最大记录数", min_value=1, max_value=250, value=25, step=1)
-        batch_portfolios_text = st.text_area(
-            "批量组合 JSON",
-            value='[{"symbols":["000001"],"weights":[1.0]},{"symbols":["600519"],"weights":[1.0]}]',
-            height=90,
-        )
-        access_user_id = st.text_input("用户ID", value="analyst_001")
-        access_role = st.selectbox("角色", ["viewer", "analyst", "admin"], index=1)
-        access_action = st.selectbox(
-            "权限动作",
-            ["read_report", "search_graph", "run_scenario", "run_batch", "monitor_event", "register_source", "manage_graph", "export_report"],
-            index=2,
-        )
-        report_version_id = st.text_input("报告ID", value=scenario_id_input)
-        report_version_type = st.text_input("报告类型", value="scenario_report")
-        report_version_content = st.text_area("版本内容", value="", height=90)
-        export_format = st.selectbox("导出格式", ["pdf", "docx"], index=0)
-        export_output_dir = st.text_input("导出目录", value="Exports")
-        proxy_factor = st.selectbox("代理因子", ["interest_rate", "cny_fx", "oil_price", "market_index"], index=0)
-        proxy_asset_type = st.text_input("代理资产类型", value="bond_proxy")
-        proxy_symbol = st.text_input("代理资产代码", value="000300")
-        proxy_table = st.selectbox("代理数据表", ["index_daily", "stock_daily"], index=0)
-        proxy_direction = st.number_input("代理方向", value=-1.0, step=0.5)
-        external_source_name = st.text_input("外部数据源名称", value="news_mcp")
-        run = st.button(f"运行{operation}", type="primary")
+        horizon_label = st.radio("观察周期", ["1周", "1个月", "3个月", "6个月"], index=1)
+        mode_label = st.radio("分析深度", ["快速", "标准", "深度"], index=1)
+        use_llm = st.toggle("LLM 解析情景", value=True)
+        loss_threshold = st.slider("我能承受的月度亏损", min_value=0.03, max_value=0.30, value=0.08, step=0.01)
 
-    st.info("该页面是压力测试工具，不是自动交易系统。所有候选动作都需要用户自行判断和确认。")
+    scenario_options = [
+        "如果央行降息25bp，我的持仓会怎样？",
+        "如果人民币贬值3%，我的持仓会怎样？",
+        "如果中美贸易战升级，对半导体板块加征25%关税，我的持仓会怎样？",
+        "如果油价上涨20%，我的持仓会怎样？",
+        "如果海外市场暴跌5%，我的持仓会怎样？",
+        "自定义情景",
+    ]
+    selected_scenario = st.selectbox("选择一个常见情景，或直接输入你的问题", scenario_options, index=2)
+    default_query = "" if selected_scenario == "自定义情景" else selected_scenario
+    query = st.text_area(
+        "我担心的情景",
+        value=default_query,
+        placeholder="例如：如果降息25bp，同时人民币贬值2%，我的持仓会怎样？",
+        height=88,
+    )
+
+    st.subheader("我的持仓")
+    portfolio_df = st.data_editor(
+        pd.DataFrame(
+            [
+                {"股票代码": "000001", "仓位": 0.50},
+                {"股票代码": "600519", "仓位": 0.50},
+            ]
+        ),
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "股票代码": st.column_config.TextColumn(help="A股代码，例如 600519"),
+            "仓位": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
+        },
+        hide_index=True,
+    )
+    cash_weight = st.slider("现金仓位", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+
+    with st.expander("可选：比较一个调仓方案", expanded=False):
+        proposed_df = st.data_editor(
+            pd.DataFrame(
+                [
+                    {"股票代码": "000001", "仓位": 0.35},
+                    {"股票代码": "600519", "仓位": 0.45},
+                ]
+            ),
+            num_rows="dynamic",
+            use_container_width=True,
+            key="proposed_portfolio_editor",
+            column_config={
+                "股票代码": st.column_config.TextColumn(),
+                "仓位": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
+            },
+            hide_index=True,
+        )
+        proposed_cash_weight = st.slider("调仓后现金仓位", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
+        run_compare = st.checkbox("同时比较这个调仓方案", value=False)
+
+    run = st.button("开始推演", type="primary", use_container_width=True)
+    st.info("结果是情景压力测试，不是收益承诺或自动买卖指令。")
 
     if not run:
+        _render_empty_state()
         return
 
     try:
-        symbols = [item.strip() for item in symbols_text.split(",") if item.strip()]
-        weights = _parse_weights(weights_text, len(symbols))
-        engine = ScenarioEngine(persist=True)
+        symbols, weights = _portfolio_from_editor(portfolio_df)
+        horizon = {"1周": "1w", "1个月": "1m", "3个月": "3m", "6个月": "6m"}[horizon_label]
         mode = {"快速": "quick", "标准": "standard", "深度": "deep"}[mode_label]
+        engine = ScenarioEngine(persist=False, use_llm=use_llm)
         try:
-            if operation == "情景推演":
-                report = engine.run(
-                    user_query=query,
-                    as_of_date=as_of_date,
-                    symbols=symbols,
-                    weights=weights,
-                    cash_weight=cash_weight,
-                    horizon=horizon,
-                    mode=mode,
-                )
-            elif operation == "反向压力测试":
-                reverse_report = engine.reverse_stress(
-                    loss_threshold=loss_threshold,
-                    as_of_date=as_of_date,
-                    symbols=symbols,
-                    weights=weights,
-                    cash_weight=cash_weight,
-                    horizon=horizon,
-                    mode=mode,
-                )
-                _render_reverse_stress(reverse_report)
-                return
-            elif operation == "调仓比较":
-                proposed_symbols = [item.strip() for item in proposed_symbols_text.split(",") if item.strip()]
-                proposed_weights = _parse_weights(proposed_weights_text, len(proposed_symbols))
+            report = engine.run(
+                user_query=query,
+                as_of_date=as_of_date,
+                symbols=symbols,
+                weights=weights,
+                cash_weight=cash_weight,
+                horizon=horizon,
+                mode=mode,
+            )
+            reverse_report = engine.reverse_stress(
+                loss_threshold=loss_threshold,
+                as_of_date=as_of_date,
+                symbols=symbols,
+                weights=weights,
+                cash_weight=cash_weight,
+                horizon=horizon,
+                mode=mode,
+            )
+            comparison = None
+            if run_compare:
+                proposed_symbols, proposed_weights = _portfolio_from_editor(proposed_df)
                 comparison = engine.compare_rebalance_plan(
                     user_query=query,
                     as_of_date=as_of_date,
@@ -159,210 +125,28 @@ def show_scenario_page():
                     horizon=horizon,
                     mode=mode,
                 )
-                _render_rebalance_comparison(comparison)
-                return
-            elif operation == "模板回测":
-                backtest_report = engine.backtest_template(
-                    template_name=template_name,
-                    start_date=backtest_start,
-                    end_date=backtest_end,
-                    horizon=horizon,
-                    symbols=symbols,
-                    mode=mode,
-                )
-                _render_backtest(backtest_report)
-                return
-            elif operation == "全模板回测":
-                batch_report = engine.backtest_all_templates(
-                    start_date=backtest_start,
-                    end_date=backtest_end,
-                    horizon=horizon,
-                    symbols=symbols,
-                    mode=mode,
-                )
-                _render_batch_backtest(batch_report)
-                return
-            elif operation == "情景复盘":
-                if not scenario_id_input.strip():
-                    raise ValueError("情景复盘需要输入情景ID。")
-                replay = engine.replay_scenario(scenario_id_input.strip(), review_date)
-                _render_replay(replay)
-                return
-            elif operation == "记录用户操作":
-                if not scenario_id_input.strip():
-                    raise ValueError("记录用户操作需要输入情景ID。")
-                record = engine.record_user_operation(
-                    scenario_id=scenario_id_input.strip(),
-                    operation_date=as_of_date,
-                    operation_type=user_operation_type,
-                    symbol=user_operation_symbol.strip() or None,
-                    rationale=user_operation_rationale,
-                    user_confirmed=user_operation_confirmed,
-                )
-                st.success(f"已记录用户操作：{record.operation_id}")
-                st.json(record.to_dict())
-                return
-            elif operation == "知识图谱检索":
-                graph = engine.search_knowledge_graph(graph_query, top_k=10)
-                _render_graph_search(graph)
-                return
-            elif operation == "导入知识图谱关系":
-                import json
-
-                graph_import = engine.import_knowledge_graph(
-                    items=json.loads(graph_import_text),
-                    source_uri="manual://streamlit/graph_import",
-                    operator=access_user_id,
-                )
-                st.subheader("知识图谱导入")
-                st.json(graph_import.to_dict())
-                return
-            elif operation == "导入图谱文本证据":
-                graph_doc = engine.ingest_graph_text_document(
-                    title=graph_doc_title,
-                    content=graph_doc_content,
-                    source_uri=graph_doc_source_uri,
-                    metadata={"operator": access_user_id, "ui": "streamlit"},
-                    user_id=access_user_id,
-                    role=access_role,
-                )
-                st.subheader("图谱文本证据")
-                st.json(graph_doc)
-                return
-            elif operation == "事件监控":
-                event = engine.monitor_event(event_text, as_of_date, symbols=symbols, weights=weights, auto_run=True)
-                _render_event_monitor(event)
-                return
-            elif operation == "登记事件源":
-                source = engine.register_event_source(
-                    source_id=event_source_id,
-                    source_type=event_source_type,
-                    description=event_text,
-                    status=event_source_status,
-                    metadata={
-                        "operator": access_user_id,
-                        "ui": "streamlit",
-                        "path": event_source_file_path.strip(),
-                        "events": [item.strip() for item in event_text.splitlines() if item.strip()],
-                    },
-                    user_id=access_user_id,
-                    role=access_role,
-                )
-                st.subheader("事件源登记")
-                st.json(source.to_dict())
-                return
-            elif operation == "登记GDELT新闻源":
-                source = engine.register_gdelt_doc_news_source(
-                    source_id=event_source_id,
-                    query=gdelt_query,
-                    max_records=int(gdelt_max_records),
-                    timespan=gdelt_timespan,
-                    user_id=access_user_id,
-                    role=access_role,
-                )
-                st.subheader("GDELT 新闻源")
-                st.json(source.to_dict())
-                return
-            elif operation == "事件源读取监控":
-                ingest = engine.ingest_event_source(
-                    source_id=event_source_id,
-                    as_of_date=as_of_date,
-                    symbols=symbols,
-                    weights=weights,
-                    auto_run=True,
-                    user_id=access_user_id,
-                    role=access_role,
-                )
-                st.subheader("事件源读取监控")
-                st.json(ingest.to_dict())
-                return
-            elif operation == "批量组合压力测试":
-                import json
-
-                batch = engine.batch_portfolio_stress(
-                    user_query=query,
-                    as_of_date=as_of_date,
-                    portfolios=json.loads(batch_portfolios_text),
-                    horizon=horizon,
-                    mode=mode,
-                )
-                _render_batch_portfolio_stress(batch)
-                return
-            elif operation == "多资产覆盖":
-                coverage = engine.multi_asset_coverage(as_of_date)
-                _render_multi_asset_coverage(coverage)
-                return
-            elif operation == "登记资产代理":
-                proxy = engine.register_asset_proxy(
-                    factor=proxy_factor,
-                    asset_type=proxy_asset_type,
-                    symbol=proxy_symbol,
-                    table_name=proxy_table,
-                    direction=proxy_direction,
-                    description="用户在界面登记的本地可审计多资产代理。",
-                    user_id=access_user_id,
-                    role=access_role,
-                )
-                st.subheader("资产代理")
-                st.json(proxy)
-                return
-            elif operation == "权限检查":
-                decision = engine.check_access(access_user_id, access_role, access_action)
-                st.subheader("权限检查")
-                st.json(decision.to_dict())
-                return
-            elif operation == "报告版本化":
-                version = engine.version_report(
-                    report_id=report_version_id.strip() or scenario_id_input.strip(),
-                    report_type=report_version_type,
-                    content=report_version_content,
-                    user_id=access_user_id,
-                    role=access_role,
-                )
-                st.subheader("报告版本")
-                st.json(version.to_dict())
-                return
-            elif operation == "报告导出":
-                export = engine.export_report(
-                    report_id=report_version_id.strip() or scenario_id_input.strip(),
-                    export_format=export_format,
-                    output_dir=export_output_dir,
-                    user_id=access_user_id,
-                    role=access_role,
-                )
-                st.subheader("报告导出")
-                st.json(export.to_dict())
-                return
-            elif operation == "外部数据状态":
-                status = engine.external_data_status(external_source_name)
-                st.subheader("外部数据状态")
-                st.json(status.to_dict())
-                return
-            else:
-                raise ValueError(f"未知功能：{operation}")
         finally:
             engine.close()
     except Exception as exc:
-        st.error(f"情景推演失败：{exc}")
+        st.error(f"推演失败：{exc}")
         return
 
     st.subheader("执行摘要")
     st.write(report.executive_summary)
 
     total = report.portfolio_total_impact
-    cols = st.columns(5)
+    cols = st.columns(4)
     base_range = total.get("base_range")
     cols[0].metric("可量化仓位", f"{total.get('quantified_position_weight', 0):.1%}")
-    cols[1].metric("现金权重", f"{total.get('cash_weight', 0):.1%}")
-    cols[2].metric("组合冲击区间", "未量化" if base_range is None else f"{base_range[0]:.2%} ~ {base_range[1]:.2%}")
+    cols[1].metric("组合冲击区间", "未量化" if base_range is None else f"{base_range[0]:.2%} ~ {base_range[1]:.2%}")
     risk = _risk_holding(report)
     upside = _upside_holding(report)
-    cols[3].metric("最大风险持仓", risk)
-    cols[4].metric("最大正向受益", upside)
+    cols[2].metric("最大风险持仓", risk)
+    cols[3].metric("最大正向受益", upside)
     if report.uncertainty:
-        st.warning("主要不确定项：" + "；".join(report.uncertainty[:3]))
+        st.warning("需要你留意的假设：" + "；".join(report.uncertainty[:3]))
 
-    st.subheader("持仓影响矩阵")
+    st.subheader("风险暴露在哪里")
     impacts_df = pd.DataFrame(
         [
             {
@@ -392,6 +176,15 @@ def show_scenario_page():
     if chart:
         st.plotly_chart(chart, use_container_width=True)
 
+    st.subheader("要不要调仓")
+    for item in report.recommendations:
+        st.write(f"- [{item.get('type')}] {item.get('content')}")
+    if comparison:
+        _render_rebalance_comparison(comparison)
+
+    st.subheader("什么情况下会亏到你的阈值")
+    _render_reverse_stress(reverse_report)
+
     col1, col2 = st.columns(2)
     with col1:
         path_chart = _path_chart(report)
@@ -412,19 +205,14 @@ def show_scenario_page():
     else:
         st.caption("缺少历史类比窗口收益数据，暂不展示历史类比窗口收益图。")
 
-    st.subheader("候选动作")
-    for item in report.recommendations:
-        st.write(f"- [{item.get('type')}] {item.get('content')}")
-
-    st.subheader("不确定性")
-    for item in report.uncertainty:
-        st.write(f"- {item}")
-
     with st.expander("完整 Markdown 报告", expanded=False):
         st.markdown(report.markdown)
 
     with st.expander("审计信息", expanded=False):
         st.json(report.audit)
+
+    with st.expander("高级工具", expanded=False):
+        _render_advanced_tools(as_of_date, query, symbols, weights, horizon, mode, use_llm)
 
 
 def _parse_weights(weights_text: str, symbol_count: int) -> list[float] | None:
@@ -434,6 +222,67 @@ def _parse_weights(weights_text: str, symbol_count: int) -> list[float] | None:
     if len(weights) != symbol_count:
         raise ValueError("权重数量必须与股票代码数量一致，或留空使用等权。")
     return weights
+
+
+def _portfolio_from_editor(df: pd.DataFrame) -> tuple[list[str], list[float]]:
+    rows = []
+    for _, row in df.iterrows():
+        symbol = str(row.get("股票代码") or "").strip()
+        if not symbol:
+            continue
+        weight = float(row.get("仓位") or 0.0)
+        if weight <= 0:
+            continue
+        rows.append((symbol, weight))
+    if not rows:
+        raise ValueError("请至少输入一只持仓股票和仓位。")
+    total = sum(weight for _, weight in rows)
+    if total <= 0:
+        raise ValueError("持仓仓位合计必须大于 0。")
+    return [symbol for symbol, _ in rows], [weight for _, weight in rows]
+
+
+def _render_empty_state() -> None:
+    st.subheader("你会得到什么")
+    cols = st.columns(3)
+    cols[0].markdown("**我会受多大影响**\n\n组合冲击区间、可量化仓位、最大风险持仓。")
+    cols[1].markdown("**风险暴露在哪里**\n\n持仓贡献、因子暴露、历史类比和压力路径。")
+    cols[2].markdown("**要不要调仓**\n\n只给风险管理候选动作，可选比较调仓前后差异。")
+
+
+def _render_advanced_tools(
+    as_of_date: str,
+    query: str,
+    symbols: list[str],
+    weights: list[float],
+    horizon: str,
+    mode: str,
+    use_llm: bool,
+) -> None:
+    st.caption("这些能力用于复盘、审计和研究；普通投资者不需要调整。")
+    tool = st.selectbox("高级功能", ["模板回测", "全模板回测", "多资产覆盖", "知识图谱检索"], index=0)
+    engine = ScenarioEngine(persist=False, use_llm=use_llm)
+    try:
+        if tool == "模板回测":
+            template_name = st.selectbox("回测模板", [item["name"] for item in SCENARIO_TEMPLATES], index=0)
+            start = st.text_input("开始日期", value="2020-01-02")
+            end = st.text_input("结束日期", value=as_of_date)
+            if st.button("运行模板回测"):
+                _render_backtest(engine.backtest_template(template_name, start, end, horizon, symbols=symbols, mode=mode))
+        elif tool == "全模板回测":
+            start = st.text_input("开始日期", value="2020-01-02", key="batch_bt_start")
+            end = st.text_input("结束日期", value=as_of_date, key="batch_bt_end")
+            if st.button("运行全模板回测"):
+                _render_batch_backtest(engine.backtest_all_templates(start, end, horizon, symbols=symbols, mode=mode))
+        elif tool == "多资产覆盖":
+            if st.button("检查覆盖"):
+                _render_multi_asset_coverage(engine.multi_asset_coverage(as_of_date))
+        elif tool == "知识图谱检索":
+            graph_query = st.text_input("检索词", value=query[:30])
+            if st.button("检索图谱"):
+                _render_graph_search(engine.search_knowledge_graph(graph_query, top_k=10))
+    finally:
+        engine.close()
 
 
 def _render_reverse_stress(report) -> None:
@@ -715,9 +564,6 @@ def _path_chart(report) -> go.Figure | None:
 
 def _factor_radar_chart(report) -> go.Figure | None:
     factor_items = [item for item in report.evidence if item.evidence_type == "factor_regression" and item.metrics]
-    if not factor_items:
-        return None
-
     categories = ["market_beta", "momentum_20d", "volatility_60d", "liquidity_change_20d"]
     fig = go.Figure()
     added = False
@@ -730,6 +576,20 @@ def _factor_radar_chart(report) -> go.Figure | None:
             continue
         fig.add_trace(go.Scatterpolar(r=values, theta=categories, fill="toself", name=item.title.replace(" 简化市场因子暴露", "")))
         added = True
+
+    if not added:
+        low_data = [item for item in report.portfolio_impacts if item.quantification_status == "low_data_proxy"]
+        if low_data:
+            for item in low_data[:5]:
+                fig.add_trace(
+                    go.Scatterpolar(
+                        r=[1.0, 0.0, 0.05, 0.0],
+                        theta=categories,
+                        fill="toself",
+                        name=f"{item.symbol} 低数据代理",
+                    )
+                )
+            added = True
 
     if not added:
         return None

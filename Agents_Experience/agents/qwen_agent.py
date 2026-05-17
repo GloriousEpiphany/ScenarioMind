@@ -3,7 +3,10 @@ Qwen Agent实现
 """
 import json
 import time
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 from typing import Dict, List, Any, Optional
 from .base_agent import BaseAgent
 import sys
@@ -35,6 +38,9 @@ class QwenAgent(BaseAgent):
         self.api_call_interval = api_call_interval  # API调用间隔（秒）
         self.last_api_call_time = 0  # 上次API调用时间
         
+        if OpenAI is None:
+            raise RuntimeError("OpenAI SDK 未安装，无法创建 QwenAgent；情景推演等非交易页面不受影响。")
+
         # 初始化OpenAI客户端
         self.client = OpenAI(
             base_url=api_base,

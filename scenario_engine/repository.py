@@ -57,7 +57,7 @@ class ScenarioRepository:
                 report.as_of_date,
                 report.scenario_spec.horizon,
                 "succeeded",
-                "deterministic_v2",
+                report.audit.get("model_snapshot_id", "scenario_engine_deterministic_v2"),
                 report.markdown,
                 json.dumps(report.to_dict(), ensure_ascii=False),
             ),

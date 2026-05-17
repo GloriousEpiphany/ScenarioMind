@@ -59,18 +59,19 @@ class ReverseStressEngine:
             volatility_risk_symbols: list[str] = []
             for position in portfolio.positions:
                 exposure = exposure_by_symbol.get(position.symbol)
-                if not exposure or exposure.market_beta is None:
-                    continue
-                point = exposure.market_beta * shock
-                margin = abs(point) * 0.25 + (exposure.volatility_60d or 0.0)
+                beta = exposure.market_beta if exposure and exposure.market_beta is not None else 1.0
+                volatility = (exposure.volatility_60d if exposure and exposure.volatility_60d is not None else 0.05)
+                point = beta * shock
+                margin = abs(point) * 0.35 + volatility
                 low += (point - margin) * position.weight
                 high += (point + margin) * position.weight
                 affected_symbols.append(position.symbol)
-                evidence_ids.append(exposure.evidence_id)
+                if exposure:
+                    evidence_ids.append(exposure.evidence_id)
                 quantified_weight += position.weight
-                if exposure.liquidity_change_20d is not None and exposure.liquidity_change_20d < -0.2:
+                if exposure and exposure.liquidity_change_20d is not None and exposure.liquidity_change_20d < -0.2:
                     liquidity_risk_symbols.append(position.symbol)
-                if exposure.volatility_60d is not None and exposure.volatility_60d > 0.03:
+                if volatility > 0.03:
                     volatility_risk_symbols.append(position.symbol)
 
             if quantified_weight <= 0:
@@ -126,12 +127,12 @@ class ReverseStressEngine:
                         affected_symbols=sorted(set(affected_symbols)),
                         evidence_ids=sorted(set(evidence_ids)),
                         explanation=(
-                            f"在当前本地 beta 暴露下，市场指数下跌 {magnitude_pct:.1f}% 的压力组合"
-                            f"可使可量化仓位的组合贡献下沿达到 {low:.2%}。"
+                            f"在当前本地 beta/低数据默认 beta 暴露下，市场指数下跌 {magnitude_pct:.1f}% 的压力组合"
+                            f"可使组合贡献下沿达到 {low:.2%}。"
                             + (f" {'；'.join(amplifiers)}。" if amplifiers else "")
                         ),
-                        confidence=0.55 if quantified_weight >= 0.8 else 0.42,
-                        quantification_status="market_beta_with_audited_risk_amplifiers",
+                        confidence=0.50 if quantified_weight >= 0.8 else 0.40,
+                        quantification_status="market_beta_or_low_data_proxy_with_audited_risk_amplifiers",
                     )
                 )
                 break
@@ -155,7 +156,7 @@ class ReverseStressEngine:
         if not candidates:
             uncertainty.append("未找到满足阈值的可审计冲击组合")
         if any(item.market_beta is None for item in exposures):
-            uncertainty.append("部分持仓缺少可估计 market_beta")
+            uncertainty.append("部分持仓缺少可估计 market_beta，已用低数据默认 beta=1.0 和更宽误差带处理")
         if portfolio.cash_weight:
             uncertainty.append("现金仓位按零风险资产处理，未模拟货币基金或利率收益")
         uncertainty.append("流动性和波动率压力只作为本地风险放大标记，不单独生成收益率")
@@ -198,7 +199,11 @@ class ReverseStressEngine:
         if not report.candidates:
             lines.append("- 未找到可审计的压力组合。")
         for candidate in report.candidates:
-            shocks = ", ".join(f"{shock.factor} {shock.direction} {shock.magnitude:.2f}{shock.unit}" for shock in candidate.factor_shocks)
+            shocks = ", ".join(
+                f"{shock.factor} {shock.direction} "
+                f"{'未设定' if shock.magnitude is None else f'{shock.magnitude:.2f}'}{shock.unit}"
+                for shock in candidate.factor_shocks
+            )
             impact = "未量化" if candidate.estimated_portfolio_impact is None else (
                 f"{candidate.estimated_portfolio_impact[0]:.2%} ~ {candidate.estimated_portfolio_impact[1]:.2%}"
             )
