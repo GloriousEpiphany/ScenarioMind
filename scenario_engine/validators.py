@@ -22,6 +22,12 @@ class ScenarioValidator:
                 issues.append(f"{impact.symbol} is marked not_quantified but has numeric range")
 
         for path in report.paths:
+            if not path.direction:
+                issues.append(f"{path.path_id} missing direction")
+            if not path.lag_days or path.lag_days[0] < 0 or path.lag_days[1] < path.lag_days[0]:
+                issues.append(f"{path.path_id} has invalid lag_days")
+            if not path.reverse_conditions:
+                issues.append(f"{path.path_id} missing reverse conditions")
             for evidence_id in path.evidence_ids:
                 if evidence_id not in known_evidence_ids:
                     issues.append(f"{path.path_id} references missing evidence id: {evidence_id}")
@@ -30,7 +36,7 @@ class ScenarioValidator:
             if report.portfolio_total_impact.get("quantified_position_weight", 0) <= 0:
                 issues.append("portfolio total impact has range but no quantified weight")
 
-        text = report.markdown or report.executive_summary
+        text = f"{report.executive_summary}\n{report.markdown or ''}"
         for phrase in self.banned_phrases:
             if phrase in text:
                 issues.append(f"banned phrase found: {phrase}")

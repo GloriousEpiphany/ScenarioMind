@@ -1,0 +1,72 @@
+[
+  {
+    "template_name": "央行降息",
+    "query": "如果央行降息25bp，我的持仓会怎样？",
+    "expected_event_type": "macro",
+    "expected_factors": ["interest_rate"],
+    "default_horizons": ["1w", "1m", "3m"]
+  },
+  {
+    "template_name": "央行加息或流动性收紧",
+    "query": "如果央行加息50bp，我的持仓会怎样？",
+    "expected_event_type": "macro",
+    "expected_factors": ["interest_rate"],
+    "default_horizons": ["1w", "1m", "3m"]
+  },
+  {
+    "template_name": "人民币汇率贬值",
+    "query": "如果人民币贬值3%，我的持仓会怎样？",
+    "expected_event_type": "macro",
+    "expected_factors": ["cny_fx"],
+    "default_horizons": ["1w", "1m", "3m"]
+  },
+  {
+    "template_name": "中美贸易摩擦升级",
+    "query": "如果中美贸易战升级，对半导体板块加征25%关税，我的持仓会怎样？",
+    "expected_event_type": "policy",
+    "expected_factors": ["tariff"],
+    "default_horizons": ["1w", "1m", "3m"]
+  },
+  {
+    "template_name": "中美贸易摩擦升级",
+    "query": "如果半导体出口限制升级，我的持仓会怎样？",
+    "expected_event_type": "policy",
+    "expected_factors": ["tariff"],
+    "default_horizons": ["1w", "1m", "3m"]
+  },
+  {
+    "template_name": "地产政策放松",
+    "query": "如果地产政策放松，我的持仓会怎样？",
+    "expected_event_type": "policy",
+    "expected_factors": ["real_estate_policy"],
+    "default_horizons": ["1w", "1m", "3m"]
+  },
+  {
+    "template_name": "油价上涨",
+    "query": "如果油价上涨20%，我的持仓会怎样？",
+    "expected_event_type": "global",
+    "expected_factors": ["oil_price"],
+    "default_horizons": ["1w", "1m", "3m"]
+  },
+  {
+    "template_name": "海外市场大跌",
+    "query": "如果海外市场暴跌5%，我的持仓会怎样？",
+    "expected_event_type": "global",
+    "expected_factors": ["market_index"],
+    "default_horizons": ["1w", "1m", "3m"]
+  },
+  {
+    "template_name": "白酒行业监管",
+    "query": "如果白酒监管升级，我的持仓会怎样？",
+    "expected_event_type": "industry",
+    "expected_factors": ["industry_regulation"],
+    "default_horizons": ["1w", "1m", "3m"]
+  },
+  {
+    "template_name": "新能源补贴退坡",
+    "query": "如果新能源补贴退坡，我的持仓会怎样？",
+    "expected_event_type": "policy",
+    "expected_factors": ["subsidy_policy"],
+    "default_horizons": ["1w", "1m", "3m"]
+  }
+]

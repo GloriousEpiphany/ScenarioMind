@@ -40,6 +40,7 @@ class ScenarioSpec:
     assumptions: list[Assumption] = field(default_factory=list)
     missing_information: list[str] = field(default_factory=list)
     confidence: float = 0.0
+    horizons: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -85,6 +86,7 @@ class TransmissionPath:
     evidence_ids: list[str]
     probability: Optional[float]
     probability_source: str
+    reverse_conditions: list[str] = field(default_factory=list)
 
 
 @dataclass

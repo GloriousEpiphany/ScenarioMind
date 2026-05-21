@@ -18,7 +18,10 @@ class BatchPortfolioStressTester:
         portfolios: list[dict],
         horizon: str | None = None,
         mode: str = "quick",
+        confirmed: bool = False,
     ) -> BatchPortfolioStressReport:
+        if not confirmed:
+            raise ValueError("batch portfolio stress requires confirmed=True after scenario review")
         if not portfolios:
             raise ValueError("at least one portfolio is required")
         reports: list[ScenarioReport] = []
@@ -36,6 +39,8 @@ class BatchPortfolioStressTester:
                     horizon=horizon,
                     mode=mode,
                     persist=False,
+                    require_confirmation=True,
+                    confirmed=True,
                 )
             )
         summary = self._summary(reports)

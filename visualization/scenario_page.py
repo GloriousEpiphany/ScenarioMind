@@ -79,8 +79,28 @@ def show_scenario_page():
         proposed_cash_weight = st.slider("调仓后现金仓位", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
         run_compare = st.checkbox("同时比较这个调仓方案", value=False)
 
-    run = st.button("开始推演", type="primary", use_container_width=True)
+    parse = st.button("解析情景", use_container_width=True)
+    run = st.button("确认解析并开始推演", type="primary", use_container_width=True)
     st.info("结果是情景压力测试，不是收益承诺或自动买卖指令。")
+
+    horizon = {"1周": "1w", "1个月": "1m", "3个月": "3m", "6个月": "6m"}[horizon_label]
+    mode = {"快速": "quick", "标准": "standard", "深度": "deep"}[mode_label]
+
+    if parse:
+        try:
+            engine = ScenarioEngine(persist=False, use_llm=use_llm)
+            try:
+                prepared = engine.prepare_scenario(query, as_of_date, horizon=horizon, persist=False)
+            finally:
+                engine.close()
+            st.session_state["scenario_prepared"] = prepared
+        except Exception as exc:
+            st.error(f"解析失败：{exc}")
+            return
+
+    prepared = st.session_state.get("scenario_prepared")
+    if prepared:
+        _render_prepared_scenario(prepared)
 
     if not run:
         _render_empty_state()
@@ -88,8 +108,6 @@ def show_scenario_page():
 
     try:
         symbols, weights = _portfolio_from_editor(portfolio_df)
-        horizon = {"1周": "1w", "1个月": "1m", "3个月": "3m", "6个月": "6m"}[horizon_label]
-        mode = {"快速": "quick", "标准": "standard", "深度": "deep"}[mode_label]
         engine = ScenarioEngine(persist=False, use_llm=use_llm)
         try:
             report = engine.run(
@@ -100,6 +118,8 @@ def show_scenario_page():
                 cash_weight=cash_weight,
                 horizon=horizon,
                 mode=mode,
+                require_confirmation=True,
+                confirmed=True,
             )
             reverse_report = engine.reverse_stress(
                 loss_threshold=loss_threshold,
@@ -124,6 +144,7 @@ def show_scenario_page():
                     proposed_cash_weight=proposed_cash_weight,
                     horizon=horizon,
                     mode=mode,
+                    proposed_plan_confirmed=True,
                 )
         finally:
             engine.close()
@@ -248,6 +269,25 @@ def _render_empty_state() -> None:
     cols[0].markdown("**我会受多大影响**\n\n组合冲击区间、可量化仓位、最大风险持仓。")
     cols[1].markdown("**风险暴露在哪里**\n\n持仓贡献、因子暴露、历史类比和压力路径。")
     cols[2].markdown("**要不要调仓**\n\n只给风险管理候选动作，可选比较调仓前后差异。")
+
+
+def _render_prepared_scenario(prepared: dict) -> None:
+    spec = prepared["scenario_spec"]
+    st.subheader("场景解析结果")
+    cols = st.columns(4)
+    cols[0].metric("事件", spec.get("event_name", ""))
+    cols[1].metric("类型", spec.get("event_type", ""))
+    cols[2].metric("主周期", spec.get("horizon", ""))
+    cols[3].metric("置信度", f"{float(spec.get('confidence', 0)):.2f}")
+    st.write("影响对象：" + ("，".join(spec.get("affected_entities") or []) or "未明确"))
+    shocks = spec.get("shocks") or []
+    if shocks:
+        st.dataframe(pd.DataFrame(shocks), use_container_width=True)
+    missing = spec.get("missing_information") or []
+    if missing:
+        st.warning("需要确认或补充的信息：" + "；".join(missing))
+    else:
+        st.success("解析结果没有必须补充的缺失项。")
 
 
 def _render_advanced_tools(

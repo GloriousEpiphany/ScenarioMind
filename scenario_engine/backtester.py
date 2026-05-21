@@ -24,6 +24,8 @@ class ScenarioBacktester:
         end_date: str,
         horizon: str,
         symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        cash_weight: float = 0.0,
         mode: str = "quick",
         max_observations: int = 10,
     ) -> BacktestReport:
@@ -37,6 +39,7 @@ class ScenarioBacktester:
 
         selected_symbols = symbols or self.data_provider.get_available_stock_symbols(limit=3)
         selected_symbols = selected_symbols[:5]
+        selected_weights = self._normalize_weights(selected_symbols, weights, cash_weight)
         if not selected_symbols:
             raise ValueError("backtest requires at least one symbol with local data")
 
@@ -45,13 +48,14 @@ class ScenarioBacktester:
             notes: list[str] = []
             predicted_range = None
             evidence_ids: list[str] = []
-            realized = self._portfolio_forward_return(selected_symbols, as_of_date, self._horizon_days(horizon), notes)
+            realized = self._portfolio_forward_return(selected_symbols, selected_weights, as_of_date, self._horizon_days(horizon), notes)
             try:
                 report = self.run_scenario(
                     user_query=f"如果{template['name']}，我的持仓会怎样？",
                     as_of_date=as_of_date,
                     symbols=selected_symbols,
-                    weights=None,
+                    weights=selected_weights,
+                    cash_weight=cash_weight,
                     horizon=horizon,
                     mode=mode,
                     persist=False,
@@ -92,6 +96,8 @@ class ScenarioBacktester:
                 "method": "walk_forward_no_future_data_in_prediction",
                 "data_boundary": "each scenario run uses only local data on or before its as_of_date",
                 "symbols": selected_symbols,
+                "weights": selected_weights,
+                "cash_weight": cash_weight,
                 "mode": mode,
                 "validation_status": "passed",
             },
@@ -105,6 +111,8 @@ class ScenarioBacktester:
         end_date: str,
         horizon: str,
         symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        cash_weight: float = 0.0,
         mode: str = "quick",
         max_observations_per_template: int = 10,
     ) -> BatchBacktestReport:
@@ -115,6 +123,8 @@ class ScenarioBacktester:
                 end_date=end_date,
                 horizon=horizon,
                 symbols=symbols,
+                weights=weights,
+                cash_weight=cash_weight,
                 mode=mode,
                 max_observations=max_observations_per_template,
             )
@@ -191,17 +201,41 @@ class ScenarioBacktester:
             )
         return "\n".join(lines)
 
-    def _portfolio_forward_return(self, symbols: list[str], as_of_date: str, trading_days: int, notes: list[str]) -> float | None:
-        returns = []
-        for symbol in symbols:
+    def _portfolio_forward_return(self, symbols: list[str], weights: list[float], as_of_date: str, trading_days: int, notes: list[str]) -> float | None:
+        weighted_returns = []
+        observed_weight = 0.0
+        for symbol, weight in zip(symbols, weights):
             item = self.data_provider.get_forward_return(symbol, as_of_date, trading_days)
             if item is None:
                 notes.append(f"{symbol} 缺少 {trading_days} 个交易日后的价格")
                 continue
-            returns.append(item["return"])
-        if not returns:
+            weighted_returns.append(item["return"] * weight)
+            observed_weight += weight
+        if not weighted_returns:
             return None
-        return sum(returns) / len(returns)
+        if observed_weight <= 0:
+            return None
+        if observed_weight < sum(weights):
+            notes.append("部分持仓缺少未来价格，真实收益按可观测持仓权重归一化计算。")
+            return sum(weighted_returns) / observed_weight
+        return sum(weighted_returns)
+
+    def _normalize_weights(self, symbols: list[str], weights: list[float] | None, cash_weight: float) -> list[float]:
+        if cash_weight < 0 or cash_weight >= 1:
+            raise ValueError("cash_weight must be >= 0 and < 1 for backtest")
+        if weights is None:
+            if not symbols:
+                return []
+            return [(1.0 - cash_weight) / len(symbols)] * len(symbols)
+        if len(weights) != len(symbols):
+            raise ValueError("weights length must match symbols length")
+        if any(weight < 0 for weight in weights):
+            raise ValueError("weights cannot be negative")
+        total = sum(weights)
+        if total <= 0:
+            raise ValueError("weights must sum to a positive value")
+        scale = (1.0 - cash_weight) / total
+        return [weight * scale for weight in weights]
 
     def _metrics(self, observations: list[BacktestObservation]) -> dict:
         comparable = [item for item in observations if item.hit is not None]

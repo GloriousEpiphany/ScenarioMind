@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
+from dataclasses import asdict
 
 from .analogs import HistoricalAnalogRetriever
 from .agent_review import ScenarioAgentReview
 from .backtester import ScenarioBacktester
 from .batch import BatchPortfolioStressTester
+from .capabilities import build_capability_report
 from .constraints import AShareConstraintAnalyzer
 from .data_provider import ScenarioDataProvider
 from .event_monitor import EventMonitor
 from .event_scheduler import EventPollingScheduler
 from .enterprise import AccessControl, EnterpriseAudit, ReportVersioner
+from .evals import ScenarioEvaluationSuite
 from .external_data import ExternalDataRegistry, McpJsonRpcEventConnector
 from .factors import FactorExposureEstimator
 from .knowledge_graph import LocalKnowledgeGraph
@@ -115,6 +118,7 @@ class ScenarioEngine:
         self.reporter = ReportComposer()
         self.validator = ScenarioValidator()
         self.agent_review = ScenarioAgentReview()
+        self.evaluation_suite = ScenarioEvaluationSuite()
         self.reverse_stress_engine = ReverseStressEngine(self.factor_estimator)
         self.rebalance_comparator = RebalanceComparator()
         self.repository = ScenarioRepository(self.data_provider) if persist else None
@@ -149,6 +153,8 @@ class ScenarioEngine:
         persist: bool = True,
         user_id: str | None = None,
         role: str | None = None,
+        require_confirmation: bool = False,
+        confirmed: bool = False,
     ) -> ScenarioReport:
         self._require_access(user_id, role, "run_scenario")
         if mode not in {"quick", "standard", "deep"}:
@@ -163,7 +169,12 @@ class ScenarioEngine:
             {"event_name": spec.event_name, "missing_information": spec.missing_information},
             requires_human_confirmation=bool(spec.missing_information),
         )
-        spec_issues = validate_required_contract(spec.__dict__, SCENARIO_SPEC_SCHEMA)
+        if require_confirmation and spec.missing_information and not confirmed:
+            raise ValueError(
+                "scenario parsing requires user confirmation before quantification; "
+                f"missing_information={spec.missing_information}"
+            )
+        spec_issues = validate_required_contract(asdict(spec), SCENARIO_SPEC_SCHEMA)
         if spec_issues:
             raise ValueError(f"ScenarioSpec contract validation failed: {spec_issues}")
         if portfolio is None:
@@ -218,6 +229,7 @@ class ScenarioEngine:
             "state_trace": [
                 "CREATED",
                 "PARSED",
+                "HUMAN_CONFIRMED" if confirmed else "HUMAN_CONFIRMATION_NOT_REQUIRED",
                 "EVIDENCE_READY",
                 "QUANT_READY",
                 "AGENT_REVIEW_READY",
@@ -225,6 +237,7 @@ class ScenarioEngine:
                 "REPORTED",
             ],
         }
+        audit["workflow_orchestrator"] = self.workflow.run_langgraph_trace(spec.scenario_id, confirmed=confirmed)
         report = self.reporter.compose(spec, paths, impacts, total_impact, evidence, audit)
         ok, issues = self.validator.validate(report)
         report.audit["validation_status"] = "passed" if ok else "failed"
@@ -232,6 +245,7 @@ class ScenarioEngine:
         report.audit["agent_review"] = [item.__dict__ for item in self.agent_review.review(report)]
         self._checkpoint(spec.scenario_id, "AGENT_REVIEW_READY", {"reviewer_count": len(report.audit["agent_review"])})
         report.markdown = self.reporter._to_markdown(report)
+        report.audit["scenario_evals"] = self.evaluation_suite.evaluate(report)
 
         if not ok:
             raise ValueError(f"scenario report validation failed: {issues}")
@@ -255,6 +269,44 @@ class ScenarioEngine:
                 model_snapshot_id=report.audit["model_snapshot_id"],
             )
         return report
+
+    def prepare_scenario(
+        self,
+        user_query: str,
+        as_of_date: str,
+        horizon: str | None = None,
+        persist: bool = True,
+    ) -> dict:
+        """Parse a scenario and create a durable confirmation checkpoint.
+
+        This is the product-level human-in-the-loop entry point: callers show
+        the parsed spec to the user and call run(..., confirmed=True) only after
+        explicit confirmation.
+        """
+        spec = self.parser.parse(user_query, as_of_date, horizon=horizon)
+        checkpoint = None
+        if self.repository is not None and persist:
+            self._checkpoint(spec.scenario_id, "CREATED", {"user_query": user_query, "as_of_date": as_of_date})
+            checkpoint = self.workflow.build_checkpoint(
+                scenario_id=spec.scenario_id,
+                state="PARSED",
+                payload={
+                    "event_name": spec.event_name,
+                    "event_type": spec.event_type,
+                    "horizon": spec.horizon,
+                    "horizons": spec.horizons,
+                    "shocks": [asdict(item) for item in spec.shocks],
+                    "missing_information": spec.missing_information,
+                },
+                requires_human_confirmation=bool(spec.missing_information),
+                confirmed=not bool(spec.missing_information),
+            )
+            self.repository.save_checkpoint(checkpoint)
+        return {
+            "scenario_spec": asdict(spec),
+            "requires_human_confirmation": bool(spec.missing_information),
+            "checkpoint": None if checkpoint is None else checkpoint.to_dict(),
+        }
 
     def reverse_stress(
         self,
@@ -288,7 +340,10 @@ class ScenarioEngine:
         proposed_cash_weight: float = 0.0,
         horizon: str | None = None,
         mode: str = "standard",
+        proposed_plan_confirmed: bool = False,
     ) -> RebalanceComparison:
+        if not proposed_plan_confirmed:
+            raise ValueError("compare_rebalance_plan requires proposed_plan_confirmed=True")
         current = self.run(
             user_query=user_query,
             as_of_date=as_of_date,
@@ -298,6 +353,8 @@ class ScenarioEngine:
             horizon=horizon,
             mode=mode,
             persist=False,
+            require_confirmation=True,
+            confirmed=True,
         )
         proposed = self.run(
             user_query=user_query,
@@ -308,6 +365,8 @@ class ScenarioEngine:
             horizon=horizon,
             mode=mode,
             persist=False,
+            require_confirmation=True,
+            confirmed=True,
         )
         comparison = self.rebalance_comparator.compare(current, proposed)
         if self.repository is not None:
@@ -321,6 +380,8 @@ class ScenarioEngine:
         end_date: str,
         horizon: str,
         symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        cash_weight: float = 0.0,
         mode: str = "quick",
         max_observations: int = 10,
     ) -> BacktestReport:
@@ -330,6 +391,8 @@ class ScenarioEngine:
             end_date=end_date,
             horizon=horizon,
             symbols=symbols,
+            weights=weights,
+            cash_weight=cash_weight,
             mode=mode,
             max_observations=max_observations,
         )
@@ -343,6 +406,8 @@ class ScenarioEngine:
         end_date: str,
         horizon: str,
         symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        cash_weight: float = 0.0,
         mode: str = "quick",
         max_observations_per_template: int = 10,
     ) -> BatchBacktestReport:
@@ -351,6 +416,8 @@ class ScenarioEngine:
             end_date=end_date,
             horizon=horizon,
             symbols=symbols,
+            weights=weights,
+            cash_weight=cash_weight,
             mode=mode,
             max_observations_per_template=max_observations_per_template,
         )
@@ -487,6 +554,7 @@ class ScenarioEngine:
         mode: str = "quick",
         user_id: str | None = None,
         role: str | None = None,
+        confirmed: bool = False,
     ) -> BatchPortfolioStressReport:
         self._require_access(user_id, role, "run_batch")
         report = self.batch_stress_tester.run(
@@ -495,6 +563,7 @@ class ScenarioEngine:
             portfolios=portfolios,
             horizon=horizon,
             mode=mode,
+            confirmed=confirmed,
         )
         if self.repository is not None:
             self.repository.save_batch_portfolio_stress(report)
@@ -1076,6 +1145,16 @@ class ScenarioEngine:
             self.repository.save_external_data_status(status)
         return status
 
+    def capability_report(self) -> dict:
+        sources = {}
+        if self.repository is not None:
+            for name in ["mcp", "gdelt_doc", "manual", "file"]:
+                persisted = self.repository.get_external_data_status(name)
+                if persisted is not None:
+                    sources[name] = persisted
+        sources.update(self.external_data_registry.sources)
+        return build_capability_report(sources)
+
     def record_user_operation(
         self,
         scenario_id: str,
@@ -1340,3 +1419,27 @@ class ScenarioEngine:
                 metadata={"otel_compatible_fields": ["trace_id", "span_id", "parent_span_id", "name"]},
             )
         )
+        self._emit_otel_span(name, trace_id, span_id, input_hash, output_hash, model_snapshot_id, data_snapshot_id)
+
+    def _emit_otel_span(
+        self,
+        name: str,
+        trace_id: str,
+        span_id: str,
+        input_hash: str,
+        output_hash: str,
+        model_snapshot_id: str,
+        data_snapshot_id: str,
+    ) -> None:
+        try:
+            from opentelemetry import trace
+        except Exception:
+            return
+        tracer = trace.get_tracer("stockm1.scenario_engine")
+        with tracer.start_as_current_span(name) as span:
+            span.set_attribute("scenario.trace_id", trace_id)
+            span.set_attribute("scenario.span_id", span_id)
+            span.set_attribute("scenario.input_hash", input_hash)
+            span.set_attribute("scenario.output_hash", output_hash)
+            span.set_attribute("scenario.model_snapshot_id", model_snapshot_id)
+            span.set_attribute("scenario.data_snapshot_id", data_snapshot_id)

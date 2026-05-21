@@ -21,6 +21,9 @@ class ScenarioTools:
         spec = self.engine.parser.parse(user_query, as_of_date)
         return asdict(spec)
 
+    def prepare_scenario(self, user_query: str, as_of_date: str, horizon: str | None = None) -> dict[str, Any]:
+        return self.engine.prepare_scenario(user_query, as_of_date, horizon=horizon)
+
     def get_portfolio_snapshot(
         self,
         symbols: list[str],
@@ -76,7 +79,14 @@ class ScenarioTools:
         cash_weight: float = 0.0,
         horizon: str | None = None,
         mode: str = "standard",
+        confirmed: bool = False,
     ) -> dict[str, Any]:
+        if not confirmed:
+            prepared = self.engine.prepare_scenario(user_query, as_of_date, horizon=horizon, persist=False)
+            raise ValueError(
+                "simulate_factor_shocks requires confirmed=True after reviewing prepare_scenario output; "
+                f"prepared={prepared}"
+            )
         report = self.engine.run(
             user_query=user_query,
             as_of_date=as_of_date,
@@ -85,6 +95,8 @@ class ScenarioTools:
             cash_weight=cash_weight,
             horizon=horizon,
             mode=mode,
+            require_confirmation=True,
+            confirmed=True,
         )
         return report.to_dict()
 
@@ -121,6 +133,7 @@ class ScenarioTools:
         proposed_cash_weight: float = 0.0,
         horizon: str | None = None,
         mode: str = "standard",
+        proposed_plan_confirmed: bool = False,
     ) -> dict[str, Any]:
         comparison = self.engine.compare_rebalance_plan(
             user_query=user_query,
@@ -133,6 +146,7 @@ class ScenarioTools:
             proposed_cash_weight=proposed_cash_weight,
             horizon=horizon,
             mode=mode,
+            proposed_plan_confirmed=proposed_plan_confirmed,
         )
         return comparison.to_dict()
 
@@ -147,6 +161,8 @@ class ScenarioTools:
         end_date: str,
         horizon: str,
         symbols: list[str] | None = None,
+        weights: list[float] | None = None,
+        cash_weight: float = 0.0,
         mode: str = "quick",
         max_observations_per_template: int = 10,
     ) -> dict[str, Any]:
@@ -155,6 +171,8 @@ class ScenarioTools:
             end_date=end_date,
             horizon=horizon,
             symbols=symbols,
+            weights=weights,
+            cash_weight=cash_weight,
             mode=mode,
             max_observations_per_template=max_observations_per_template,
         )
@@ -319,6 +337,7 @@ class ScenarioTools:
         mode: str = "quick",
         user_id: str | None = None,
         role: str | None = None,
+        confirmed: bool = False,
     ) -> dict[str, Any]:
         return self.engine.batch_portfolio_stress(
             user_query=user_query,
@@ -328,6 +347,7 @@ class ScenarioTools:
             mode=mode,
             user_id=user_id,
             role=role,
+            confirmed=confirmed,
         ).to_dict()
 
     def register_external_data_source(
@@ -397,6 +417,14 @@ class ScenarioTools:
 
     def external_data_status(self, source_name: str) -> dict[str, Any]:
         return self.engine.external_data_status(source_name).to_dict()
+
+    def capability_report(self) -> dict[str, Any]:
+        return self.engine.capability_report()
+
+    def validate_runtime_environment(self) -> dict[str, Any]:
+        from scenario_engine import validate_runtime_environment
+
+        return validate_runtime_environment()
 
     def multi_asset_coverage(self, as_of_date: str) -> dict[str, Any]:
         return self.engine.multi_asset_coverage(as_of_date).to_dict()

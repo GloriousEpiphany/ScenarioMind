@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import time
 import unittest
@@ -6,7 +7,14 @@ import zipfile
 
 import pandas as pd
 
-from scenario_engine import ScenarioEngine, get_scenario_report_schema, get_scenario_spec_schema
+from scenario_engine import (
+    ScenarioEngine,
+    get_golden_scenarios,
+    get_scenario_report_schema,
+    get_scenario_spec_schema,
+    validate_runtime_environment,
+)
+from scenario_engine.schema_contracts import validate_required_contract
 from scenario_engine.parser import ScenarioParser
 from scenario_engine.templates import SCENARIO_TEMPLATES
 from scenario_engine.news_connectors import GdeltDocNewsConnector
@@ -273,6 +281,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 as_of_date="2020-03-20",
                 symbols=["000001"],
                 weights=[1.0],
+                confirmed=True,
             )
         finally:
             engine.close()
@@ -307,6 +316,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 as_of_date="2020-03-20",
                 symbols=["000001"],
                 weights=[1.0],
+                confirmed=True,
             )
         finally:
             engine.close()
@@ -427,6 +437,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 current_weights=[1.0, 0.0],
                 proposed_symbols=["000001", "600519"],
                 proposed_weights=[0.0, 1.0],
+                proposed_plan_confirmed=True,
             )
         finally:
             engine.close()
@@ -471,6 +482,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 as_of_date="2020-03-20",
                 symbols=["000001"],
                 weights=[1.0],
+                confirmed=True,
             )
         finally:
             engine.close()
@@ -487,11 +499,19 @@ class ScenarioEngineTestCase(unittest.TestCase):
         try:
             parsed = tools.parse_scenario("如果沪深300下跌5%，我的持仓会怎样？", "2020-03-20")
             self.assertEqual(parsed["shocks"][0]["factor"], "market_index")
+            with self.assertRaises(ValueError):
+                tools.simulate_factor_shocks(
+                    user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                    as_of_date="2020-03-20",
+                    symbols=["000001"],
+                    weights=[1.0],
+                )
             result = tools.simulate_factor_shocks(
                 user_query="如果沪深300下跌5%，我的持仓会怎样？",
                 as_of_date="2020-03-20",
                 symbols=["000001"],
                 weights=[1.0],
+                confirmed=True,
             )
         finally:
             tools.close()
@@ -554,6 +574,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 as_of_date="2020-03-20",
                 symbols=["000001"],
                 weights=[1.0],
+                confirmed=True,
             )
             with self.assertRaises(ValueError):
                 engine.record_user_operation(
@@ -599,6 +620,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 as_of_date="2020-03-20",
                 symbols=["000001"],
                 weights=[1.0],
+                confirmed=True,
             )
             conn = self.db.connect()
             row = conn.execute(
@@ -624,6 +646,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 as_of_date="2020-03-20",
                 symbols=["000001"],
                 weights=[1.0],
+                confirmed=True,
             )
             saved = tools.save_scenario_report(report)
             with self.assertRaises(ValueError):
@@ -646,6 +669,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 as_of_date="2020-03-20",
                 symbols=["000001"],
                 weights=[1.0],
+                confirmed=True,
             )
             conn = self.db.connect()
             checkpoint_id = conn.execute(
@@ -714,6 +738,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 ],
                 user_id="analyst_001",
                 role="analyst",
+                confirmed=True,
             )
         finally:
             engine.close()
@@ -1333,6 +1358,15 @@ class ScenarioEngineTestCase(unittest.TestCase):
                     portfolios=[{"symbols": ["000001"], "weights": [1.0]}],
                     user_id="viewer_001",
                     role="viewer",
+                    confirmed=True,
+                )
+            with self.assertRaises(ValueError):
+                engine.batch_portfolio_stress(
+                    user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                    as_of_date="2020-03-20",
+                    portfolios=[{"symbols": ["000001"], "weights": [1.0]}],
+                    user_id="analyst_001",
+                    role="analyst",
                 )
             report = engine.batch_portfolio_stress(
                 user_query="如果沪深300下跌5%，我的持仓会怎样？",
@@ -1340,6 +1374,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 portfolios=[{"symbols": ["000001"], "weights": [1.0]}],
                 user_id="analyst_001",
                 role="analyst",
+                confirmed=True,
             )
         finally:
             engine.close()
@@ -1422,6 +1457,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 portfolios=[{"symbols": ["000001"], "weights": [1.0]}],
                 user_id="analyst_001",
                 role="analyst",
+                confirmed=True,
             )
             status = tools.external_data_status("unregistered_mcp")
             coverage = tools.multi_asset_coverage("2020-03-20")
@@ -1459,6 +1495,173 @@ class ScenarioEngineTestCase(unittest.TestCase):
             engine.close()
         self.assertTrue(any(item.evidence_id == "evidence_reverse_stress_grid" for item in report.evidence))
         self.assertTrue(any("流动性和波动率压力只作为本地风险放大标记" in item for item in report.uncertainty))
+
+    def test_prepare_scenario_requires_confirmation_before_quantification(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            prepared = engine.prepare_scenario(
+                "如果出现一个我没说清楚的新事件，会怎样？",
+                "2020-03-20",
+            )
+            self.assertTrue(prepared["requires_human_confirmation"])
+            with self.assertRaises(ValueError):
+                engine.run(
+                    user_query="如果出现一个我没说清楚的新事件，会怎样？",
+                    as_of_date="2020-03-20",
+                    symbols=["000001"],
+                    weights=[1.0],
+                    require_confirmation=True,
+                    confirmed=False,
+                )
+            report = engine.run(
+                user_query="如果出现一个我没说清楚的新事件，会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                require_confirmation=True,
+                confirmed=True,
+            )
+        finally:
+            engine.close()
+        self.assertIn("HUMAN_CONFIRMED", report.audit["state_trace"])
+
+    def test_parser_defaults_to_three_horizons_when_user_omits_horizon(self):
+        spec = ScenarioParser().parse("如果央行降息25bp，我的持仓会怎样？", "2020-03-20")
+        self.assertEqual(spec.horizon, "1m")
+        self.assertEqual(spec.horizons, ["1w", "1m", "3m"])
+
+    def test_backtest_uses_user_weights_and_cash_weight(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            weighted = engine.backtest_template(
+                template_name="中美贸易摩擦升级",
+                start_date="2020-01-02",
+                end_date="2020-01-02",
+                horizon="1w",
+                symbols=["000001", "600519"],
+                weights=[1.0, 0.0],
+                cash_weight=0.2,
+                max_observations=1,
+            )
+            single = engine.backtest_template(
+                template_name="中美贸易摩擦升级",
+                start_date="2020-01-02",
+                end_date="2020-01-02",
+                horizon="1w",
+                symbols=["000001"],
+                weights=[1.0],
+                cash_weight=0.2,
+                max_observations=1,
+            )
+        finally:
+            engine.close()
+        self.assertEqual(weighted.audit["weights"], [0.8, 0.0])
+        self.assertEqual(weighted.observations[0].realized_return, single.observations[0].realized_return)
+
+    def test_report_expands_path_details_and_key_number_audit_table(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+        finally:
+            engine.close()
+        self.assertIn("时间滞后", report.markdown)
+        self.assertIn("反向条件", report.markdown)
+        self.assertIn("### 关键数字审计表", report.markdown)
+        self.assertTrue(all(path.reverse_conditions for path in report.paths))
+
+    def test_report_schema_validates_nested_report_items(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+        finally:
+            engine.close()
+        schema = get_scenario_report_schema()
+        issues = validate_required_contract(report.to_dict(), schema)
+        self.assertEqual(issues, [])
+        broken = report.to_dict()
+        del broken["paths"][0]["reverse_conditions"]
+        issues = validate_required_contract(broken, schema)
+        self.assertTrue(any("reverse_conditions" in issue for issue in issues))
+
+    def test_local_eval_suite_is_recorded_without_claiming_external_frameworks(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+        finally:
+            engine.close()
+        evals = report.audit["scenario_evals"]
+        self.assertEqual(evals["status"], "passed")
+        self.assertEqual(evals["framework"], "local_deterministic_eval_suite")
+        self.assertIn(evals["external_eval_frameworks"]["deepeval"], {"available_not_configured", "not_installed"})
+
+    def test_langgraph_workflow_runs_when_dependency_is_available(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+            )
+        finally:
+            engine.close()
+        workflow = report.audit["workflow_orchestrator"]
+        if workflow["enabled"]:
+            self.assertEqual(workflow["engine"], "langgraph")
+            self.assertEqual(workflow["status"], "executed")
+            self.assertIn("REPORTED", workflow["states"])
+        else:
+            self.assertEqual(workflow["status"], "not_available")
+
+    def test_capability_report_does_not_overclaim_external_full_version_features(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.capability_report()
+        finally:
+            engine.close()
+        self.assertEqual(report["phase_0_contracts_and_samples"]["status"], "implemented")
+        self.assertIn(report["phase_3_agents_memory"]["status"], {"partial", "implemented"})
+        self.assertNotEqual(report["v2_external_data_and_graphrag"]["status"], "implemented")
+        self.assertIn("external GraphRAG service", report["v2_external_data_and_graphrag"]["not_claimed"])
+
+    def test_phase0_golden_scenario_assets_are_present_and_parseable(self):
+        fixtures = get_golden_scenarios()
+        self.assertEqual(len(fixtures), 10)
+        with open("Docs/scenario_lab_golden_scenarios.json", encoding="utf-8") as fh:
+            doc_fixtures = json.load(fh)
+        self.assertEqual(len(doc_fixtures), 10)
+        self.assertTrue(os.path.exists("Docs/scenario_lab_sample_report.md"))
+        parser = ScenarioParser()
+        for item in fixtures:
+            with self.subTest(item=item["query"]):
+                spec = parser.parse(item["query"], "2020-03-20")
+                self.assertEqual(spec.horizons, item["default_horizons"])
+                self.assertEqual(spec.event_type, item["expected_event_type"])
+                factors = {shock.factor for shock in spec.shocks}
+                self.assertTrue(set(item["expected_factors"]).issubset(factors))
+
+    def test_runtime_environment_reports_missing_full_version_dependencies(self):
+        status = validate_runtime_environment()
+        self.assertIn("python_executable", status)
+        self.assertIn("packages", status)
+        self.assertIn("full_external_runtime_available", status)
+        for package in ["pytest", "langgraph", "deepeval", "ragas", "opentelemetry"]:
+            self.assertIn(package, status["packages"])
 
 
 if __name__ == "__main__":

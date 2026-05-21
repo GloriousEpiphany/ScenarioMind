@@ -160,7 +160,7 @@ class ScenarioSimulator:
                     bear_return_range=bear_range,
                     expected_contribution_range=contribution_range,
                     key_drivers=key_drivers or ["缺少可审计数据，系统不量化该持仓影响"],
-                    hedge_candidates=[],
+                    hedge_candidates=self._hedge_candidates(base_range, constraint_notes),
                     evidence_ids=sorted(set(evidence_ids)),
                     confidence=confidence,
                     quantification_status=status,
@@ -274,6 +274,7 @@ class ScenarioSimulator:
                 evidence_ids=base_evidence,
                 probability=None,
                 probability_source="unavailable",
+                reverse_conditions=["历史类比失效", "政策对冲强度明显高于或低于模板假设", "用户补充的事件范围改变冲击对象"],
             ),
             TransmissionPath(
                 path_id="path_bear",
@@ -286,6 +287,7 @@ class ScenarioSimulator:
                 evidence_ids=base_evidence,
                 probability=None,
                 probability_source="unavailable",
+                reverse_conditions=["事件快速澄清或被政策对冲", "流动性没有恶化", "持仓基本面未受场景影响"],
             ),
             TransmissionPath(
                 path_id="path_bull",
@@ -298,6 +300,17 @@ class ScenarioSimulator:
                 evidence_ids=base_evidence,
                 probability=None,
                 probability_source="unavailable",
+                reverse_conditions=["风险偏好继续下行", "场景影响范围扩大", "高估值或低流动性标的被集中抛售"],
             ),
         ]
         return paths
+
+    def _hedge_candidates(self, base_range: tuple[float, float] | None, constraint_notes: list[str]) -> list[str]:
+        if base_range is None:
+            return ["补充可审计数据后再比较风险管理选项"]
+        candidates = ["提高现金仓位作为压力测试比较项", "降低单一标的集中度作为候选风险管理动作"]
+        if base_range[0] < -0.08:
+            candidates.append("用低相关持仓或指数替代方案做 What-If 比较")
+        if constraint_notes:
+            candidates.append("先核查停牌、涨跌停和流动性约束，再评估可执行性")
+        return candidates

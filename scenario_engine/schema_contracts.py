@@ -14,6 +14,7 @@ SCENARIO_SPEC_SCHEMA = {
         "user_query",
         "as_of_date",
         "horizon",
+        "horizons",
         "event_type",
         "event_name",
         "region",
@@ -28,6 +29,7 @@ SCENARIO_SPEC_SCHEMA = {
         "user_query": {"type": "string", "minLength": 1},
         "as_of_date": {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$"},
         "horizon": {"type": "string", "enum": ["1d", "1w", "1m", "3m", "6m", "1y"]},
+        "horizons": {"type": "array", "items": {"type": "string", "enum": ["1d", "1w", "1m", "3m", "6m", "1y"]}},
         "event_type": {"type": "string"},
         "event_name": {"type": "string"},
         "region": {"type": "string"},
@@ -90,14 +92,91 @@ SCENARIO_REPORT_SCHEMA = {
         "as_of_date": {"type": "string"},
         "executive_summary": {"type": "string"},
         "scenario_spec": SCENARIO_SPEC_SCHEMA,
-        "paths": {"type": "array"},
-        "portfolio_impacts": {"type": "array"},
+        "paths": {"type": "array", "items": {"$ref": "#/$defs/TransmissionPath"}},
+        "portfolio_impacts": {"type": "array", "items": {"$ref": "#/$defs/PortfolioImpact"}},
         "portfolio_total_impact": {"type": "object"},
-        "evidence": {"type": "array"},
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/Evidence"}},
         "recommendations": {"type": "array"},
         "uncertainty": {"type": "array"},
         "audit": {"type": "object"},
         "markdown": {"type": "string"},
+    },
+    "$defs": {
+        "Evidence": {
+            "type": "object",
+            "required": ["evidence_id", "evidence_type", "title", "content", "confidence", "source_uri", "metrics"],
+            "properties": {
+                "evidence_id": {"type": "string"},
+                "evidence_type": {"type": "string"},
+                "title": {"type": "string"},
+                "content": {"type": "string"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "source_uri": {"type": "string"},
+                "start_date": {"type": ["string", "null"]},
+                "end_date": {"type": ["string", "null"]},
+                "metrics": {"type": "object"},
+            },
+        },
+        "TransmissionPath": {
+            "type": "object",
+            "required": [
+                "path_id",
+                "name",
+                "steps",
+                "affected_symbols",
+                "affected_industries",
+                "direction",
+                "lag_days",
+                "evidence_ids",
+                "probability",
+                "probability_source",
+                "reverse_conditions",
+            ],
+            "properties": {
+                "path_id": {"type": "string"},
+                "name": {"type": "string"},
+                "steps": {"type": "array", "items": {"type": "string"}},
+                "affected_symbols": {"type": "array", "items": {"type": "string"}},
+                "affected_industries": {"type": "array", "items": {"type": "string"}},
+                "direction": {"type": "string"},
+                "lag_days": {"type": "array", "items": {"type": "number"}},
+                "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                "probability": {"type": ["number", "null"]},
+                "probability_source": {"type": "string"},
+                "reverse_conditions": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "PortfolioImpact": {
+            "type": "object",
+            "required": [
+                "symbol",
+                "name",
+                "position_weight",
+                "base_return_range",
+                "bull_return_range",
+                "bear_return_range",
+                "expected_contribution_range",
+                "key_drivers",
+                "hedge_candidates",
+                "evidence_ids",
+                "confidence",
+                "quantification_status",
+            ],
+            "properties": {
+                "symbol": {"type": "string"},
+                "name": {"type": "string"},
+                "position_weight": {"type": "number"},
+                "base_return_range": {"type": ["array", "null"]},
+                "bull_return_range": {"type": ["array", "null"]},
+                "bear_return_range": {"type": ["array", "null"]},
+                "expected_contribution_range": {"type": ["array", "null"]},
+                "key_drivers": {"type": "array", "items": {"type": "string"}},
+                "hedge_candidates": {"type": "array", "items": {"type": "string"}},
+                "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "quantification_status": {"type": "string"},
+            },
+        },
     },
 }
 
@@ -110,7 +189,14 @@ def get_scenario_report_schema() -> dict:
     return SCENARIO_REPORT_SCHEMA.copy()
 
 
-def validate_required_contract(data: dict, schema: dict, path: str = "$") -> list[str]:
+def _resolve_ref(schema: dict, ref: str) -> dict:
+    if not ref.startswith("#/$defs/"):
+        return {}
+    name = ref.rsplit("/", 1)[-1]
+    return schema.get("$defs", {}).get(name, {})
+
+
+def validate_required_contract(data: dict, schema: dict, path: str = "$", root_schema: dict | None = None) -> list[str]:
     """Validate the subset of JSON Schema used by the project contracts.
 
     This is not a full JSON Schema implementation. It enforces required fields,
@@ -118,6 +204,12 @@ def validate_required_contract(data: dict, schema: dict, path: str = "$") -> lis
     does not need a new dependency just for contract tests.
     """
     issues: list[str] = []
+    root_schema = root_schema or schema
+    if "$ref" in schema:
+        resolved = _resolve_ref(root_schema, schema["$ref"])
+        if not resolved:
+            return [f"{path} has unresolved schema ref {schema['$ref']}"]
+        return validate_required_contract(data, resolved, path, root_schema)
     expected_type = schema.get("type")
     if expected_type == "object":
         if not isinstance(data, dict):
@@ -128,16 +220,30 @@ def validate_required_contract(data: dict, schema: dict, path: str = "$") -> lis
         properties = schema.get("properties", {})
         for key, value in data.items():
             if key in properties:
-                issues.extend(validate_required_contract(value, properties[key], f"{path}.{key}"))
+                child_schema = properties[key]
+                child_root = child_schema if "$defs" in child_schema else root_schema
+                issues.extend(validate_required_contract(value, child_schema, f"{path}.{key}", child_root))
     elif expected_type == "array":
-        if not isinstance(data, list):
+        if not isinstance(data, (list, tuple)):
             return [f"{path} must be array"]
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(data):
+                issues.extend(validate_required_contract(item, item_schema, f"{path}[{index}]", root_schema))
     elif isinstance(expected_type, list):
         if "null" in expected_type and data is None:
             return issues
         if "number" in expected_type and isinstance(data, (int, float)):
             return issues
         if "string" in expected_type and isinstance(data, str):
+            return issues
+        if "array" in expected_type and isinstance(data, (list, tuple)):
+            item_schema = schema.get("items")
+            if item_schema:
+                for index, item in enumerate(data):
+                    issues.extend(validate_required_contract(item, item_schema, f"{path}[{index}]", root_schema))
+            return issues
+        if "object" in expected_type and isinstance(data, dict):
             return issues
         issues.append(f"{path} must be one of {expected_type}")
     elif expected_type == "string":

@@ -8,6 +8,9 @@ or documented templates.
 
 from .engine import ScenarioEngine
 from .schema_contracts import get_scenario_report_schema, get_scenario_spec_schema
+from .capabilities import build_capability_report
+from .golden_scenarios import get_golden_scenarios
+from .environment import validate_runtime_environment
 from .schemas import (
     BacktestReport,
     BatchBacktestReport,
@@ -73,4 +76,7 @@ __all__ = [
     "EventPollingScheduler",
     "get_scenario_report_schema",
     "get_scenario_spec_schema",
+    "build_capability_report",
+    "get_golden_scenarios",
+    "validate_runtime_environment",
 ]

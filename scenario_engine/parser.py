@@ -61,7 +61,9 @@ class ScenarioParser:
         shocks = self._extract_shocks(query)
         if matched_template and not shocks:
             shocks = self._template_default_shocks(matched_template)
-        parsed_horizon = horizon or self._extract_horizon(query) or "1m"
+        extracted_horizon = self._extract_horizon(query)
+        parsed_horizon = horizon or extracted_horizon or "1m"
+        parsed_horizons = [parsed_horizon] if (horizon or extracted_horizon) else ["1w", "1m", "3m"]
 
         if not shocks:
             missing.append("可量化冲击幅度")
@@ -93,6 +95,7 @@ class ScenarioParser:
             assumptions=assumptions,
             missing_information=sorted(set(missing)),
             confidence=confidence,
+            horizons=parsed_horizons,
         )
 
     def _merge_llm_spec(self, base: ScenarioSpec, parsed: dict[str, Any]) -> ScenarioSpec:
@@ -114,6 +117,10 @@ class ScenarioParser:
         horizon = str(parsed.get("horizon") or base.horizon)
         if horizon not in ALLOWED_HORIZONS:
             horizon = base.horizon
+        raw_horizons = self._string_list(parsed.get("horizons"))
+        horizons = [item for item in raw_horizons if item in ALLOWED_HORIZONS] or base.horizons or [horizon]
+        if horizon not in horizons:
+            horizons = [horizon, *horizons]
         affected = self._string_list(parsed.get("affected_entities")) or base.affected_entities
         missing = sorted(set(base.missing_information + self._string_list(parsed.get("missing_information"))))
         return ScenarioSpec(
@@ -129,6 +136,7 @@ class ScenarioParser:
             assumptions=assumptions,
             missing_information=missing,
             confidence=max(base.confidence, self._bounded_float(parsed.get("confidence"), default=base.confidence)),
+            horizons=horizons,
         )
 
     def _normalize_llm_shocks(self, raw: Any) -> list[ShockSpec]:

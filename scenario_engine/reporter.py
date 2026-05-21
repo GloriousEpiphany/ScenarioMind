@@ -97,6 +97,7 @@ class ReportComposer:
             f"- 基准日期：{report.as_of_date}",
             f"- 事件类型：{report.scenario_spec.event_type}",
             f"- 时间范围：{report.scenario_spec.horizon}",
+            f"- 默认/备选时间范围：{', '.join(report.scenario_spec.horizons or [report.scenario_spec.horizon])}",
             f"- 影响对象：{', '.join(report.scenario_spec.affected_entities) or '未明确'}",
             f"- 缺失信息：{', '.join(report.scenario_spec.missing_information) or '无'}",
             "",
@@ -132,8 +133,14 @@ class ReportComposer:
         lines.extend(["", "## 传导路径", ""])
         for path in report.paths:
             lines.append(f"### {path.name}")
+            lines.append(f"- 影响方向：{path.direction}")
+            lines.append(f"- 时间滞后：{path.lag_days[0]} 至 {path.lag_days[1]} 个交易日")
+            lines.append(f"- 概率口径：{path.probability_source if path.probability is None else f'{path.probability:.2%}'}")
+            lines.append(f"- 证据：{', '.join(path.evidence_ids) or '无'}")
             for step in path.steps:
                 lines.append(f"- {step}")
+            if path.reverse_conditions:
+                lines.append("- 反向条件：" + "；".join(path.reverse_conditions))
             lines.append("")
         lines.extend(["## 不确定性", ""])
         for item in report.uncertainty:
@@ -141,6 +148,15 @@ class ReportComposer:
         lines.extend(["", "## 候选动作", ""])
         for item in report.recommendations:
             lines.append(f"- [{item.get('type')}] {item.get('content')}")
+        hedge_rows = [
+            (impact.symbol, candidate)
+            for impact in report.portfolio_impacts
+            for candidate in impact.hedge_candidates
+        ]
+        if hedge_rows:
+            lines.extend(["", "## 调仓/对冲候选", "", "| 标的 | 候选动作 |", "|---|---|"])
+            for symbol, candidate in hedge_rows:
+                lines.append(f"| {symbol} | {candidate} |")
         lines.extend(["", "## 审计", ""])
         lines.append(f"- 方法：{report.audit.get('method')}")
         lines.append(f"- 数据边界：{report.audit.get('data_boundary')}")
@@ -156,6 +172,19 @@ class ReportComposer:
         for note in report.audit.get("a_share_constraints", []):
             lines.append(f"- A股约束：{note}")
         lines.append(f"- 校验状态：{report.audit.get('validation_status')}")
+        lines.extend(["", "### 关键数字审计表", "", "| 数字 | 数值 | 来源 |", "|---|---:|---|"])
+        total = report.portfolio_total_impact
+        base_range = total.get("base_range")
+        if base_range is not None:
+            lines.append(f"| 组合基准冲击下沿 | {base_range[0]:.2%} | 持仓贡献区间加权汇总 |")
+            lines.append(f"| 组合基准冲击上沿 | {base_range[1]:.2%} | 持仓贡献区间加权汇总 |")
+        lines.append(f"| 可量化仓位 | {total.get('quantified_position_weight', 0):.2%} | portfolio_impacts 中可量化持仓权重汇总 |")
+        for impact in report.portfolio_impacts:
+            if impact.base_return_range is not None:
+                lines.append(
+                    f"| {impact.symbol} 基准区间 | {impact.base_return_range[0]:.2%} ~ {impact.base_return_range[1]:.2%} | "
+                    f"{', '.join(impact.evidence_ids)} |"
+                )
         if report.audit.get("agent_review"):
             lines.extend(["", "## 多角色审查", ""])
             for item in report.audit["agent_review"]:
