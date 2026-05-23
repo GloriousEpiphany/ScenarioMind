@@ -27,28 +27,75 @@ def cli():
 @click.option('--start-date', default=config.DEFAULT_START_DATE, help='开始日期 (YYYYMMDD)')
 @click.option('--end-date', default=None, help='结束日期 (YYYYMMDD)')
 @click.option('--limit', default=None, type=int, help='限制下载数量（测试用）')
-def download_stocks(start_date, end_date, limit):
+@click.option('--interval', default=1.0, type=float, show_default=True, help='每只股票请求后的等待秒数')
+@click.option('--retries', default=3, type=int, show_default=True, help='单只股票失败后的重试次数')
+@click.option('--retry-delay', default=2.0, type=float, show_default=True, help='首次重试等待秒数，后续指数退避')
+@click.option('--timeout', default=15.0, type=float, show_default=True, help='单次网络请求超时秒数')
+@click.option('--full-refresh', is_flag=True, help='忽略数据库已有日期，强制按开始日期全量重拉')
+@click.option('--refresh-stock-list', is_flag=True, help='联网刷新股票列表；默认优先使用本地缓存，避免列表接口卡住')
+def download_stocks(
+    start_date,
+    end_date,
+    limit,
+    interval,
+    retries,
+    retry_delay,
+    timeout,
+    full_refresh,
+    refresh_stock_list
+):
     """下载A股股票历史数据"""
     console.print("[bold cyan]开始下载A股股票数据...[/bold cyan]")
     
     db = Database()
     downloader = DataDownloader()
     
-    # 获取并保存股票列表
-    stock_list = downloader.get_stock_list()
-    if not stock_list.empty:
-        db.save_stock_info(stock_list)
-        console.print(f"[green]股票列表已保存到数据库[/green]")
+    # 默认优先使用本地股票列表，避免 AKShare 列表接口偶发长时间阻塞。
+    stock_list = db.get_stock_list_for_download()
+    if not stock_list.empty and not refresh_stock_list:
+        console.print(f"[green]使用本地缓存的 {len(stock_list)} 只股票列表[/green]")
+    else:
+        stock_list = downloader.get_stock_list(retries=retries, retry_delay=retry_delay)
+        if not stock_list.empty:
+            db.save_stock_info(stock_list)
+            console.print(f"[green]股票列表已保存到数据库[/green]")
+        else:
+            cached_stock_list = db.get_stock_list_for_download()
+            if not cached_stock_list.empty:
+                stock_list = cached_stock_list
+                console.print(
+                    f"[yellow]网络股票列表获取失败，使用本地缓存的 {len(stock_list)} 只股票继续下载[/yellow]"
+                )
+            else:
+                console.print("[red]无法获取股票列表，且本地没有缓存，下载终止[/red]")
+                db.close()
+                return
     
-    # 下载股票数据
-    result = downloader.download_all_stocks(start_date, end_date, limit)
-    
-    # 保存到数据库
-    if result['data']:
-        console.print("\n[cyan]正在保存数据到数据库...[/cyan]")
-        for symbol, df in result['data'].items():
-            db.save_stock_daily_data(symbol, df)
+    # 下载股票数据。每只股票成功后立即入库，避免全市场下载时占用大量内存。
+    result = downloader.download_all_stocks(
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+        stock_list=stock_list,
+        interval=interval,
+        retries=retries,
+        retry_delay=retry_delay,
+        timeout=timeout,
+        incremental=not full_refresh,
+        latest_date_getter=db.get_latest_stock_date,
+        save_callback=db.save_stock_daily_data
+    )
+
+    if result.get('success', 0) > 0:
         console.print("[green]数据已保存到数据库[/green]")
+
+    failed_symbols = result.get('failed_symbols', [])
+    if failed_symbols:
+        failed_path = os.path.join(config.DATA_DIR, 'failed_stock_downloads.txt')
+        with open(failed_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(failed_symbols))
+            f.write('\n')
+        console.print(f"[yellow]失败股票代码已写入: {failed_path}[/yellow]")
     
     db.close()
 

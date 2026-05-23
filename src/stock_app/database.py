@@ -293,6 +293,19 @@ class Database:
         ''', (symbol,))
         
         return [row[0] for row in cursor.fetchall()]
+
+    def get_latest_stock_date(self, symbol: str) -> Optional[str]:
+        """获取某只股票已保存的最新交易日期"""
+        conn = self.connect()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT MAX(date) FROM stock_daily
+            WHERE symbol = ?
+        ''', (symbol,))
+
+        result = cursor.fetchone()
+        return result[0] if result and result[0] else None
     
     def get_all_stocks(self) -> pd.DataFrame:
         """获取所有股票列表"""

@@ -145,6 +145,67 @@ class ScenarioLLMClient:
             },
         )
 
+    def synthesize_investor_report(self, report_payload: dict[str, Any]) -> LLMCallResult:
+        """Create a plain-language qualitative synthesis from audited report data.
+
+        The model may explain, rank and summarize only. It must not invent new
+        prices, probabilities, return ranges or buy/sell orders.
+        """
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是 StockM1 情景推演实验室的 Investor Report Agent。"
+                    "你的任务是把已经审计过的结构化压力测试结果，改写成普通投资者能看懂的中文结论。"
+                    "不得新增任何报告中没有的数字、收益区间、概率、目标价或确定性买卖指令。"
+                    "必须返回 JSON。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "required_json_fields": [
+                            "bottom_line",
+                            "risk_level",
+                            "plain_summary",
+                            "main_risks",
+                            "possible_actions",
+                            "watch_points",
+                            "confidence_note",
+                        ],
+                        "rules": [
+                            "bottom_line 用一句话回答用户最关心的问题",
+                            "risk_level 只能是 低/中/高/不可判定",
+                            "possible_actions 必须是候选动作，不得写成必须买入或必须卖出",
+                            "所有结论必须能从 input_report 中追溯",
+                        ],
+                        "input_report": report_payload,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=min(self.temperature, 0.2),
+            max_tokens=max(self.max_tokens, 1600),
+            response_format={"type": "json_object"},
+        )
+        payload = response.model_dump() if hasattr(response, "model_dump") else response
+        content = payload["choices"][0]["message"].get("content", "")
+        parsed = _loads_json_object(content)
+        return LLMCallResult(
+            parsed=parsed,
+            metadata={
+                "provider": "openai_compatible_chat_completions",
+                "model": self.model,
+                "api_base": self.api_base,
+                "usage": payload.get("usage") or {},
+            },
+        )
+
 
 class ScenarioLLMUnavailable(Exception):
     pass

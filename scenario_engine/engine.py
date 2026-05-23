@@ -243,6 +243,8 @@ class ScenarioEngine:
         report.audit["validation_status"] = "passed" if ok else "failed"
         report.audit["validation_issues"] = issues
         report.audit["agent_review"] = [item.__dict__ for item in self.agent_review.review(report)]
+        report.audit["investor_decision"] = self._build_investor_decision(report)
+        self._attach_llm_investor_synthesis(report)
         self._checkpoint(spec.scenario_id, "AGENT_REVIEW_READY", {"reviewer_count": len(report.audit["agent_review"])})
         report.markdown = self.reporter._to_markdown(report)
         report.audit["scenario_evals"] = self.evaluation_suite.evaluate(report)
@@ -269,6 +271,118 @@ class ScenarioEngine:
                 model_snapshot_id=report.audit["model_snapshot_id"],
             )
         return report
+
+    def _build_investor_decision(self, report: ScenarioReport) -> dict:
+        total = report.portfolio_total_impact
+        base_range = total.get("base_range")
+        quantified = [item for item in report.portfolio_impacts if item.expected_contribution_range is not None]
+        if base_range is None:
+            return {
+                "source": "deterministic_investor_decision_agent",
+                "bottom_line": "这次情景证据不足，不能形成可执行投资结论。",
+                "risk_level": "不可判定",
+                "plain_summary": report.executive_summary,
+                "main_risks": report.uncertainty[:4],
+                "possible_actions": ["补充事件幅度、发生时间、持仓权重后重新推演。", "不要根据未量化结果直接加仓或减仓。"],
+                "watch_points": ["缺失信息是否补齐", "持仓是否有足够历史数据", "情景是否能被明确量化"],
+                "confidence_note": "可审计数据不足，系统选择不输出看似精确但无法追溯的结论。",
+            }
+        downside = float(base_range[0])
+        if downside <= -0.10:
+            risk_level = "高"
+        elif downside <= -0.03:
+            risk_level = "中"
+        else:
+            risk_level = "低"
+        worst = min(quantified, key=lambda item: item.expected_contribution_range[0]) if quantified else None
+        best = max(quantified, key=lambda item: item.expected_contribution_range[1]) if quantified else None
+        main_risks = []
+        if worst:
+            main_risks.append(f"{worst.symbol} {worst.name} 是当前最大下行贡献来源，下沿约 {worst.expected_contribution_range[0]:.2%}。")
+            main_risks.extend(worst.key_drivers[:2])
+        main_risks.extend(report.uncertainty[:3])
+        actions = [
+            "先把该结果当成风险体检：确认最差下沿是否超过你的亏损承受阈值。",
+            "若超过阈值，优先降低最大拖累标的或提高现金仓位，再用调仓方案比较功能复测。",
+        ]
+        if worst:
+            actions.append(f"重点复核 {worst.symbol} 的持仓权重、流动性和事件相关性。")
+        if best and (not worst or best.symbol != worst.symbol):
+            actions.append(f"{best.symbol} 在修复路径里相对更抗压，但这不是自动买入建议。")
+        return {
+            "source": "deterministic_investor_decision_agent",
+            "bottom_line": f"本次情景下组合可量化压力区间约 {base_range[0]:.2%} 至 {base_range[1]:.2%}，综合风险等级为{risk_level}。",
+            "risk_level": risk_level,
+            "plain_summary": report.executive_summary,
+            "main_risks": list(dict.fromkeys(main_risks)),
+            "possible_actions": actions,
+            "watch_points": [
+                "事件实际幅度是否达到输入假设",
+                "最大风险持仓是否继续扩大下行贡献",
+                "未量化持仓占比是否过高",
+                "调仓后下沿是否明显改善",
+            ],
+            "confidence_note": f"当前量化覆盖约 {total.get('quantified_position_weight', 0):.1%} 的持仓；未覆盖部分仍需要人工判断。",
+        }
+
+    def _attach_llm_investor_synthesis(self, report: ScenarioReport) -> None:
+        if self.llm_client is None or not hasattr(self.llm_client, "synthesize_investor_report"):
+            report.audit["llm_investor_synthesis"] = {
+                "status": "not_used",
+                "reason": "llm_not_configured_or_client_does_not_support_synthesis",
+                "numeric_generation_policy": "forbidden",
+            }
+            return
+        payload = {
+            "scenario": {
+                "event_name": report.scenario_spec.event_name,
+                "event_type": report.scenario_spec.event_type,
+                "horizon": report.scenario_spec.horizon,
+                "affected_entities": report.scenario_spec.affected_entities,
+                "missing_information": report.scenario_spec.missing_information,
+            },
+            "portfolio_total_impact": report.portfolio_total_impact,
+            "portfolio_impacts": [
+                {
+                    "symbol": item.symbol,
+                    "name": item.name,
+                    "weight": item.position_weight,
+                    "base_return_range": item.base_return_range,
+                    "expected_contribution_range": item.expected_contribution_range,
+                    "key_drivers": item.key_drivers,
+                    "quantification_status": item.quantification_status,
+                    "confidence": item.confidence,
+                }
+                for item in report.portfolio_impacts
+            ],
+            "uncertainty": report.uncertainty,
+            "agent_review": report.audit.get("agent_review", []),
+            "graph_context_edges": report.audit.get("graph_context_edges", [])[:8],
+        }
+        try:
+            result = self.llm_client.synthesize_investor_report(payload)
+            parsed = result.parsed if hasattr(result, "parsed") else result.get("parsed", {})
+            current = report.audit.get("investor_decision") or {}
+            merged = dict(current)
+            for key in ["bottom_line", "risk_level", "plain_summary", "main_risks", "possible_actions", "watch_points", "confidence_note"]:
+                if parsed.get(key):
+                    merged[key] = parsed[key]
+            merged["source"] = "llm_investor_report_agent_on_audited_payload"
+            report.audit["investor_decision"] = merged
+            metadata = result.metadata if hasattr(result, "metadata") else result.get("metadata", {})
+            report.audit["llm_investor_synthesis"] = {
+                "status": "used",
+                "model": metadata.get("model"),
+                "provider": metadata.get("provider"),
+                "usage": metadata.get("usage", {}),
+                "numeric_generation_policy": "forbidden",
+            }
+        except Exception as exc:
+            report.audit["llm_investor_synthesis"] = {
+                "status": "failed",
+                "error": str(exc),
+                "numeric_generation_policy": "forbidden",
+            }
 
     def prepare_scenario(
         self,

@@ -10,6 +10,19 @@ import streamlit as st
 
 from scenario_engine import ScenarioEngine
 from scenario_engine.templates import SCENARIO_TEMPLATES
+from visualization.data_loader import StockDataLoader
+
+
+@st.cache_data(ttl=300)
+def _scenario_stock_options(keyword: str = "", limit: int = 300) -> list[dict]:
+    loader = StockDataLoader()
+    df = loader.search_stocks(keyword, limit=limit) if keyword.strip() else loader.get_all_stocks(limit=limit)
+    if df.empty:
+        return []
+    return [
+        {"label": f"{row['symbol']} - {row['name']}", "symbol": str(row["symbol"]), "name": str(row["name"])}
+        for _, row in df.iterrows()
+    ]
 
 
 def show_scenario_page():
@@ -42,22 +55,65 @@ def show_scenario_page():
     )
 
     st.subheader("我的持仓")
+    st.caption("可以从股票库搜索选择，也可以直接在表格里手动输入代码。仓位会在推演时自动归一化。")
+
+    if "scenario_portfolio_df" not in st.session_state:
+        st.session_state["scenario_portfolio_df"] = pd.DataFrame(
+            [{"股票代码": "000001", "仓位": 0.50}, {"股票代码": "600519", "仓位": 0.50}]
+        )
+
+    portfolio_source = st.radio(
+        "持仓录入方式",
+        ["从股票库选择", "手动编辑", "使用示例"],
+        index=0,
+        horizontal=True,
+    )
+    if portfolio_source == "使用示例":
+        example_name = st.selectbox(
+            "示例组合",
+            ["银行+白酒均衡", "单一持仓压力测试", "高现金防守组合"],
+            index=0,
+        )
+        examples = {
+            "银行+白酒均衡": [{"股票代码": "000001", "仓位": 0.50}, {"股票代码": "600519", "仓位": 0.50}],
+            "单一持仓压力测试": [{"股票代码": "000001", "仓位": 1.00}],
+            "高现金防守组合": [{"股票代码": "000001", "仓位": 0.35}, {"股票代码": "600519", "仓位": 0.35}],
+        }
+        if st.button("载入示例组合"):
+            st.session_state["scenario_portfolio_df"] = pd.DataFrame(examples[example_name])
+
+    if portfolio_source == "从股票库选择":
+        keyword = st.text_input("搜索股票代码或名称", value="", placeholder="例如：茅台、平安、600519")
+        options = _scenario_stock_options(keyword)
+        option_labels = [item["label"] for item in options]
+        selected_labels = st.multiselect("选择持仓股票", options=option_labels, max_selections=20)
+        if selected_labels:
+            selected_symbols = [item["symbol"] for item in options if item["label"] in selected_labels]
+            existing = st.session_state["scenario_portfolio_df"].set_index("股票代码")["仓位"].to_dict()
+            default_weight = round(1.0 / len(selected_symbols), 4)
+            st.session_state["scenario_portfolio_df"] = pd.DataFrame(
+                [{"股票代码": symbol, "仓位": float(existing.get(symbol, default_weight))} for symbol in selected_symbols]
+            )
+
     portfolio_df = st.data_editor(
-        pd.DataFrame(
-            [
-                {"股票代码": "000001", "仓位": 0.50},
-                {"股票代码": "600519", "仓位": 0.50},
-            ]
-        ),
+        st.session_state["scenario_portfolio_df"],
         num_rows="dynamic",
         use_container_width=True,
+        key="scenario_portfolio_editor",
         column_config={
             "股票代码": st.column_config.TextColumn(help="A股代码，例如 600519"),
             "仓位": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
         },
         hide_index=True,
     )
+    st.session_state["scenario_portfolio_df"] = portfolio_df
     cash_weight = st.slider("现金仓位", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+    try:
+        _, preview_weights = _portfolio_from_editor(portfolio_df)
+        preview_total = sum(preview_weights) + cash_weight
+        st.caption(f"当前录入股票仓位合计 {sum(preview_weights):.1%}，加现金后系统将按总权重 {preview_total:.1%} 自动归一化。")
+    except Exception:
+        st.caption("请至少保留一只有效持仓。")
 
     with st.expander("可选：比较一个调仓方案", expanded=False):
         proposed_df = st.data_editor(
@@ -152,12 +208,34 @@ def show_scenario_page():
         st.error(f"推演失败：{exc}")
         return
 
-    st.subheader("执行摘要")
-    st.write(report.executive_summary)
+    decision = report.audit.get("investor_decision") or {}
+    st.subheader("一句话结论")
+    st.markdown(f"**{decision.get('bottom_line', report.executive_summary)}**")
+    st.caption(decision.get("confidence_note", "结论来自情景引擎、Agent 审查和本地证据链。"))
 
     total = report.portfolio_total_impact
     cols = st.columns(4)
     base_range = total.get("base_range")
+    cols[0].metric("风险等级", decision.get("risk_level", "不可判定"))
+    cols[1].metric("组合冲击区间", "未量化" if base_range is None else f"{base_range[0]:.2%} ~ {base_range[1]:.2%}")
+    cols[2].metric("最大风险持仓", _risk_holding(report))
+    cols[3].metric("可量化仓位", f"{total.get('quantified_position_weight', 0):.1%}")
+
+    with st.container(border=True):
+        st.markdown("**普通投资者版摘要**")
+        st.write(decision.get("plain_summary", report.executive_summary))
+        action_cols = st.columns(2)
+        with action_cols[0]:
+            st.markdown("**主要风险**")
+            for item in decision.get("main_risks", [])[:5]:
+                st.write(f"- {item}")
+        with action_cols[1]:
+            st.markdown("**下一步可做什么**")
+            for item in decision.get("possible_actions", [])[:5]:
+                st.write(f"- {item}")
+
+    st.subheader("关键数字")
+    cols = st.columns(4)
     cols[0].metric("可量化仓位", f"{total.get('quantified_position_weight', 0):.1%}")
     cols[1].metric("组合冲击区间", "未量化" if base_range is None else f"{base_range[0]:.2%} ~ {base_range[1]:.2%}")
     risk = _risk_holding(report)
