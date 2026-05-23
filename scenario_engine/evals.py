@@ -25,14 +25,14 @@ class ScenarioEvaluationSuite:
     ]
 
     EXPECTED_REVIEWERS = {
-        "Scenario Parser Agent",
-        "Evidence Agent",
-        "Quant Agent",
-        "Bull Agent",
-        "Bear/Risk Agent",
-        "Policy Agent",
-        "Critic Agent",
-        "Report Agent",
+        "Scenario Parser Review Agent (deterministic)",
+        "Evidence Review Agent (deterministic)",
+        "Quant Review Agent (deterministic)",
+        "Bull Review Agent (deterministic)",
+        "Bear/Risk Review Agent (deterministic)",
+        "Policy Review Agent (deterministic)",
+        "Critic Review Agent (deterministic)",
+        "Report Review Agent (deterministic)",
     }
 
     def evaluate(self, report: ScenarioReport) -> dict:

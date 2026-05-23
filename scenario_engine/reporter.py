@@ -47,22 +47,22 @@ class ReportComposer:
         return (
             f"结论：在当前假设下，系统能覆盖约 {quantified_weight:.1%} 的持仓；"
             f"可量化部分的组合压力区间约为 {base_range[0]:.2%} 至 {base_range[1]:.2%}。"
-            "如果下沿已经接近你的承受范围，应优先检查仓位集中度和最大拖累标的。"
+            "如果下沿已经接近你的承受范围，应优先检查单一股票占比和最大拖累标的。"
         )
 
     def _uncertainty(self, spec: ScenarioSpec, impacts: list[PortfolioImpact], total_impact: dict) -> list[str]:
         items = list(spec.missing_information)
         if total_impact.get("quantified_position_weight", 0.0) < 0.999:
-            items.append("部分持仓缺少可审计价格或历史窗口数据，未纳入量化区间")
+            items.append("部分持仓历史数据不足，本次结果没有覆盖全部仓位")
         if any(impact.quantification_status == "not_quantified" for impact in impacts):
-            items.append("当前版本未接入申万行业指数、利率、汇率、商品和北向资金数据，相关冲击不能直接量化")
+            items.append("部分事件影响缺少可直接参考的数据，只能做定性提示")
         return sorted(set(items))
 
     def _recommendations(self, impacts: list[PortfolioImpact], total_impact: dict) -> list[dict]:
         recs = [
             {
-                "type": "risk_management",
-                "content": "将本报告作为压力测试材料，不应作为买卖指令。",
+                "type": "风险提示",
+                "content": "这是一份情景分析，适合用来判断风险承受度，不等同于买卖指令。",
                 "requires_user_confirmation": True,
             }
         ]
@@ -71,8 +71,8 @@ class ReportComposer:
             worst = min(quantified, key=lambda item: item.expected_contribution_range[0])
             recs.append(
                 {
-                    "type": "watch_item",
-                    "content": f"重点复核 {worst.symbol} {worst.name} 的情景贡献下沿和仓位集中度。",
+                    "type": "重点关注",
+                    "content": f"优先检查 {worst.symbol} {worst.name}：它是本次组合里最可能拖累收益的持仓之一。",
                     "requires_user_confirmation": True,
                 }
             )
@@ -80,14 +80,10 @@ class ReportComposer:
 
     def _to_markdown(self, report: ScenarioReport) -> str:
         decision = report.audit.get("investor_decision") or self._fallback_decision(report)
-        industry_note = (
-            "当前版本没有接入行业分类数据库，不能计算真实行业集中度；"
-            f"仅展示场景影响对象：{', '.join(report.scenario_spec.affected_entities) or '未明确'}。"
-        )
         lines = [
             f"# {report.title}",
             "",
-            "> 说明：本报告是情景分析和压力测试，不是收益承诺，也不是自动交易建议。",
+            "> 说明：本报告帮助你理解“如果这个情景发生，我的持仓可能受什么影响”，不是收益承诺。",
             "",
             "## 一句话结论",
             "",
@@ -127,29 +123,26 @@ class ReportComposer:
             lines.append("- 事件是否按你输入的幅度发生；最大风险持仓是否继续扩大亏损贡献；证据缺口是否被补齐。")
         lines.extend([
             "",
-            "## 场景定义",
+            "## 本次分析看什么",
             "",
             f"- 基准日期：{report.as_of_date}",
-            f"- 事件类型：{report.scenario_spec.event_type}",
-            f"- 时间范围：{report.scenario_spec.horizon}",
-            f"- 默认/备选时间范围：{', '.join(report.scenario_spec.horizons or [report.scenario_spec.horizon])}",
+            f"- 分析周期：{self._plain_horizon(report.scenario_spec.horizon)}",
             f"- 影响对象：{', '.join(report.scenario_spec.affected_entities) or '未明确'}",
-            f"- 缺失信息：{', '.join(report.scenario_spec.missing_information) or '无'}",
+            f"- 仍需确认：{', '.join(report.scenario_spec.missing_information) or '无'}",
             "",
-            "## 持仓影响",
+            "## 持仓可能怎么受影响",
             "",
-            "| 标的 | 权重 | 基准区间 | 状态 | 证据 |",
-            "|---|---:|---:|---|---|",
+            "| 持仓 | 仓位 | 可能涨跌区间 | 怎么理解 |",
+            "|---|---:|---:|---|",
         ])
         for impact in report.portfolio_impacts:
             base = "未量化" if impact.base_return_range is None else f"{impact.base_return_range[0]:.2%} ~ {impact.base_return_range[1]:.2%}"
+            note = self._impact_note(impact)
             lines.append(
-                f"| {impact.symbol} {impact.name} | {impact.position_weight:.1%} | {base} | "
-                f"{impact.quantification_status} | {', '.join(impact.evidence_ids)} |"
+                f"| {impact.symbol} {impact.name} | {impact.position_weight:.1%} | {base} | {note} |"
             )
-        lines.extend(["", "## 行业集中度", "", industry_note])
-        lines.extend(["", "## 多路径结果", ""])
-        for path_name, attr in [("Base", "base_return_range"), ("Bear", "bear_return_range"), ("Bull", "bull_return_range")]:
+        lines.extend(["", "## 三种结果区间", ""])
+        for path_name, attr in [("正常情况", "base_return_range"), ("更差情况", "bear_return_range"), ("更好情况", "bull_return_range")]:
             low = 0.0
             high = 0.0
             has_data = False
@@ -164,82 +157,105 @@ class ReportComposer:
                 lines.append(f"- {path_name}: {low:.2%} ~ {high:.2%}")
             else:
                 lines.append(f"- {path_name}: 未量化")
-        lines.append("- Reflexive: 仅在证据充足时展示；当前未建模反身性路径，不输出数值。")
-        lines.extend(["", "## 传导路径", ""])
+        lines.extend(["", "## 为什么会这样", ""])
         for path in report.paths:
-            lines.append(f"### {path.name}")
-            lines.append(f"- 影响方向：{path.direction}")
-            lines.append(f"- 时间滞后：{path.lag_days[0]} 至 {path.lag_days[1]} 个交易日")
-            lines.append(f"- 概率口径：{path.probability_source if path.probability is None else f'{path.probability:.2%}'}")
-            lines.append(f"- 证据：{', '.join(path.evidence_ids) or '无'}")
+            lines.append(f"### {self._plain_path_name(path.name)}")
+            lines.append(f"- 可能方向：{self._plain_direction(path.direction)}")
+            lines.append(f"- 影响可能在 {path.lag_days[0]} 至 {path.lag_days[1]} 个交易日内逐步体现")
             for step in path.steps:
-                lines.append(f"- {step}")
+                lines.append(f"- {self._clean_user_text(step)}")
             if path.reverse_conditions:
-                lines.append("- 反向条件：" + "；".join(path.reverse_conditions))
+                lines.append("- 这些变化可能让结果变轻：" + "；".join(self._clean_user_text(item) for item in path.reverse_conditions))
             lines.append("")
-        lines.extend(["## 不确定性", ""])
+        lines.extend(["## 需要注意的限制", ""])
         for item in report.uncertainty:
-            lines.append(f"- {item}")
-        lines.extend(["", "## 候选动作", ""])
+            lines.append(f"- {self._clean_user_text(item)}")
+        lines.extend(["", "## 下一步可以怎么做", ""])
         for item in report.recommendations:
-            lines.append(f"- [{item.get('type')}] {item.get('content')}")
+            lines.append(f"- {self._clean_user_text(item.get('content'))}")
         hedge_rows = [
             (impact.symbol, candidate)
             for impact in report.portfolio_impacts
             for candidate in impact.hedge_candidates
         ]
         if hedge_rows:
-            lines.extend(["", "## 调仓/对冲候选", "", "| 标的 | 候选动作 |", "|---|---|"])
+            lines.extend(["", "## 可复核的调仓方向", "", "| 标的 | 可考虑复核的方向 |", "|---|---|"])
             for symbol, candidate in hedge_rows:
-                lines.append(f"| {symbol} | {candidate} |")
-        lines.extend(["", "## 审计", ""])
-        lines.append(f"- 方法：{report.audit.get('method')}")
-        lines.append(f"- 数据边界：{report.audit.get('data_boundary')}")
-        llm_audit = report.audit.get("llm") or {}
-        if llm_audit:
-            lines.append(
-                "- LLM 解析："
-                f"{'已使用' if llm_audit.get('used') else '未使用'}"
-                f"（parser={report.audit.get('scenario_parser')}, model={llm_audit.get('model') or '无'}）"
-            )
-            lines.append(f"- LLM 数值边界：{llm_audit.get('numeric_generation_policy')}")
-        lines.append(f"- 冲击映射：{report.audit.get('shock_status')}")
-        for note in report.audit.get("a_share_constraints", []):
-            lines.append(f"- A股约束：{note}")
-        lines.append(f"- 校验状态：{report.audit.get('validation_status')}")
-        lines.extend(["", "### 关键数字审计表", "", "| 数字 | 数值 | 来源 |", "|---|---:|---|"])
-        total = report.portfolio_total_impact
-        base_range = total.get("base_range")
-        if base_range is not None:
-            lines.append(f"| 组合基准冲击下沿 | {base_range[0]:.2%} | 持仓贡献区间加权汇总 |")
-            lines.append(f"| 组合基准冲击上沿 | {base_range[1]:.2%} | 持仓贡献区间加权汇总 |")
-        lines.append(f"| 可量化仓位 | {total.get('quantified_position_weight', 0):.2%} | portfolio_impacts 中可量化持仓权重汇总 |")
-        for impact in report.portfolio_impacts:
-            if impact.base_return_range is not None:
-                lines.append(
-                    f"| {impact.symbol} 基准区间 | {impact.base_return_range[0]:.2%} ~ {impact.base_return_range[1]:.2%} | "
-                    f"{', '.join(impact.evidence_ids)} |"
-                )
-        if report.audit.get("agent_review"):
-            lines.extend(["", "## 多角色审查", ""])
-            for item in report.audit["agent_review"]:
-                lines.append(f"### {item.get('reviewer')}")
-                lines.append(f"- 状态：{item.get('status')}")
-                for finding in item.get("findings", []):
-                    lines.append(f"- {finding}")
+                lines.append(f"| {symbol} | {self._clean_user_text(candidate)} |")
+        external_research = report.audit.get("external_research") or {}
+        if external_research:
+            lines.extend(["", "## 外部研究证据", ""])
+            lines.append(f"- 本次找到并纳入 {external_research.get('document_count', 0)} 条外部证据。")
+            assessment = report.audit.get("external_research_assessment") or {}
+            if assessment:
+                for finding in assessment.get("positive_findings", [])[:3]:
+                    lines.append(f"- 支持信息：{self._clean_user_text(finding)}")
+                for finding in assessment.get("risk_findings", [])[:3]:
+                    lines.append(f"- 风险信息：{self._clean_user_text(finding)}")
+            lines.append("- 没有真实来源的内容不会被写进报告。")
         synthesis = report.audit.get("llm_investor_synthesis") or {}
         if synthesis:
-            lines.extend(["", "## LLM 定性综合", ""])
-            lines.append(f"- 状态：{synthesis.get('status')}")
-            if synthesis.get("model"):
-                lines.append(f"- 模型：{synthesis.get('model')}")
-            if synthesis.get("error"):
-                lines.append(f"- 错误：{synthesis.get('error')}")
-            lines.append("- 边界：LLM 只负责用自然语言综合已审计结果，不生成新的收益数字或交易指令。")
-        lines.extend(["", "## 证据", ""])
+            lines.extend(["", "## 文字整理说明", ""])
+            lines.append("- 系统只整理已有分析结果，不额外编写新的收益数字。")
+        lines.extend(["", "## 参考依据", ""])
         for item in report.evidence:
-            lines.append(f"- `{item.evidence_id}` {item.title}：{item.content}")
+            lines.append(f"- {self._clean_user_text(item.title)}")
         return "\n".join(lines)
+
+    def _plain_horizon(self, horizon: str) -> str:
+        return {"1w": "约 1 周", "1m": "约 1 个月", "3m": "约 3 个月", "6m": "约 6 个月"}.get(horizon, horizon)
+
+    def _plain_direction(self, direction: str) -> str:
+        return {"positive": "偏正面", "negative": "偏负面", "mixed": "有正有负", "unknown": "不明确"}.get(direction, direction)
+
+    def _plain_path_name(self, name: str) -> str:
+        return self._clean_user_text(name.replace("_", " "))
+
+    def _impact_note(self, impact: PortfolioImpact) -> str:
+        if impact.base_return_range is None:
+            return "数据不足，不能给出可靠区间"
+        low, high = impact.base_return_range
+        if low < 0 and high <= 0:
+            return "主要体现为下跌压力"
+        if low >= 0 and high > 0:
+            return "在该情景下相对受益"
+        if low < 0 < high:
+            return "方向不确定，既可能受压也可能修复"
+        return "影响较小"
+
+    def _clean_user_text(self, text: object) -> str:
+        value = str(text or "")
+        replacements = {
+            "market_beta": "市场敏感度",
+            "beta": "市场敏感度",
+            "low_data_proxy": "数据不足时的保守估计",
+            "低数据保守代理": "数据不足时的保守估计",
+            "scenario_proxy": "情景估计",
+            "historical_template": "历史参考",
+            "reverse_stress_grid": "压力测试",
+            "local_volatility_flag": "波动较高",
+            "local_amount_change_flag": "成交活跃度变化",
+            "volatility_proxy": "波动压力",
+            "liquidity_proxy": "流动性压力",
+            "not_quantified": "未量化",
+            "市场 beta": "市场敏感度",
+            "默认 beta": "默认市场敏感度",
+            "beta 部分": "市场敏感度部分",
+            "What-If 比较": "调仓前后对比",
+            "What-If": "调仓对比",
+            "仓位集中度": "单一股票占比",
+            "基准压力路径": "正常情况",
+            "下行情景路径": "更差情况",
+            "修复情景路径": "更好情况",
+            "采用历史窗口低分位或 市场敏感度 冲击下沿作为下行情景": "如果市场情绪更差，结果可能接近区间下沿",
+            "采用历史窗口高分位或 市场敏感度 冲击上沿作为修复情景": "如果事件影响减弱，结果可能接近区间上沿",
+            "降低单一标的集中度作为候选风险管理动作": "降低单一股票占比后再比较结果",
+            "用低相关持仓或指数替代方案做 调仓对比 比较": "用相关性较低的持仓或指数方案做调仓前后对比",
+            "用低相关持仓或指数替代方案做 调仓前后对比": "用相关性较低的持仓或指数方案做调仓前后对比",
+        }
+        for old, new in replacements.items():
+            value = value.replace(old, new)
+        return value
 
     def _fallback_decision(self, report: ScenarioReport) -> dict:
         total = report.portfolio_total_impact

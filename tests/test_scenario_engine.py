@@ -18,6 +18,7 @@ from scenario_engine.schema_contracts import validate_required_contract
 from scenario_engine.parser import ScenarioParser
 from scenario_engine.templates import SCENARIO_TEMPLATES
 from scenario_engine.news_connectors import GdeltDocNewsConnector
+from scenario_engine.research.models import ExternalEvidenceDocument
 from Agents_Experience.core.scenario_tools import ScenarioTools
 from src.stock_app.database import Database
 
@@ -125,6 +126,44 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertEqual(spec.event_type, "unknown")
         self.assertIn("可量化冲击幅度", spec.missing_information)
         self.assertEqual(spec.shocks, [])
+
+    def test_policy_details_remain_missing_when_user_does_not_provide_them(self):
+        spec = ScenarioParser().parse(
+            "如果中美贸易战升级，对半导体板块加征25%关税，我的持仓会怎样？",
+            "2020-03-20",
+        )
+        self.assertIn("执行日期", spec.missing_information)
+        self.assertIn("政策适用范围", spec.missing_information)
+        self.assertIn("海外反制措施", spec.missing_information)
+        self.assertIn("豁免清单", spec.missing_information)
+        self.assertFalse(any(item.source == "user_input_policy_detail" for item in spec.assumptions))
+
+    def test_policy_details_from_user_input_clear_matching_missing_items(self):
+        query = (
+            "如果中美贸易战升级，对半导体板块加征25%关税，我的持仓会怎样？\n"
+            "补充政策细节：政策主体：商务部；执行日期：2020年3月20日；"
+            "适用范围：半导体设备出口链；反制措施：中国采取对等关税；豁免清单：医疗芯片"
+        )
+        spec = ScenarioParser().parse(query, "2020-03-20")
+        self.assertNotIn("执行日期", spec.missing_information)
+        self.assertNotIn("政策适用范围", spec.missing_information)
+        self.assertNotIn("海外反制措施", spec.missing_information)
+        self.assertNotIn("豁免清单", spec.missing_information)
+        assumptions = {item.key: item for item in spec.assumptions if item.source == "user_input_policy_detail"}
+        self.assertEqual(assumptions["policy_authority"].value, "商务部")
+        self.assertEqual(assumptions["execution_date"].value, "2020年3月20日")
+        self.assertIn("半导体设备出口链", assumptions["policy_scope"].value)
+        self.assertIn("中国采取对等关税", assumptions["countermeasures"].value)
+        self.assertIn("医疗芯片", assumptions["exemption_list"].value)
+
+    def test_llm_missing_policy_details_do_not_override_user_input(self):
+        query = (
+            "如果美国扩大半导体出口限制，我的持仓会怎样？"
+            "补充政策细节：执行日期：2020年3月20日；适用范围：先进制程芯片出口链"
+        )
+        spec = ScenarioParser(llm_client=FakeScenarioLLMClient()).parse(query, "2020-03-20")
+        self.assertNotIn("执行日期", spec.missing_information)
+        self.assertIn("限制清单", spec.missing_information)
 
     def test_llm_parser_structures_scenario_without_owning_numeric_impacts(self):
         parser = ScenarioParser(llm_client=FakeScenarioLLMClient())
@@ -285,8 +324,22 @@ class ScenarioEngineTestCase(unittest.TestCase):
             )
         finally:
             engine.close()
-        self.assertIn("## 候选动作", report.markdown)
-        for phrase in ["必涨", "必跌", "稳赚", "确定性机会", "保证收益"]:
+        self.assertIn("## 下一步可以怎么做", report.markdown)
+        for phrase in [
+            "必涨",
+            "必跌",
+            "稳赚",
+            "确定性机会",
+            "保证收益",
+            "[risk_management]",
+            "[watch_item]",
+            "market_beta",
+            "local_volatility_flag",
+            "reverse_market_",
+            "quantification_status",
+            "行业集中度-行业集中度",
+            "仓位集中度",
+        ]:
             self.assertNotIn(phrase, report.markdown)
 
     def test_all_golden_scenarios_parse_to_known_templates(self):
@@ -339,8 +392,10 @@ class ScenarioEngineTestCase(unittest.TestCase):
             )
         finally:
             engine.close()
-        for section in ["## 场景定义", "## 持仓影响", "## 行业集中度", "## 多路径结果", "## 候选动作", "## 审计", "## 证据"]:
+        for section in ["## 本次分析看什么", "## 持仓可能怎么受影响", "## 三种结果区间", "## 下一步可以怎么做", "## 参考依据"]:
             self.assertIn(section, report.markdown)
+        for hidden_internal in ["## 审计", "## 多角色审查", "evidence_id", "market_beta", "reverse_"]:
+            self.assertNotIn(hidden_internal, report.markdown)
         self.assertEqual(report.audit["mode"], "deep")
         self.assertEqual(report.audit["factor_lookback_days"], 240)
 
@@ -487,12 +542,12 @@ class ScenarioEngineTestCase(unittest.TestCase):
         finally:
             engine.close()
         reviewers = {item["reviewer"] for item in report.audit["agent_review"]}
-        self.assertIn("Critic Agent", reviewers)
-        self.assertIn("Bull Agent", reviewers)
-        self.assertIn("Policy Agent", reviewers)
-        self.assertIn("Report Agent", reviewers)
+        self.assertIn("Critic Review Agent (deterministic)", reviewers)
+        self.assertIn("Bull Review Agent (deterministic)", reviewers)
+        self.assertIn("Policy Review Agent (deterministic)", reviewers)
+        self.assertIn("Report Review Agent (deterministic)", reviewers)
         self.assertIn("AGENT_REVIEW_READY", report.audit["state_trace"])
-        self.assertIn("## 多角色审查", report.markdown)
+        self.assertNotIn("## 多角色审查", report.markdown)
 
     def test_agent_scenario_tools_expose_audited_engine_results(self):
         tools = ScenarioTools(db_path=self.db_path, persist=False)
@@ -1420,7 +1475,8 @@ class ScenarioEngineTestCase(unittest.TestCase):
         with zipfile.ZipFile(docx.file_path) as zf:
             xml = zf.read("word/document.xml").decode("utf-8")
         self.assertIn("如果沪深300下跌5%，我的持仓会怎样？", xml)
-        self.assertIn("deterministic_v2_local_data_kg_and_audit_no_llm_numeric_generation", xml)
+        self.assertIn("普通投资者版摘要", xml)
+        self.assertNotIn("deterministic_v2_local_data_kg_and_audit_no_llm_numeric_generation", xml)
 
     def test_v2_report_export_does_not_truncate_long_pdf_to_first_page_only(self):
         engine = ScenarioEngine(self.db_path, persist=True)
@@ -1494,7 +1550,9 @@ class ScenarioEngineTestCase(unittest.TestCase):
         finally:
             engine.close()
         self.assertTrue(any(item.evidence_id == "evidence_reverse_stress_grid" for item in report.evidence))
-        self.assertTrue(any("流动性和波动率压力只作为本地风险放大标记" in item for item in report.uncertainty))
+        self.assertTrue(any("成交活跃度和价格波动只用于提示风险" in item for item in report.uncertainty))
+        for hidden_internal in ["reverse_market_", "market_beta", "local_volatility_flag", "最小压力组合"]:
+            self.assertNotIn(hidden_internal, report.markdown)
 
     def test_prepare_scenario_requires_confirmation_before_quantification(self):
         engine = ScenarioEngine(self.db_path, persist=True)
@@ -1569,9 +1627,9 @@ class ScenarioEngineTestCase(unittest.TestCase):
             )
         finally:
             engine.close()
-        self.assertIn("时间滞后", report.markdown)
-        self.assertIn("反向条件", report.markdown)
-        self.assertIn("### 关键数字审计表", report.markdown)
+        self.assertIn("影响可能在", report.markdown)
+        self.assertIn("这些变化可能让结果变轻", report.markdown)
+        self.assertNotIn("### 关键数字审计表", report.markdown)
         self.assertTrue(all(path.reverse_conditions for path in report.paths))
 
     def test_report_schema_validates_nested_report_items(self):
@@ -1662,6 +1720,84 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertIn("full_external_runtime_available", status)
         for package in ["pytest", "langgraph", "deepeval", "ragas", "opentelemetry"]:
             self.assertIn(package, status["packages"])
+
+    def test_v2_research_repository_saves_and_searches_real_documents(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            repo = engine.research_orchestrator.repository
+            doc = ExternalEvidenceDocument(
+                evidence_id="external_test_policy",
+                source_type="policy",
+                source_id="manual_test",
+                source_name="测试政策源",
+                title="央行降息影响银行净息差",
+                url="https://example.com/policy",
+                summary="测试文档用于验证证据库搜索，不代表真实新闻。",
+                event_tags=["政策信号"],
+                related_symbols=["000001"],
+                evidence_score=0.8,
+            )
+            repo.save_document(doc)
+            found = repo.search("银行净息差", mode="keyword", limit=5)
+        finally:
+            engine.close()
+        self.assertEqual(found[0].evidence_id, "external_test_policy")
+        self.assertIn("000001", found[0].related_symbols)
+
+    def test_v2_external_research_disabled_does_not_fabricate_evidence(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_external_research=False,
+            )
+        finally:
+            engine.close()
+        research = report.audit["external_research"]
+        self.assertEqual(research["status"], "disabled")
+        self.assertEqual([e for e in report.evidence if e.evidence_type.startswith("external_")], [])
+        self.assertIn("EXTERNAL_RESEARCH_SKIPPED", report.audit["state_trace"])
+
+    def test_v2_external_research_can_use_local_evidence_without_network(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            doc = ExternalEvidenceDocument(
+                evidence_id="external_local_rate_cut",
+                source_type="policy",
+                source_id="manual_test",
+                source_name="测试政策源",
+                title="央行 降息 LPR 银行 净息差",
+                url="https://example.com/local-rate-cut",
+                summary="本地已保存证据，用于验证不开启网络时不会伪造但会检索本地证据。",
+                event_tags=["政策信号"],
+                related_symbols=["000001"],
+                relevance_score=0.9,
+                source_quality_score=0.7,
+                freshness_score=0.8,
+                evidence_score=0.85,
+            )
+            engine.research_orchestrator.repository.save_document(doc)
+            report = engine.run(
+                user_query="如果央行降息25bp，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_external_research=True,
+                research_network=False,
+                research_source_types=["policy"],
+            )
+        finally:
+            engine.close()
+        research = report.audit["external_research"]
+        self.assertEqual(research["status"], "completed")
+        self.assertTrue(any(e.evidence_id == "external_local_rate_cut" for e in report.evidence))
+        self.assertTrue(all(s["status"] == "skipped" for s in research["source_status"]))
+        self.assertIn("EXTERNAL_RESEARCH_READY", report.audit["state_trace"])
 
 
 if __name__ == "__main__":

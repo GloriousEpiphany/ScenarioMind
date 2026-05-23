@@ -81,6 +81,9 @@ class ScenarioParser:
         else:
             assumptions = []
             confidence = 0.35
+        policy_assumptions = self._extract_policy_detail_assumptions(query)
+        assumptions.extend(policy_assumptions)
+        missing = self._remove_satisfied_missing(missing, policy_assumptions, query)
 
         return ScenarioSpec(
             scenario_id=scenario_id,
@@ -97,6 +100,50 @@ class ScenarioParser:
             confidence=confidence,
             horizons=parsed_horizons,
         )
+
+    def _extract_policy_detail_assumptions(self, query: str) -> list[Assumption]:
+        details: list[Assumption] = []
+        patterns = [
+            ("execution_date", r"(?:执行日期|生效日期|实施日期|落地日期|从|自)\s*[:：为是]?\s*([0-9]{4}[-/年][0-9]{1,2}[-/月][0-9]{1,2}日?|[0-9]{1,2}月[0-9]{1,2}日|即日起|明天|下周|下月)"),
+            ("policy_scope", r"(?:适用范围|影响范围|适用对象|覆盖范围|针对|面向)\s*[:：为是]?\s*([^。；;，,\n]{2,80})"),
+            ("countermeasures", r"(?:反制措施|海外反制|反制|报复措施|对等措施)\s*[:：为是]?\s*([^。；;\n]{2,100})"),
+            ("exemption_list", r"(?:豁免清单|豁免名单|豁免范围|排除清单|例外清单|例外范围)\s*[:：为是]?\s*([^。；;\n]{2,100})"),
+            ("policy_authority", r"(?:政策主体|发布主体|具体央行)\s*[:：为是]?\s*([^。；;，,\n]{2,80})|(中国人民银行|美联储|欧洲央行|日本央行|财政部|商务部)"),
+        ]
+        for key, pattern in patterns:
+            match = re.search(pattern, query, flags=re.I)
+            if not match:
+                continue
+            value = next((group.strip() for group in match.groups() if group and group.strip()), match.group(0).strip())
+            details.append(
+                Assumption(
+                    key=key,
+                    value=value,
+                    source="user_input_policy_detail",
+                    confidence=0.9,
+                    needs_user_confirmation=False,
+                )
+            )
+        return details
+
+    def _remove_satisfied_missing(self, missing: list[str], assumptions: list[Assumption], query: str) -> list[str]:
+        provided = {item.key for item in assumptions}
+        result = []
+        for item in missing:
+            if item in {"执行日期", "事件发生日期"} and "execution_date" in provided:
+                continue
+            if item in {"政策适用范围", "影响范围"} and "policy_scope" in provided:
+                continue
+            if item in {"海外反制措施", "反制措施"} and "countermeasures" in provided:
+                continue
+            if item == "豁免清单" and "exemption_list" in provided:
+                continue
+            if item == "具体央行" and "policy_authority" in provided:
+                continue
+            if item == "适用范围" and "policy_scope" in provided:
+                continue
+            result.append(item)
+        return result
 
     def _merge_llm_spec(self, base: ScenarioSpec, parsed: dict[str, Any]) -> ScenarioSpec:
         if not isinstance(parsed, dict):
@@ -123,6 +170,7 @@ class ScenarioParser:
             horizons = [horizon, *horizons]
         affected = self._string_list(parsed.get("affected_entities")) or base.affected_entities
         missing = sorted(set(base.missing_information + self._string_list(parsed.get("missing_information"))))
+        missing = self._remove_satisfied_missing(missing, assumptions, base.user_query)
         return ScenarioSpec(
             scenario_id=base.scenario_id,
             user_query=base.user_query,

@@ -100,6 +100,67 @@ class ScenarioTools:
         )
         return report.to_dict()
 
+    def collect_external_evidence(
+        self,
+        user_query: str,
+        as_of_date: str,
+        symbols: list[str],
+        weights: list[float] | None = None,
+        cash_weight: float = 0.0,
+        mode: str = "standard",
+        network: bool = False,
+        source_types: list[str] | None = None,
+        read_articles: bool = False,
+    ) -> dict[str, Any]:
+        spec = self.engine.parser.parse(user_query, as_of_date)
+        portfolio = self.engine.portfolio_builder.from_weights(symbols, weights, as_of_date, cash_weight=cash_weight)
+        self.engine.research_orchestrator.enable_network = network
+        self.engine.research_orchestrator.read_articles = read_articles
+        bundle = self.engine.research_orchestrator.collect(
+            spec=spec,
+            portfolio=portfolio,
+            mode=mode,
+            as_of_date=as_of_date,
+            enabled=True,
+            selected_source_types=source_types,
+        )
+        return bundle.to_dict()
+
+    def search_research_evidence(
+        self,
+        query: str,
+        search_mode: str = "keyword",
+        limit: int = 50,
+        threshold: float = 0.4,
+        source_types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        from scenario_engine.research.search import ResearchSearch
+
+        search = ResearchSearch(self.engine.research_orchestrator.repository)
+        return search.search_news(
+            query=query,
+            search_mode=search_mode,
+            limit=limit,
+            threshold=threshold,
+            source_types=source_types,
+        )
+
+    def classify_scenario_evidence(
+        self,
+        user_query: str,
+        as_of_date: str,
+        symbols: list[str],
+        weights: list[float] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        spec = self.engine.parser.parse(user_query, as_of_date)
+        portfolio = self.engine.portfolio_builder.from_weights(symbols, weights, as_of_date)
+        plan = self.engine.research_orchestrator.planner.build_plan(spec, portfolio)
+        documents = self.engine.research_orchestrator.repository.top_relevant(plan.queries, limit=limit)
+        classified, audit = self.engine.research_orchestrator.classifier.classify(documents, plan)
+        saved = self.engine.research_orchestrator.repository.save_documents(classified)
+        return {"audit": audit, "documents": [item.to_dict() for item in saved]}
+
     def run_reverse_stress(
         self,
         symbols: list[str],

@@ -35,6 +35,14 @@ def show_scenario_page():
         horizon_label = st.radio("观察周期", ["1周", "1个月", "3个月", "6个月"], index=1)
         mode_label = st.radio("分析深度", ["快速", "标准", "深度"], index=1)
         use_llm = st.toggle("LLM 解析情景", value=True)
+        enable_external_research = st.toggle("外部研究证据", value=False, help="启用后才会尝试外部数据采集；失败不会伪造证据。")
+        research_network = st.toggle("允许联网采集", value=False, help="需要本机网络可用；关闭时仅使用本地证据库。")
+        research_source_labels = st.multiselect(
+            "外部研究源",
+            ["政策官网", "公告官网", "RSS", "热榜"],
+            default=["政策官网", "公告官网", "RSS"],
+        )
+        research_read_articles = st.toggle("读取高相关正文", value=False, help="会增加耗时；默认只用标题/摘要/页面快照。")
         loss_threshold = st.slider("我能承受的月度亏损", min_value=0.03, max_value=0.30, value=0.08, step=0.01)
 
     scenario_options = [
@@ -53,60 +61,34 @@ def show_scenario_page():
         placeholder="例如：如果降息25bp，同时人民币贬值2%，我的持仓会怎样？",
         height=88,
     )
+    with st.expander("可选：补充政策细节", expanded=False):
+        st.caption("这些字段只在你明确填写后进入推演；系统不会自动补写未知政策细节。")
+        policy_cols = st.columns(2)
+        policy_execution_date = policy_cols[0].text_input("执行日期/生效日期", placeholder="例如：2026-06-01 或 即日起")
+        policy_scope = policy_cols[1].text_input("适用范围/适用对象", placeholder="例如：半导体出口链、银行体系、特定国家")
+        policy_countermeasures = policy_cols[0].text_input("反制措施/对等措施", placeholder="例如：暂无、可能采取对等关税")
+        policy_exemptions = policy_cols[1].text_input("豁免清单/例外范围", placeholder="例如：未公布、医疗设备豁免")
+        policy_authority = st.text_input("政策主体/发布机构", placeholder="例如：中国人民银行、商务部、美联储")
+    enriched_query = _build_enriched_query(
+        query,
+        {
+            "执行日期": policy_execution_date,
+            "适用范围": policy_scope,
+            "反制措施": policy_countermeasures,
+            "豁免清单": policy_exemptions,
+            "政策主体": policy_authority,
+        },
+    )
 
     st.subheader("我的持仓")
-    st.caption("可以从股票库搜索选择，也可以直接在表格里手动输入代码。仓位会在推演时自动归一化。")
-
-    if "scenario_portfolio_df" not in st.session_state:
-        st.session_state["scenario_portfolio_df"] = pd.DataFrame(
-            [{"股票代码": "000001", "仓位": 0.50}, {"股票代码": "600519", "仓位": 0.50}]
-        )
-
-    portfolio_source = st.radio(
-        "持仓录入方式",
-        ["从股票库选择", "手动编辑", "使用示例"],
-        index=0,
-        horizontal=True,
+    portfolio_df = _render_portfolio_input(
+        title="当前持仓",
+        state_key="scenario_portfolio_df",
+        editor_key="scenario_portfolio_editor",
+        search_key="scenario_portfolio_search",
+        selected_key="scenario_portfolio_selected",
+        default_rows=[{"股票代码": "000001", "仓位": 0.50}, {"股票代码": "600519", "仓位": 0.50}],
     )
-    if portfolio_source == "使用示例":
-        example_name = st.selectbox(
-            "示例组合",
-            ["银行+白酒均衡", "单一持仓压力测试", "高现金防守组合"],
-            index=0,
-        )
-        examples = {
-            "银行+白酒均衡": [{"股票代码": "000001", "仓位": 0.50}, {"股票代码": "600519", "仓位": 0.50}],
-            "单一持仓压力测试": [{"股票代码": "000001", "仓位": 1.00}],
-            "高现金防守组合": [{"股票代码": "000001", "仓位": 0.35}, {"股票代码": "600519", "仓位": 0.35}],
-        }
-        if st.button("载入示例组合"):
-            st.session_state["scenario_portfolio_df"] = pd.DataFrame(examples[example_name])
-
-    if portfolio_source == "从股票库选择":
-        keyword = st.text_input("搜索股票代码或名称", value="", placeholder="例如：茅台、平安、600519")
-        options = _scenario_stock_options(keyword)
-        option_labels = [item["label"] for item in options]
-        selected_labels = st.multiselect("选择持仓股票", options=option_labels, max_selections=20)
-        if selected_labels:
-            selected_symbols = [item["symbol"] for item in options if item["label"] in selected_labels]
-            existing = st.session_state["scenario_portfolio_df"].set_index("股票代码")["仓位"].to_dict()
-            default_weight = round(1.0 / len(selected_symbols), 4)
-            st.session_state["scenario_portfolio_df"] = pd.DataFrame(
-                [{"股票代码": symbol, "仓位": float(existing.get(symbol, default_weight))} for symbol in selected_symbols]
-            )
-
-    portfolio_df = st.data_editor(
-        st.session_state["scenario_portfolio_df"],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="scenario_portfolio_editor",
-        column_config={
-            "股票代码": st.column_config.TextColumn(help="A股代码，例如 600519"),
-            "仓位": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
-        },
-        hide_index=True,
-    )
-    st.session_state["scenario_portfolio_df"] = portfolio_df
     cash_weight = st.slider("现金仓位", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
     try:
         _, preview_weights = _portfolio_from_editor(portfolio_df)
@@ -116,21 +98,13 @@ def show_scenario_page():
         st.caption("请至少保留一只有效持仓。")
 
     with st.expander("可选：比较一个调仓方案", expanded=False):
-        proposed_df = st.data_editor(
-            pd.DataFrame(
-                [
-                    {"股票代码": "000001", "仓位": 0.35},
-                    {"股票代码": "600519", "仓位": 0.45},
-                ]
-            ),
-            num_rows="dynamic",
-            use_container_width=True,
-            key="proposed_portfolio_editor",
-            column_config={
-                "股票代码": st.column_config.TextColumn(),
-                "仓位": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
-            },
-            hide_index=True,
+        proposed_df = _render_portfolio_input(
+            title="调仓后组合",
+            state_key="scenario_proposed_portfolio_df",
+            editor_key="proposed_portfolio_editor",
+            search_key="scenario_proposed_search",
+            selected_key="scenario_proposed_selected",
+            default_rows=[{"股票代码": "000001", "仓位": 0.35}, {"股票代码": "600519", "仓位": 0.45}],
         )
         proposed_cash_weight = st.slider("调仓后现金仓位", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
         run_compare = st.checkbox("同时比较这个调仓方案", value=False)
@@ -141,12 +115,22 @@ def show_scenario_page():
 
     horizon = {"1周": "1w", "1个月": "1m", "3个月": "3m", "6个月": "6m"}[horizon_label]
     mode = {"快速": "quick", "标准": "standard", "深度": "deep"}[mode_label]
+    research_source_types = [
+        item
+        for label, item in {
+            "政策官网": "policy",
+            "公告官网": "announcement",
+            "RSS": "rss",
+            "热榜": "hotlist",
+        }.items()
+        if label in research_source_labels
+    ]
 
     if parse:
         try:
             engine = ScenarioEngine(persist=False, use_llm=use_llm)
             try:
-                prepared = engine.prepare_scenario(query, as_of_date, horizon=horizon, persist=False)
+                prepared = engine.prepare_scenario(enriched_query, as_of_date, horizon=horizon, persist=False)
             finally:
                 engine.close()
             st.session_state["scenario_prepared"] = prepared
@@ -167,7 +151,7 @@ def show_scenario_page():
         engine = ScenarioEngine(persist=False, use_llm=use_llm)
         try:
             report = engine.run(
-                user_query=query,
+                user_query=enriched_query,
                 as_of_date=as_of_date,
                 symbols=symbols,
                 weights=weights,
@@ -176,6 +160,10 @@ def show_scenario_page():
                 mode=mode,
                 require_confirmation=True,
                 confirmed=True,
+                enable_external_research=enable_external_research,
+                research_network=research_network,
+                research_source_types=research_source_types,
+                research_read_articles=research_read_articles,
             )
             reverse_report = engine.reverse_stress(
                 loss_threshold=loss_threshold,
@@ -190,7 +178,7 @@ def show_scenario_page():
             if run_compare:
                 proposed_symbols, proposed_weights = _portfolio_from_editor(proposed_df)
                 comparison = engine.compare_rebalance_plan(
-                    user_query=query,
+                    user_query=enriched_query,
                     as_of_date=as_of_date,
                     current_symbols=symbols,
                     current_weights=weights,
@@ -243,7 +231,7 @@ def show_scenario_page():
     cols[2].metric("最大风险持仓", risk)
     cols[3].metric("最大正向受益", upside)
     if report.uncertainty:
-        st.warning("需要你留意的假设：" + "；".join(report.uncertainty[:3]))
+        st.warning("需要你留意：" + "；".join(_plain_user_text(item) for item in report.uncertainty[:3]))
 
     st.subheader("风险暴露在哪里")
     impacts_df = pd.DataFrame(
@@ -252,10 +240,10 @@ def show_scenario_page():
                 "股票代码": item.symbol,
                 "名称": item.name,
                 "权重": item.position_weight,
-                "基准下沿": None if item.base_return_range is None else item.base_return_range[0],
-                "基准上沿": None if item.base_return_range is None else item.base_return_range[1],
-                "状态": item.quantification_status,
-                "置信度": item.confidence,
+                "可能下跌到": None if item.base_return_range is None else item.base_return_range[0],
+                "可能上涨到": None if item.base_return_range is None else item.base_return_range[1],
+                "怎么看": _impact_note(item),
+                "参考程度": _confidence_label(item.confidence),
             }
             for item in report.portfolio_impacts
         ]
@@ -265,9 +253,8 @@ def show_scenario_page():
         use_container_width=True,
         column_config={
             "权重": st.column_config.NumberColumn(format="%.2f"),
-            "基准下沿": st.column_config.NumberColumn(format="%.2%"),
-            "基准上沿": st.column_config.NumberColumn(format="%.2%"),
-            "置信度": st.column_config.NumberColumn(format="%.2f"),
+            "可能下跌到": st.column_config.NumberColumn(format="%.2%"),
+            "可能上涨到": st.column_config.NumberColumn(format="%.2%"),
         },
     )
 
@@ -277,11 +264,11 @@ def show_scenario_page():
 
     st.subheader("要不要调仓")
     for item in report.recommendations:
-        st.write(f"- [{item.get('type')}] {item.get('content')}")
+        st.write(f"- {_plain_user_text(item.get('content'))}")
     if comparison:
         _render_rebalance_comparison(comparison)
 
-    st.subheader("什么情况下会亏到你的阈值")
+    st.subheader("什么情况下可能跌到你的亏损线")
     _render_reverse_stress(reverse_report)
 
     col1, col2 = st.columns(2)
@@ -304,14 +291,35 @@ def show_scenario_page():
     else:
         st.caption("缺少历史类比窗口收益数据，暂不展示历史类比窗口收益图。")
 
-    with st.expander("完整 Markdown 报告", expanded=False):
+    with st.expander("完整投资者报告", expanded=False):
         st.markdown(report.markdown)
+
+    with st.expander("外部研究证据", expanded=False):
+        external_research = report.audit.get("external_research") or {}
+        st.json(external_research)
+        external_rows = [
+            {
+                "证据ID": item.evidence_id,
+                "类型": item.evidence_type,
+                "标题": item.title,
+                "来源": item.source_uri,
+                "置信度": item.confidence,
+                "相关标的": ",".join(item.metrics.get("related_symbols") or []),
+                "标签": ",".join(item.metrics.get("event_tags") or []),
+            }
+            for item in report.evidence
+            if str(item.evidence_type).startswith("external_")
+        ]
+        if external_rows:
+            st.dataframe(pd.DataFrame(external_rows), use_container_width=True)
+        else:
+            st.caption("本次没有可展示的外部证据。若需要真实联网采集，请开启外部研究证据和允许联网采集，并确认网络与数据源可访问。")
 
     with st.expander("审计信息", expanded=False):
         st.json(report.audit)
 
     with st.expander("高级工具", expanded=False):
-        _render_advanced_tools(as_of_date, query, symbols, weights, horizon, mode, use_llm)
+        _render_advanced_tools(as_of_date, enriched_query, symbols, weights, horizon, mode, use_llm)
 
 
 def _parse_weights(weights_text: str, symbol_count: int) -> list[float] | None:
@@ -321,6 +329,85 @@ def _parse_weights(weights_text: str, symbol_count: int) -> list[float] | None:
     if len(weights) != symbol_count:
         raise ValueError("权重数量必须与股票代码数量一致，或留空使用等权。")
     return weights
+
+
+def _render_portfolio_input(
+    title: str,
+    state_key: str,
+    editor_key: str,
+    search_key: str,
+    selected_key: str,
+    default_rows: list[dict],
+) -> pd.DataFrame:
+    st.caption(f"{title}：可以从股票库连续添加多只股票，也可以直接在表格里手动输入代码。仓位会在推演时自动归一化。")
+    if state_key not in st.session_state:
+        st.session_state[state_key] = pd.DataFrame(default_rows)
+
+    mode = st.radio(
+        f"{title}录入方式",
+        ["从股票库添加", "手动编辑", "使用示例"],
+        index=0,
+        horizontal=True,
+        key=f"{state_key}_mode",
+    )
+    if mode == "使用示例":
+        example_name = st.selectbox(
+            "示例组合",
+            ["银行+白酒均衡", "单一持仓压力测试", "高现金防守组合"],
+            index=0,
+            key=f"{state_key}_example",
+        )
+        examples = {
+            "银行+白酒均衡": [{"股票代码": "000001", "仓位": 0.50}, {"股票代码": "600519", "仓位": 0.50}],
+            "单一持仓压力测试": [{"股票代码": "000001", "仓位": 1.00}],
+            "高现金防守组合": [{"股票代码": "000001", "仓位": 0.35}, {"股票代码": "600519", "仓位": 0.35}],
+        }
+        if st.button("载入示例组合", key=f"{state_key}_load_example"):
+            st.session_state[state_key] = pd.DataFrame(examples[example_name])
+
+    if mode == "从股票库添加":
+        keyword = st.text_input("搜索股票代码或名称", value="", placeholder="例如：茅台、平安、600519", key=search_key)
+        options = _scenario_stock_options(keyword)
+        option_labels = [item["label"] for item in options]
+        selected_labels = st.multiselect("选择要添加的股票", options=option_labels, max_selections=20, key=selected_key)
+        cols = st.columns([1, 1, 4])
+        default_weight = cols[0].number_input("新增默认仓位", min_value=0.0, max_value=1.0, value=0.10, step=0.05, key=f"{state_key}_new_weight")
+        replace_existing = cols[1].checkbox("覆盖已有", value=False, key=f"{state_key}_replace")
+        if cols[2].button("添加到组合", key=f"{state_key}_add_selected"):
+            selected_symbols = [item["symbol"] for item in options if item["label"] in selected_labels]
+            current = _clean_portfolio_rows(st.session_state[state_key])
+            existing = {row["股票代码"]: row["仓位"] for row in current}
+            for symbol in selected_symbols:
+                if symbol in existing and not replace_existing:
+                    continue
+                existing[symbol] = float(default_weight)
+            st.session_state[state_key] = pd.DataFrame(
+                [{"股票代码": symbol, "仓位": weight} for symbol, weight in existing.items()]
+            )
+
+    portfolio_df = st.data_editor(
+        st.session_state[state_key],
+        num_rows="dynamic",
+        use_container_width=True,
+        key=editor_key,
+        column_config={
+            "股票代码": st.column_config.TextColumn(help="A股代码，例如 600519"),
+            "仓位": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
+        },
+        hide_index=True,
+    )
+    st.session_state[state_key] = portfolio_df
+    return portfolio_df
+
+
+def _clean_portfolio_rows(df: pd.DataFrame) -> list[dict]:
+    rows = []
+    for _, row in df.iterrows():
+        symbol = str(row.get("股票代码") or "").strip()
+        if not symbol:
+            continue
+        rows.append({"股票代码": symbol, "仓位": float(row.get("仓位") or 0.0)})
+    return rows
 
 
 def _portfolio_from_editor(df: pd.DataFrame) -> tuple[list[str], list[float]]:
@@ -341,12 +428,74 @@ def _portfolio_from_editor(df: pd.DataFrame) -> tuple[list[str], list[float]]:
     return [symbol for symbol, _ in rows], [weight for _, weight in rows]
 
 
+def _build_enriched_query(query: str, policy_details: dict[str, str]) -> str:
+    base = (query or "").strip()
+    details = []
+    for label, value in policy_details.items():
+        cleaned = str(value or "").strip()
+        if cleaned:
+            details.append(f"{label}：{cleaned}")
+    if not details:
+        return base
+    suffix = "；".join(details)
+    if not base:
+        return suffix
+    return f"{base}\n补充政策细节：{suffix}"
+
+
+def _plain_user_text(text: object) -> str:
+    value = str(text or "")
+    replacements = {
+        "market_beta": "市场敏感度",
+        "beta": "市场敏感度",
+        "low_data_proxy": "数据不足时的保守估计",
+        "scenario_proxy": "情景估计",
+        "historical_template": "历史参考",
+        "reverse_stress_grid": "压力测试",
+        "local_volatility_flag": "波动较高",
+        "local_amount_change_flag": "成交活跃度变化",
+        "volatility_proxy": "波动压力",
+        "liquidity_proxy": "流动性压力",
+        "quantification_status": "参考状态",
+        "not_quantified": "未量化",
+        "deterministic": "规则化",
+        "What-If 比较": "调仓前后对比",
+        "What-If": "调仓对比",
+        "仓位集中度": "单一股票占比",
+        "降低单一标的集中度作为候选风险管理动作": "降低单一股票占比后再比较结果",
+    }
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    return value
+
+
+def _impact_note(item) -> str:
+    if item.base_return_range is None:
+        return "数据不足，暂不能判断涨跌区间"
+    low, high = item.base_return_range
+    if low < 0 and high <= 0:
+        return "主要是下跌压力"
+    if low >= 0 and high > 0:
+        return "相对受益"
+    if low < 0 < high:
+        return "方向不确定"
+    return "影响较小"
+
+
+def _confidence_label(confidence: float) -> str:
+    if confidence >= 0.65:
+        return "较高"
+    if confidence >= 0.45:
+        return "中等"
+    return "较低"
+
+
 def _render_empty_state() -> None:
     st.subheader("你会得到什么")
     cols = st.columns(3)
-    cols[0].markdown("**我会受多大影响**\n\n组合冲击区间、可量化仓位、最大风险持仓。")
-    cols[1].markdown("**风险暴露在哪里**\n\n持仓贡献、因子暴露、历史类比和压力路径。")
-    cols[2].markdown("**要不要调仓**\n\n只给风险管理候选动作，可选比较调仓前后差异。")
+    cols[0].markdown("**可能亏多少**\n\n组合可能涨跌区间、最容易拖累组合的持仓。")
+    cols[1].markdown("**为什么会受影响**\n\n用普通语言解释事件会影响哪些股票。")
+    cols[2].markdown("**下一步怎么复核**\n\n比较调仓前后，看看亏损下沿有没有改善。")
 
 
 def _render_prepared_scenario(prepared: dict) -> None:
@@ -361,6 +510,22 @@ def _render_prepared_scenario(prepared: dict) -> None:
     shocks = spec.get("shocks") or []
     if shocks:
         st.dataframe(pd.DataFrame(shocks), use_container_width=True)
+    assumptions = [
+        item
+        for item in (spec.get("assumptions") or [])
+        if item.get("source") == "user_input_policy_detail"
+    ]
+    if assumptions:
+        st.markdown("**已纳入的政策细节**")
+        labels = {
+            "execution_date": "执行日期",
+            "policy_scope": "适用范围",
+            "countermeasures": "反制措施",
+            "exemption_list": "豁免清单",
+            "policy_authority": "政策主体",
+        }
+        rows = [{"项目": labels.get(item.get("key"), item.get("key")), "内容": item.get("value")} for item in assumptions]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     missing = spec.get("missing_information") or []
     if missing:
         st.warning("需要确认或补充的信息：" + "；".join(missing))
@@ -404,39 +569,25 @@ def _render_advanced_tools(
 
 
 def _render_reverse_stress(report) -> None:
-    st.subheader("反向压力测试")
     cols = st.columns(3)
     cols[0].metric("损失阈值", f"{report.loss_threshold:.2%}")
-    cols[1].metric("候选压力组合", str(len(report.candidates)))
+    cols[1].metric("触发情况", "未找到" if not report.candidates else "已找到")
     cols[2].metric("时间范围", report.horizon)
     if not report.candidates:
-        st.warning("未找到可审计的压力组合。")
-    rows = []
+        st.info("在当前设置下，暂未找到会触发你亏损线的市场下跌幅度。")
     for candidate in report.candidates:
         impact = candidate.estimated_portfolio_impact
-        rows.append(
-            {
-                "候选ID": candidate.candidate_id,
-                "影响下沿": None if impact is None else impact[0],
-                "影响上沿": None if impact is None else impact[1],
-                "影响标的": ",".join(candidate.affected_symbols),
-                "状态": candidate.quantification_status,
-                "置信度": candidate.confidence,
-            }
-        )
-    if rows:
-        st.dataframe(
-            pd.DataFrame(rows),
-            use_container_width=True,
-            column_config={
-                "影响下沿": st.column_config.NumberColumn(format="%.2%"),
-                "影响上沿": st.column_config.NumberColumn(format="%.2%"),
-                "置信度": st.column_config.NumberColumn(format="%.2f"),
-            },
-        )
+        market_shock = next((shock for shock in candidate.factor_shocks if shock.factor == "market_index"), None)
+        shock_text = "市场明显下跌" if market_shock is None else f"市场整体下跌约 {market_shock.magnitude:.1f}%"
+        range_text = "未量化" if impact is None else f"{impact[0]:.2%} ~ {impact[1]:.2%}"
+        st.markdown(f"**{shock_text} 时，组合可能接近亏损线**")
+        st.write(f"组合可能区间：{range_text}")
+        st.write(_plain_user_text(candidate.explanation))
+        if candidate.affected_symbols:
+            st.caption("主要涉及：" + "、".join(candidate.affected_symbols))
     if report.uncertainty:
-        st.warning("；".join(report.uncertainty))
-    with st.expander("完整 Markdown 报告", expanded=False):
+        st.warning("；".join(_plain_user_text(item) for item in report.uncertainty))
+    with st.expander("完整亏损线分析", expanded=False):
         st.markdown(report.markdown)
     with st.expander("审计信息", expanded=False):
         st.json(report.audit)
@@ -653,7 +804,7 @@ def _path_chart(report) -> go.Figure | None:
         return None
 
     path_values = {}
-    for label, attr in [("Bear", "bear_return_range"), ("Base", "base_return_range"), ("Bull", "bull_return_range")]:
+    for label, attr in [("更差情况", "bear_return_range"), ("正常情况", "base_return_range"), ("更好情况", "bull_return_range")]:
         low = 0.0
         high = 0.0
         has_data = False
@@ -676,18 +827,19 @@ def _path_chart(report) -> go.Figure | None:
     fig = go.Figure()
     fig.add_trace(go.Bar(name="下沿", x=labels, y=lows, marker_color="#B23A48"))
     fig.add_trace(go.Bar(name="上沿", x=labels, y=highs, marker_color="#2F7D6D"))
-    fig.update_layout(title="多路径组合收益区间", yaxis_tickformat=".1%", barmode="group", height=360)
+    fig.update_layout(title="不同情况下的组合涨跌区间", yaxis_tickformat=".1%", barmode="group", height=360)
     return fig
 
 
 def _factor_radar_chart(report) -> go.Figure | None:
     factor_items = [item for item in report.evidence if item.evidence_type == "factor_regression" and item.metrics]
-    categories = ["market_beta", "momentum_20d", "volatility_60d", "liquidity_change_20d"]
+    categories = ["市场敏感度", "近期走势", "价格波动", "成交活跃度变化"]
+    metric_keys = ["market_beta", "momentum_20d", "volatility_60d", "liquidity_change_20d"]
     fig = go.Figure()
     added = False
     for item in factor_items:
         values = []
-        for category in categories:
+        for category in metric_keys:
             value = item.metrics.get(category)
             values.append(0 if value is None else float(value))
         if all(value == 0 for value in values):
@@ -704,14 +856,14 @@ def _factor_radar_chart(report) -> go.Figure | None:
                         r=[1.0, 0.0, 0.05, 0.0],
                         theta=categories,
                         fill="toself",
-                        name=f"{item.symbol} 低数据代理",
+                        name=f"{item.symbol} 数据较少",
                     )
                 )
             added = True
 
     if not added:
         return None
-    fig.update_layout(title="风险因子暴露雷达图", polar=dict(radialaxis=dict(visible=True)), height=360)
+    fig.update_layout(title="持仓风险特征", polar=dict(radialaxis=dict(visible=True)), height=360)
     return fig
 
 

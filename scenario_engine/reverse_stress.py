@@ -116,9 +116,9 @@ class ReverseStressEngine:
                 candidate_id = f"reverse_market_{int(magnitude_pct * 100):04d}"
                 amplifiers = []
                 if liquidity_risk_symbols:
-                    amplifiers.append(f"流动性走弱标的：{', '.join(sorted(set(liquidity_risk_symbols)))}")
+                    amplifiers.append(f"成交活跃度走弱的持仓：{', '.join(sorted(set(liquidity_risk_symbols)))}")
                 if volatility_risk_symbols:
-                    amplifiers.append(f"高波动标的：{', '.join(sorted(set(volatility_risk_symbols)))}")
+                    amplifiers.append(f"波动较大的持仓：{', '.join(sorted(set(volatility_risk_symbols)))}")
                 candidates.append(
                     ReverseStressCandidate(
                         candidate_id=candidate_id,
@@ -127,8 +127,8 @@ class ReverseStressEngine:
                         affected_symbols=sorted(set(affected_symbols)),
                         evidence_ids=sorted(set(evidence_ids)),
                         explanation=(
-                            f"在当前本地 beta/低数据默认 beta 暴露下，市场指数下跌 {magnitude_pct:.1f}% 的压力组合"
-                            f"可使组合贡献下沿达到 {low:.2%}。"
+                            f"如果市场整体下跌约 {magnitude_pct:.1f}%，你的组合在保守估计下可能接近或跌破"
+                            f" {abs(loss_threshold):.1%} 的亏损线。"
                             + (f" {'；'.join(amplifiers)}。" if amplifiers else "")
                         ),
                         confidence=0.50 if quantified_weight >= 0.8 else 0.40,
@@ -154,12 +154,12 @@ class ReverseStressEngine:
 
         uncertainty = []
         if not candidates:
-            uncertainty.append("未找到满足阈值的可审计冲击组合")
+            uncertainty.append("在当前设置下，暂未找到会触发你亏损线的市场下跌幅度")
         if any(item.market_beta is None for item in exposures):
-            uncertainty.append("部分持仓缺少可估计 market_beta，已用低数据默认 beta=1.0 和更宽误差带处理")
+            uncertainty.append("部分持仓历史数据不足，结果按更保守的方式估计")
         if portfolio.cash_weight:
             uncertainty.append("现金仓位按零风险资产处理，未模拟货币基金或利率收益")
-        uncertainty.append("流动性和波动率压力只作为本地风险放大标记，不单独生成收益率")
+        uncertainty.append("成交活跃度和价格波动只用于提示风险，不单独预测涨跌幅")
 
         report = ReverseStressReport(
             reverse_stress_id=self._make_id(portfolio.as_of_date, loss_threshold, horizon, mode),
@@ -183,9 +183,9 @@ class ReverseStressEngine:
 
     def to_markdown(self, report: ReverseStressReport) -> str:
         lines = [
-            "# 反向压力测试报告",
+            "# 亏损线触发分析",
             "",
-            "> 说明：本报告寻找可能触达指定亏损阈值的压力组合，不是收益预测或交易建议。",
+            "> 说明：本报告回答“市场跌到什么程度，我的组合可能接近亏损线”。",
             "",
             "## 参数",
             "",
@@ -193,29 +193,39 @@ class ReverseStressEngine:
             f"- 损失阈值：{report.loss_threshold:.2%}",
             f"- 时间范围：{report.horizon}",
             "",
-            "## 最小压力组合",
+            "## 可能触发亏损线的情况",
             "",
         ]
         if not report.candidates:
-            lines.append("- 未找到可审计的压力组合。")
+            lines.append("- 暂未找到会触发你亏损线的市场下跌幅度。")
         for candidate in report.candidates:
-            shocks = ", ".join(
-                f"{shock.factor} {shock.direction} "
-                f"{'未设定' if shock.magnitude is None else f'{shock.magnitude:.2f}'}{shock.unit}"
-                for shock in candidate.factor_shocks
-            )
+            market_shock = next((shock for shock in candidate.factor_shocks if shock.factor == "market_index"), None)
+            shock_text = "市场明显下跌" if market_shock is None else f"市场整体下跌约 {market_shock.magnitude:.1f}%"
             impact = "未量化" if candidate.estimated_portfolio_impact is None else (
                 f"{candidate.estimated_portfolio_impact[0]:.2%} ~ {candidate.estimated_portfolio_impact[1]:.2%}"
             )
-            lines.append(f"- `{candidate.candidate_id}`：{shocks}，组合区间 {impact}。{candidate.explanation}")
-        lines.extend(["", "## 不确定性", ""])
+            lines.append(f"- {shock_text} 时，组合可能落在 {impact}。{candidate.explanation}")
+        lines.extend(["", "## 需要注意", ""])
         for item in report.uncertainty:
             lines.append(f"- {item}")
-        lines.extend(["", "## 证据", ""])
+        lines.extend(["", "## 参考依据", ""])
         for item in report.evidence:
-            lines.append(f"- `{item.evidence_id}` {item.title}：{item.content}")
+            lines.append(f"- {self._clean_user_text(item.title)}")
         return "\n".join(lines)
 
     def _make_id(self, as_of_date: str, loss_threshold: float, horizon: str, mode: str) -> str:
         digest = hashlib.sha1(f"{as_of_date}|{loss_threshold}|{horizon}|{mode}".encode("utf-8")).hexdigest()[:12]
         return f"reverse_{digest}"
+
+    def _clean_user_text(self, text: object) -> str:
+        value = str(text or "")
+        replacements = {
+            "market_beta": "市场敏感度",
+            "beta": "市场敏感度",
+            "reverse_stress": "亏损线分析",
+            "local_volatility_flag": "波动较高",
+            "local_amount_change_flag": "成交活跃度变化",
+        }
+        for old, new in replacements.items():
+            value = value.replace(old, new)
+        return value

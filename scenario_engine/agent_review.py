@@ -32,7 +32,7 @@ class ScenarioAgentReview:
             findings.append("存在用户未明确的信息，已保留为缺失项。")
         if not spec.shocks:
             findings.append("用户未提供可解析冲击幅度。")
-        return AgentReviewItem("Scenario Parser Agent", "reviewed", findings or ["场景解析结构完整。"])
+        return AgentReviewItem("Scenario Parser Review Agent (deterministic)", "reviewed", findings or ["场景解析结构完整。"])
 
     def _evidence_review(self, report: ScenarioReport) -> AgentReviewItem:
         evidence_ids = [item.evidence_id for item in report.evidence]
@@ -42,7 +42,7 @@ class ScenarioAgentReview:
             findings.append("未找到可量化历史类比证据。")
         else:
             findings.append(f"找到 {len(historical)} 条历史类比或市场相似证据。")
-        return AgentReviewItem("Evidence Agent", "reviewed", findings, evidence_ids)
+        return AgentReviewItem("Evidence Review Agent (deterministic)", "reviewed", findings, evidence_ids)
 
     def _quant_review(self, report: ScenarioReport) -> AgentReviewItem:
         findings = []
@@ -53,7 +53,7 @@ class ScenarioAgentReview:
             findings.append("没有持仓具备可审计量化区间。")
         if report.portfolio_total_impact.get("base_range") is None:
             findings.append("组合层面未输出收益区间。")
-        return AgentReviewItem("Quant Agent", "reviewed", findings)
+        return AgentReviewItem("Quant Review Agent (deterministic)", "reviewed", findings)
 
     def _risk_review(self, report: ScenarioReport) -> AgentReviewItem:
         findings = []
@@ -63,7 +63,7 @@ class ScenarioAgentReview:
             findings.append(f"最大下行情景贡献来自 {worst.symbol}，贡献下沿 {worst.expected_contribution_range[0]:.2%}。")
         if report.uncertainty:
             findings.append(f"存在 {len(report.uncertainty)} 项不确定性。")
-        return AgentReviewItem("Bear/Risk Agent", "reviewed", findings or ["未发现额外集中风险。"])
+        return AgentReviewItem("Bear/Risk Review Agent (deterministic)", "reviewed", findings or ["未发现额外集中风险。"])
 
     def _bull_review(self, report: ScenarioReport) -> AgentReviewItem:
         findings = []
@@ -74,7 +74,7 @@ class ScenarioAgentReview:
             findings.append("该上沿仅是压力测试区间，不构成买入理由。")
         else:
             findings.append("没有足够证据支持正向修复路径量化。")
-        return AgentReviewItem("Bull Agent", "reviewed", findings)
+        return AgentReviewItem("Bull Review Agent (deterministic)", "reviewed", findings)
 
     def _policy_review(self, report: ScenarioReport) -> AgentReviewItem:
         findings = []
@@ -86,7 +86,7 @@ class ScenarioAgentReview:
             findings.append("缺失信息已保留，不能把政策强度或实施范围自动补全。")
         if not findings:
             findings.append("未识别出需要单独审查的政策假设。")
-        return AgentReviewItem("Policy Agent", "reviewed", findings)
+        return AgentReviewItem("Policy Review Agent (deterministic)", "reviewed", findings)
 
     def _critic_review(self, report: ScenarioReport) -> AgentReviewItem:
         findings = []
@@ -98,10 +98,10 @@ class ScenarioAgentReview:
             if missing:
                 findings.append(f"{impact.symbol} 引用了不存在的证据：{', '.join(missing)}。")
         status = "passed" if not findings else "failed"
-        return AgentReviewItem("Critic Agent", status, findings or ["未发现无来源数值或断裂证据链。"])
+        return AgentReviewItem("Critic Review Agent (deterministic)", status, findings or ["未发现无来源数值或断裂证据链。"])
 
     def _report_review(self, report: ScenarioReport) -> AgentReviewItem:
-        required_sections = ["## 执行摘要", "## 场景定义", "## 持仓影响", "## 多路径结果", "## 审计", "## 证据"]
+        required_sections = ["## 一句话结论", "## 普通投资者版摘要", "## 场景定义", "## 持仓影响", "## 多路径结果", "## 审计", "## 证据"]
         findings = []
         for section in required_sections:
             if section not in report.markdown:
@@ -109,4 +109,4 @@ class ScenarioAgentReview:
         if report.audit.get("validation_status") != "passed":
             findings.append("报告校验状态不是 passed。")
         status = "passed" if not findings else "failed"
-        return AgentReviewItem("Report Agent", status, findings or ["报告结构完整，且审计信息已写入。"])
+        return AgentReviewItem("Report Review Agent (deterministic)", status, findings or ["报告结构完整，且审计信息已写入。"])

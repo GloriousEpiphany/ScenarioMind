@@ -29,6 +29,7 @@ from .rebalance import RebalanceComparator
 from .reporter import ReportComposer
 from .report_exporter import ReportExporter
 from .repository import ScenarioRepository
+from .research import ResearchOrchestrator
 from .reverse_stress import ReverseStressEngine
 from .schema_contracts import SCENARIO_REPORT_SCHEMA, SCENARIO_SPEC_SCHEMA, validate_required_contract
 from .schemas import (
@@ -128,6 +129,7 @@ class ScenarioEngine:
         self.event_monitor = EventMonitor(self.parser, self._run_for_backtest)
         self.batch_stress_tester = BatchPortfolioStressTester(self._run_for_backtest)
         self.external_data_registry = ExternalDataRegistry()
+        self.research_orchestrator = ResearchOrchestrator(self.data_provider, llm_client=self.llm_client)
         self.multi_asset_coverage_checker = MultiAssetCoverage(self.data_provider)
         self.access_control = AccessControl()
         self.enterprise_audit = EnterpriseAudit()
@@ -155,6 +157,10 @@ class ScenarioEngine:
         role: str | None = None,
         require_confirmation: bool = False,
         confirmed: bool = False,
+        enable_external_research: bool = False,
+        research_network: bool = False,
+        research_source_types: list[str] | None = None,
+        research_read_articles: bool = False,
     ) -> ScenarioReport:
         self._require_access(user_id, role, "run_scenario")
         if mode not in {"quick", "standard", "deep"}:
@@ -182,6 +188,18 @@ class ScenarioEngine:
                 raise ValueError("symbols or portfolio must be provided")
             portfolio = self.portfolio_builder.from_weights(symbols, weights, as_of_date, cash_weight=cash_weight)
 
+        self.research_orchestrator.enable_network = bool(research_network)
+        self.research_orchestrator.read_articles = bool(research_read_articles)
+        research_bundle = self.research_orchestrator.collect(
+            spec=spec,
+            portfolio=portfolio,
+            mode=mode,
+            as_of_date=as_of_date,
+            enabled=enable_external_research,
+            selected_source_types=research_source_types,
+        )
+        external_evidence = self.research_orchestrator.to_scenario_evidence(research_bundle, limit=20)
+
         asset_proxies = self.repository.list_asset_proxies() if self.repository is not None else []
         proxy_factors = {item["factor"] for item in asset_proxies}
         shock_evidence, shock_status = self.shock_mapper.map(spec, extra_quantifiable_factors=proxy_factors)
@@ -206,7 +224,7 @@ class ScenarioEngine:
             {"quantified_position_weight": total_impact.get("quantified_position_weight")},
         )
 
-        evidence = shock_evidence + constraints.evidences + analogs.evidences + graph_evidence + exposure_evidence + proxy_evidence + simulator_evidence
+        evidence = external_evidence + shock_evidence + constraints.evidences + analogs.evidences + graph_evidence + exposure_evidence + proxy_evidence + simulator_evidence
         audit = {
             "method": (
                 "llm_structured_parser_plus_deterministic_v2_local_data_kg_and_audit_no_llm_numeric_generation"
@@ -226,10 +244,14 @@ class ScenarioEngine:
             "model_snapshot_id": parser_audit["model_snapshot_id"],
             "data_snapshot_id": self._data_snapshot_id(as_of_date),
             "registered_asset_proxies": asset_proxies,
+            "external_research": research_bundle.audit,
+            "external_research_assessment": self._assess_external_research(research_bundle),
+            "agent_research": research_bundle.agent_traces,
             "state_trace": [
                 "CREATED",
                 "PARSED",
                 "HUMAN_CONFIRMED" if confirmed else "HUMAN_CONFIRMATION_NOT_REQUIRED",
+                "EXTERNAL_RESEARCH_READY" if enable_external_research else "EXTERNAL_RESEARCH_SKIPPED",
                 "EVIDENCE_READY",
                 "QUANT_READY",
                 "AGENT_REVIEW_READY",
@@ -299,14 +321,16 @@ class ScenarioEngine:
         main_risks = []
         if worst:
             main_risks.append(f"{worst.symbol} {worst.name} 是当前最大下行贡献来源，下沿约 {worst.expected_contribution_range[0]:.2%}。")
-            main_risks.extend(worst.key_drivers[:2])
-        main_risks.extend(report.uncertainty[:3])
+            main_risks.extend(self._plain_investor_text(item) for item in worst.key_drivers[:2])
+        main_risks.extend(self._plain_investor_text(item) for item in report.uncertainty[:3])
+        external_assessment = report.audit.get("external_research_assessment") or {}
+        main_risks.extend(external_assessment.get("risk_findings", [])[:3])
         actions = [
             "先把该结果当成风险体检：确认最差下沿是否超过你的亏损承受阈值。",
             "若超过阈值，优先降低最大拖累标的或提高现金仓位，再用调仓方案比较功能复测。",
         ]
         if worst:
-            actions.append(f"重点复核 {worst.symbol} 的持仓权重、流动性和事件相关性。")
+            actions.append(f"重点复核 {worst.symbol} 的仓位是否过重，以及它和本次事件的关系是否足够直接。")
         if best and (not worst or best.symbol != worst.symbol):
             actions.append(f"{best.symbol} 在修复路径里相对更抗压，但这不是自动买入建议。")
         return {
@@ -321,8 +345,61 @@ class ScenarioEngine:
                 "最大风险持仓是否继续扩大下行贡献",
                 "未量化持仓占比是否过高",
                 "调仓后下沿是否明显改善",
+                *external_assessment.get("watch_points", [])[:3],
             ],
             "confidence_note": f"当前量化覆盖约 {total.get('quantified_position_weight', 0):.1%} 的持仓；未覆盖部分仍需要人工判断。",
+        }
+
+    def _plain_investor_text(self, text: object) -> str:
+        value = str(text or "")
+        replacements = {
+            "market_beta": "市场敏感度",
+            "beta": "市场敏感度",
+            "低数据持仓使用保守默认市场敏感度": "该持仓可参考数据较少，结果按更保守方式估计",
+            "用户明确输入的大盘冲击与本地/默认 市场敏感度": "该持仓会跟随你输入的大盘冲击变化",
+            "用户明确输入的大盘冲击与本地/默认市场敏感度": "该持仓会跟随你输入的大盘冲击变化",
+            "保守情景代理冲击与本地/默认因子暴露": "该事件缺少直接市场数据，系统按保守情景估计影响",
+            "scenario_proxy": "情景估计",
+            "low_data_proxy": "数据不足时的保守估计",
+        }
+        for old, new in replacements.items():
+            value = value.replace(old, new)
+        return value
+
+    def _assess_external_research(self, research_bundle) -> dict:
+        documents = research_bundle.documents
+        if not documents:
+            return {
+                "status": "no_external_evidence",
+                "risk_findings": [],
+                "positive_findings": [],
+                "watch_points": [],
+                "evidence_ids": [],
+                "method": "deterministic_tag_and_source_quality_assessment",
+            }
+        high_quality = [doc for doc in documents if doc.evidence_score >= 0.55]
+        risk_terms = {"反向风险", "bank_margin", "real_estate", "tariff", "oil_price"}
+        positive_terms = {"政策信号", "credit", "market_expectation", "市场预期"}
+        risk_findings = []
+        positive_findings = []
+        watch_points = []
+        for doc in high_quality[:10]:
+            tags = set(doc.event_tags)
+            if tags & risk_terms:
+                risk_findings.append(f"外部证据提示需复核：{doc.title}")
+            if tags & positive_terms:
+                positive_findings.append(f"外部证据支持关注：{doc.title}")
+            if doc.related_symbols:
+                watch_points.append(f"跟踪 {', '.join(doc.related_symbols)} 相关证据：{doc.title}")
+        return {
+            "status": "assessed",
+            "method": "deterministic_tag_and_source_quality_assessment",
+            "document_count": len(documents),
+            "high_quality_document_count": len(high_quality),
+            "risk_findings": list(dict.fromkeys(risk_findings))[:5],
+            "positive_findings": list(dict.fromkeys(positive_findings))[:5],
+            "watch_points": list(dict.fromkeys(watch_points))[:5],
+            "evidence_ids": [doc.evidence_id for doc in high_quality[:10]],
         }
 
     def _attach_llm_investor_synthesis(self, report: ScenarioReport) -> None:
@@ -358,6 +435,19 @@ class ScenarioEngine:
             "uncertainty": report.uncertainty,
             "agent_review": report.audit.get("agent_review", []),
             "graph_context_edges": report.audit.get("graph_context_edges", [])[:8],
+            "external_research": report.audit.get("external_research", {}),
+            "external_evidence": [
+                {
+                    "evidence_id": item.evidence_id,
+                    "type": item.evidence_type,
+                    "title": item.title,
+                    "source_uri": item.source_uri,
+                    "confidence": item.confidence,
+                    "metrics": item.metrics,
+                }
+                for item in report.evidence
+                if str(item.evidence_type).startswith("external_")
+            ][:12],
         }
         try:
             result = self.llm_client.synthesize_investor_report(payload)
