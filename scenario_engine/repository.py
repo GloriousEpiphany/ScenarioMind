@@ -182,6 +182,43 @@ class ScenarioRepository:
         )
         conn.commit()
 
+    def search_memories(
+        self,
+        query: str,
+        limit: int = 8,
+        memory_types: list[str] | None = None,
+    ) -> list[dict]:
+        """Search persisted scenario memory without fabricating context."""
+        tokens = self._memory_tokens(query)
+        conn = self.data_provider.db.connect()
+        params: list[object] = []
+        where = ""
+        if memory_types:
+            placeholders = ",".join(["?"] * len(memory_types))
+            where = f"WHERE memory_type IN ({placeholders})"
+            params.extend(memory_types)
+        rows = conn.execute(
+            f"""
+            SELECT memory_id, scenario_id, memory_type, as_of_date, title, content,
+                   tags_json, source_report_id, created_at, metadata_json
+            FROM scenario_memory
+            {where}
+            ORDER BY created_at DESC, memory_id DESC
+            LIMIT 200
+            """,
+            params,
+        ).fetchall()
+        scored = []
+        for row in rows:
+            item = self._memory_row_to_dict(row)
+            text = " ".join([item["title"], item["content"], " ".join(item["tags"])])
+            score = self._token_overlap(text, tokens)
+            if score > 0 or not tokens:
+                item["match_score"] = score
+                scored.append(item)
+        scored.sort(key=lambda item: (item["match_score"], item["created_at"]), reverse=True)
+        return scored[:limit]
+
     def save_user_operation(self, record: UserOperationRecord) -> UserOperationRecord:
         if not record.user_confirmed:
             raise ValueError("user operation must be explicitly confirmed before persistence")
@@ -1357,6 +1394,49 @@ class ScenarioRepository:
     def _memory_id(self, scenario_id: str, memory_type: str, date_value: str) -> str:
         digest = hashlib.sha1(f"{scenario_id}|{memory_type}|{date_value}".encode("utf-8")).hexdigest()[:12]
         return f"memory_{digest}"
+
+    def _memory_row_to_dict(self, row) -> dict:
+        return {
+            "memory_id": row[0],
+            "scenario_id": row[1],
+            "memory_type": row[2],
+            "as_of_date": row[3],
+            "title": row[4],
+            "content": row[5],
+            "tags": json.loads(row[6] or "[]"),
+            "source_report_id": row[7],
+            "created_at": row[8],
+            "metadata": json.loads(row[9] or "{}"),
+        }
+
+    def _memory_tokens(self, query: str) -> set[str]:
+        raw = str(query or "").replace("_", " ")
+        tokens = set()
+        current = []
+        for char in raw:
+            if char.isalnum() or "\u4e00" <= char <= "\u9fff":
+                current.append(char.lower())
+            else:
+                if current:
+                    token = "".join(current).strip()
+                    if len(token) >= 2:
+                        tokens.add(token)
+                    current = []
+        if current:
+            token = "".join(current).strip()
+            if len(token) >= 2:
+                tokens.add(token)
+        for phrase in ["降息", "加息", "关税", "半导体", "地产", "银行", "汇率", "油价", "监管", "新能源"]:
+            if phrase in raw:
+                tokens.add(phrase)
+        return tokens
+
+    def _token_overlap(self, text: str, tokens: set[str]) -> float:
+        if not tokens:
+            return 0.0
+        lowered = str(text or "").lower()
+        hits = sum(1 for token in tokens if token and token in lowered)
+        return hits / max(len(tokens), 1)
 
     def _replay_markdown(self, report: ScenarioReplayReport) -> str:
         predicted = "未量化" if report.predicted_range is None else f"{report.predicted_range[0]:.2%} ~ {report.predicted_range[1]:.2%}"

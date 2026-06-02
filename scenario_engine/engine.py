@@ -7,6 +7,7 @@ import hashlib
 from dataclasses import asdict
 
 from .analogs import HistoricalAnalogRetriever
+from .agent_workflow import ScenarioFullAgentWorkflow
 from .agent_review import ScenarioAgentReview
 from .backtester import ScenarioBacktester
 from .batch import BatchPortfolioStressTester
@@ -119,6 +120,7 @@ class ScenarioEngine:
         self.reporter = ReportComposer()
         self.validator = ScenarioValidator()
         self.agent_review = ScenarioAgentReview()
+        self.full_agent_workflow = ScenarioFullAgentWorkflow()
         self.evaluation_suite = ScenarioEvaluationSuite()
         self.reverse_stress_engine = ReverseStressEngine(self.factor_estimator)
         self.rebalance_comparator = RebalanceComparator()
@@ -261,6 +263,12 @@ class ScenarioEngine:
         }
         audit["workflow_orchestrator"] = self.workflow.run_langgraph_trace(spec.scenario_id, confirmed=confirmed)
         report = self.reporter.compose(spec, paths, impacts, total_impact, evidence, audit)
+        report = self.full_agent_workflow.run(
+            report,
+            repository=self.repository,
+            research_repository=self.research_orchestrator.repository,
+            knowledge_graph=self.knowledge_graph,
+        )
         ok, issues = self.validator.validate(report)
         report.audit["validation_status"] = "passed" if ok else "failed"
         report.audit["validation_issues"] = issues

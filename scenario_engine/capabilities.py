@@ -53,12 +53,18 @@ def build_capability_report(external_sources: dict | None = None) -> dict:
         "phase_3_agents_memory": {
             "status": "partial",
             "implemented": [
+                "local A2A JSON-RPC message/send multi-step full agent workflow",
+                "A2A Agent Cards and task transcript audit",
+                "agent tool-call audit trail",
+                "agent memory retrieval",
+                "agent self-correction for evidence gaps and overclaims",
                 "local role-based review",
                 "scenario memory",
                 "scenario replay",
                 "workflow checkpoints",
                 "LangGraph workflow audit execution" if langgraph_available else "local checkpoint workflow",
             ],
+            "not_claimed": ["remote HTTP A2A server", "fully autonomous LLM agent team", "LLM-generated numeric impacts"],
             "external_or_optional": {
                 "langgraph": "available" if langgraph_available else "not_installed",
                 "agent_trajectory_evals": "local_deterministic_eval_suite",

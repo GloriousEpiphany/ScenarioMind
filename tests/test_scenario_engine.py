@@ -19,6 +19,7 @@ from scenario_engine.parser import ScenarioParser
 from scenario_engine.templates import SCENARIO_TEMPLATES
 from scenario_engine.news_connectors import GdeltDocNewsConnector
 from scenario_engine.research.models import ExternalEvidenceDocument
+from scenario_engine.schemas import ScenarioMemoryRecord
 from Agents_Experience.core.scenario_tools import ScenarioTools
 from src.stock_app.database import Database
 
@@ -548,6 +549,137 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertIn("Report Review Agent (deterministic)", reviewers)
         self.assertIn("AGENT_REVIEW_READY", report.audit["state_trace"])
         self.assertNotIn("## 多角色审查", report.markdown)
+
+    def test_full_agent_workflow_calls_tools_memory_research_graph_and_self_corrects(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            engine.repository.save_memory_record(
+                ScenarioMemoryRecord(
+                    memory_id="memory_test_rate_cut_bank",
+                    scenario_id="scenario_previous_rate_cut",
+                    memory_type="scenario_report",
+                    as_of_date="2020-03-01",
+                    title="降息与银行持仓复盘",
+                    content="降息 银行 净息差 平安银行 历史情景复盘。",
+                    tags=["scenario", "降息", "银行"],
+                    source_report_id="scenario_previous_rate_cut",
+                    created_at="2020-03-02T00:00:00",
+                )
+            )
+            engine.research_orchestrator.repository.save_document(
+                ExternalEvidenceDocument(
+                    evidence_id="external_agent_rate_cut_policy",
+                    source_type="policy",
+                    source_id="manual_test",
+                    source_name="测试政策源",
+                    title="央行 降息 LPR 银行 净息差",
+                    url="https://example.com/agent-rate-cut",
+                    summary="本地测试证据，仅用于验证 Agent 工具调用。",
+                    event_tags=["政策信号"],
+                    related_symbols=["000001"],
+                    relevance_score=0.9,
+                    source_quality_score=0.9,
+                    freshness_score=0.8,
+                    evidence_score=0.9,
+                )
+            )
+            engine.import_knowledge_graph(
+                items=[
+                    {
+                        "source": "降息",
+                        "relation": "影响",
+                        "target": "银行净息差",
+                        "evidence_id": "graph_agent_rate_cut_margin",
+                        "confidence": 0.8,
+                    }
+                ],
+                source_uri="manual://test/full_agent_graph",
+                operator="admin_001",
+                role="admin",
+            )
+            report = engine.run(
+                user_query="如果央行降息25bp，我的平安银行持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                enable_external_research=True,
+                confirmed=True,
+            )
+        finally:
+            engine.close()
+        workflow = report.audit["full_agent_workflow"]
+        agents = {step["agent"] for step in workflow["steps"]}
+        tools = {
+            call["tool_name"]
+            for step in workflow["steps"]
+            for call in step["tool_calls"]
+        }
+        self.assertEqual(workflow["status"], "completed")
+        self.assertEqual(workflow["protocol"], "A2A")
+        self.assertEqual(workflow["a2a_transport"], "local_in_process_jsonrpc_2_0")
+        self.assertIn("message/send", workflow["a2a_methods"])
+        self.assertIn("Memory Retrieval Agent", workflow["agent_cards"])
+        self.assertGreaterEqual(len(workflow["a2a_transcript"]), 8)
+        first_rpc = workflow["a2a_transcript"][0]["request"]
+        self.assertEqual(first_rpc["jsonrpc"], "2.0")
+        self.assertEqual(first_rpc["method"], "message/send")
+        self.assertIn("message", first_rpc["params"])
+        self.assertTrue(workflow["a2a_transcript"][0]["response"]["result"]["artifacts"])
+        self.assertFalse(workflow["autonomous_llm_claimed"])
+        self.assertFalse(workflow["numeric_generation_allowed"])
+        self.assertIn("Memory Retrieval Agent", agents)
+        self.assertIn("Research Retrieval Agent", agents)
+        self.assertIn("RAG Retrieval Agent", agents)
+        self.assertIn("Evidence Critic Agent", agents)
+        self.assertIn("Self Correction Agent", agents)
+        self.assertIn("memory.search", tools)
+        self.assertIn("research.search", tools)
+        self.assertIn("graph.search", tools)
+        self.assertTrue(workflow["memory_used"])
+        self.assertTrue(workflow["research_tools_used"])
+        self.assertTrue(workflow["graph_tools_used"])
+
+    def test_full_agent_workflow_does_not_fabricate_external_evidence_when_none_exists(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                enable_external_research=True,
+                confirmed=True,
+            )
+        finally:
+            engine.close()
+        workflow = report.audit["full_agent_workflow"]
+        self.assertFalse(workflow["memory_used"])
+        self.assertFalse(workflow["research_tools_used"])
+        self.assertIn("完整 Agent 未找到外部证据", "\n".join(report.uncertainty))
+        self.assertEqual([e for e in report.evidence if e.evidence_type.startswith("external_")], [])
+
+    def test_a2a_agent_layer_does_not_override_deterministic_quantification_or_validation(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+            )
+        finally:
+            engine.close()
+        workflow = report.audit["full_agent_workflow"]
+        self.assertEqual(workflow["protocol"], "A2A")
+        self.assertFalse(workflow["numeric_generation_allowed"])
+        self.assertEqual(report.audit["validation_status"], "passed")
+        self.assertIsNotNone(report.portfolio_total_impact["base_range"])
+        for impact in report.portfolio_impacts:
+            if impact.base_return_range is not None:
+                self.assertTrue(impact.evidence_ids)
+                self.assertNotEqual(impact.quantification_status, "not_quantified")
+        self.assertNotIn("validation_status_before_full_agent_correction", report.audit)
 
     def test_agent_scenario_tools_expose_audited_engine_results(self):
         tools = ScenarioTools(db_path=self.db_path, persist=False)
