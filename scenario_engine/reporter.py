@@ -186,6 +186,14 @@ class ReportComposer:
         if external_research:
             lines.extend(["", "## 外部研究证据", ""])
             lines.append(f"- 本次找到并纳入 {external_research.get('document_count', 0)} 条外部证据。")
+            adjustment = report.audit.get("external_research_adjustment") or {}
+            if adjustment.get("status") == "applied":
+                direction_text = {
+                    "risk_tilt": "外部证据更偏向风险提示",
+                    "positive_tilt": "外部证据更偏向修复或政策支持",
+                    "mixed_or_uncertain": "外部证据正反信号混合",
+                }.get(adjustment.get("direction"), "外部证据已参与修正")
+                lines.append(f"- {direction_text}，系统只据此调整区间宽度和方向倾向，不单独生成涨跌数字。")
             assessment = report.audit.get("external_research_assessment") or {}
             if assessment:
                 for finding in assessment.get("positive_findings", [])[:3]:

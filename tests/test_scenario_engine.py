@@ -1931,6 +1931,95 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertTrue(all(s["status"] == "skipped" for s in research["source_status"]))
         self.assertIn("EXTERNAL_RESEARCH_READY", report.audit["state_trace"])
 
+    def test_v2_external_research_adjusts_quant_ranges_without_llm_numbers(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            risk_doc = ExternalEvidenceDocument(
+                evidence_id="external_bank_margin_risk",
+                source_type="policy",
+                source_id="manual_test",
+                source_name="测试政策源",
+                title="央行 降息 LPR 银行 净息差 平安银行",
+                url="https://example.com/bank-margin-risk",
+                summary="降息可能压缩银行净息差，平安银行需要复核资产质量和息差压力。",
+                event_tags=["bank_margin", "反向风险"],
+                related_symbols=["000001"],
+                relevance_score=0.95,
+                source_quality_score=0.8,
+                freshness_score=0.9,
+                evidence_score=0.9,
+            )
+            engine.research_orchestrator.repository.save_document(risk_doc)
+            local_only = engine.run(
+                user_query="如果央行降息25bp，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_external_research=False,
+            )
+            adjusted = engine.run(
+                user_query="如果央行降息25bp，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_external_research=True,
+                research_network=False,
+                research_source_types=["policy"],
+            )
+        finally:
+            engine.close()
+
+        self.assertNotEqual(local_only.portfolio_total_impact["base_range"], adjusted.portfolio_total_impact["base_range"])
+        self.assertTrue(adjusted.portfolio_total_impact["external_evidence_adjusted"])
+        adjustment = adjusted.audit["external_research_adjustment"]
+        self.assertEqual(adjustment["status"], "applied")
+        self.assertIn("external_bank_margin_risk", adjustment["evidence_ids"])
+        self.assertTrue(any(e.evidence_id == "evidence_external_research_adjustment" for e in adjusted.evidence))
+        self.assertIn("不单独生成涨跌数字", adjusted.markdown)
+
+    def test_v2_debate_agents_use_retrieved_research_and_rag_evidence(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            doc = ExternalEvidenceDocument(
+                evidence_id="external_policy_support",
+                source_type="policy",
+                source_id="manual_test",
+                source_name="测试政策源",
+                title="央行 降息 宽信用 银行股 平安银行",
+                url="https://example.com/policy-support",
+                summary="宽信用和政策信号可能支持银行股估值修复。",
+                event_tags=["政策信号", "credit"],
+                related_symbols=["000001"],
+                relevance_score=0.95,
+                source_quality_score=0.8,
+                freshness_score=0.9,
+                evidence_score=0.9,
+            )
+            engine.research_orchestrator.repository.save_document(doc)
+            report = engine.run(
+                user_query="如果央行降息25bp，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_external_research=True,
+                research_network=False,
+                research_source_types=["policy"],
+            )
+        finally:
+            engine.close()
+
+        debate_steps = [
+            step
+            for step in report.audit["full_agent_workflow"]["steps"]
+            if step["agent"] in {"Bull Debate Agent", "Bear Debate Agent", "Risk Debate Agent"}
+        ]
+        self.assertTrue(debate_steps)
+        self.assertTrue(any("external_policy_support" in step["evidence_ids"] for step in debate_steps))
+        self.assertTrue(any("本轮辩论纳入" in " ".join(step["observations"]) for step in debate_steps))
+
 
 if __name__ == "__main__":
     unittest.main()

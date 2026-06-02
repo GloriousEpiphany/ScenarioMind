@@ -295,27 +295,10 @@ def show_scenario_page():
         st.markdown(report.markdown)
 
     with st.expander("外部研究证据", expanded=False):
-        external_research = report.audit.get("external_research") or {}
-        st.json(external_research)
-        external_rows = [
-            {
-                "证据ID": item.evidence_id,
-                "类型": item.evidence_type,
-                "标题": item.title,
-                "来源": item.source_uri,
-                "置信度": item.confidence,
-                "相关标的": ",".join(item.metrics.get("related_symbols") or []),
-                "标签": ",".join(item.metrics.get("event_tags") or []),
-            }
-            for item in report.evidence
-            if str(item.evidence_type).startswith("external_")
-        ]
-        if external_rows:
-            st.dataframe(pd.DataFrame(external_rows), use_container_width=True)
-        else:
-            st.caption("本次没有可展示的外部证据。若需要真实联网采集，请开启外部研究证据和允许联网采集，并确认网络与数据源可访问。")
+        _render_external_research(report)
 
-    with st.expander("审计信息", expanded=False):
+    with st.expander("开发/审计信息", expanded=False):
+        st.caption("这里给开发者和审计人员核查数据来源、Agent轨迹和模型边界；普通投资者只需要看上面的结论、风险和证据表。")
         st.json(report.audit)
 
     with st.expander("高级工具", expanded=False):
@@ -490,6 +473,48 @@ def _confidence_label(confidence: float) -> str:
     return "较低"
 
 
+def _plain_research_status(status: object) -> str:
+    return {
+        "completed": "已完成",
+        "success": "可用",
+        "failed": "失败",
+        "skipped": "已跳过",
+        "disabled": "未开启",
+        "not_applied": "未使用",
+        "applied": "已使用",
+        "available": "可用",
+        "unavailable": "不可用",
+    }.get(str(status or ""), str(status or "未知"))
+
+
+def _plain_adjustment_direction(direction: object) -> str:
+    return {
+        "risk_tilt": "偏风险",
+        "positive_tilt": "偏修复",
+        "mixed_or_uncertain": "正反混合",
+        None: "未使用",
+        "": "未使用",
+    }.get(direction, str(direction or "未使用"))
+
+
+def _plain_research_tag(tag: object) -> str:
+    return {
+        "interest_rate": "利率政策",
+        "bank_margin": "银行息差",
+        "credit": "信贷环境",
+        "real_estate": "地产链",
+        "fx": "汇率",
+        "oil_price": "油价",
+        "tariff": "关税/贸易",
+        "company_announcement": "公司公告",
+        "政策信号": "政策信号",
+        "持仓公司": "持仓公司",
+        "行业影响": "行业影响",
+        "市场预期": "市场预期",
+        "反向风险": "反向风险",
+    }.get(str(tag or ""), str(tag or ""))
+
+
 def _render_empty_state() -> None:
     st.subheader("你会得到什么")
     cols = st.columns(3)
@@ -543,8 +568,12 @@ def _render_advanced_tools(
     use_llm: bool,
 ) -> None:
     st.caption("这些能力用于复盘、审计和研究；普通投资者不需要调整。")
-    tool = st.selectbox("高级功能", ["模板回测", "全模板回测", "多资产覆盖", "知识图谱检索"], index=0)
-    engine = ScenarioEngine(persist=False, use_llm=use_llm)
+    tool = st.selectbox(
+        "高级功能",
+        ["模板回测", "全模板回测", "批量组合压力测试", "多资产覆盖", "知识图谱检索", "外部数据状态", "事件源轮询"],
+        index=0,
+    )
+    engine = ScenarioEngine(persist=True, use_llm=use_llm)
     try:
         if tool == "模板回测":
             template_name = st.selectbox("回测模板", [item["name"] for item in SCENARIO_TEMPLATES], index=0)
@@ -557,6 +586,23 @@ def _render_advanced_tools(
             end = st.text_input("结束日期", value=as_of_date, key="batch_bt_end")
             if st.button("运行全模板回测"):
                 _render_batch_backtest(engine.backtest_all_templates(start, end, horizon, symbols=symbols, mode=mode))
+        elif tool == "批量组合压力测试":
+            st.caption("一次比较多个组合在同一个情景下的风险下沿，适合投顾或研究场景。")
+            if st.button("运行批量压力测试"):
+                portfolios = [
+                    {"name": "当前组合", "symbols": symbols, "weights": weights, "cash_weight": 0.0},
+                    {"name": "提高现金的防守组合", "symbols": symbols, "weights": [weight * 0.8 for weight in weights], "cash_weight": 0.2},
+                ]
+                _render_batch_portfolio_stress(
+                    engine.batch_portfolio_stress(
+                        user_query=query,
+                        as_of_date=as_of_date,
+                        portfolios=portfolios,
+                        horizon=horizon,
+                        mode=mode,
+                        confirmed=True,
+                    )
+                )
         elif tool == "多资产覆盖":
             if st.button("检查覆盖"):
                 _render_multi_asset_coverage(engine.multi_asset_coverage(as_of_date))
@@ -564,6 +610,21 @@ def _render_advanced_tools(
             graph_query = st.text_input("检索词", value=query[:30])
             if st.button("检索图谱"):
                 _render_graph_search(engine.search_knowledge_graph(graph_query, top_k=10))
+        elif tool == "外部数据状态":
+            if st.button("查看状态"):
+                _render_external_data_status(engine.capability_report())
+        elif tool == "事件源轮询":
+            st.caption("输入一条已确认的事件文本，系统会判断它是否触发内置情景模板。")
+            source_id = st.text_input("事件源名称", value="manual_frontend_event")
+            event_text = st.text_area("事件内容", value=query, height=80)
+            if st.button("保存并轮询事件源"):
+                engine.register_event_source(
+                    source_id=source_id,
+                    source_type="manual",
+                    description="前端手动录入事件源",
+                    metadata={"events": [event_text]},
+                )
+                _render_event_polling(engine.poll_event_sources(as_of_date=as_of_date, symbols=symbols, weights=weights, source_ids=[source_id], auto_run=False))
     finally:
         engine.close()
 
@@ -593,6 +654,45 @@ def _render_reverse_stress(report) -> None:
         st.json(report.audit)
 
 
+def _render_external_research(report) -> None:
+    external_research = report.audit.get("external_research") or {}
+    adjustment = report.audit.get("external_research_adjustment") or {}
+    assessment = report.audit.get("external_research_assessment") or {}
+    cols = st.columns(4)
+    cols[0].metric("证据条数", external_research.get("document_count", 0))
+    cols[1].metric("采集状态", _plain_research_status(external_research.get("status")))
+    cols[2].metric("是否修正区间", "是" if adjustment.get("status") == "applied" else "否")
+    cols[3].metric("信号方向", _plain_adjustment_direction(adjustment.get("direction")))
+    if adjustment.get("status") == "applied":
+        st.info("外部证据已经参与本次区间修正：只调整风险倾向和不确定性，不单独生成涨跌数字。")
+    elif external_research.get("enabled"):
+        st.caption("本次未找到足够高质量且高相关的外部证据，量化结果仍以本地历史和因子数据为主。")
+    else:
+        st.caption("外部研究未开启，本次没有使用新闻、公告或政策页面修正结论。")
+
+    for label, items in [("支持修复路径的信息", assessment.get("positive_findings", [])), ("需要警惕的信息", assessment.get("risk_findings", [])), ("建议继续观察", assessment.get("watch_points", []))]:
+        if items:
+            st.markdown(f"**{label}**")
+            for item in items[:5]:
+                st.write(f"- {_plain_user_text(item)}")
+
+    external_rows = [
+        {
+            "标题": item.title,
+            "来源": item.source_uri,
+            "参考程度": _confidence_label(item.confidence),
+            "相关标的": "、".join(item.metrics.get("related_symbols") or []),
+            "标签": "、".join(_plain_research_tag(tag) for tag in (item.metrics.get("event_tags") or [])),
+        }
+        for item in report.evidence
+        if str(item.evidence_type).startswith("external_")
+    ]
+    if external_rows:
+        st.dataframe(pd.DataFrame(external_rows), use_container_width=True)
+    else:
+        st.caption("本次没有可展示的外部证据。若需要真实联网采集，请开启外部研究证据和允许联网采集，并确认网络与数据源可访问。")
+
+
 def _render_rebalance_comparison(comparison) -> None:
     st.subheader("What-If 调仓比较")
     delta = comparison.delta
@@ -609,6 +709,47 @@ def _render_rebalance_comparison(comparison) -> None:
         st.markdown(comparison.proposed_report.markdown)
     with st.expander("审计信息", expanded=False):
         st.json(comparison.audit)
+
+
+def _render_external_data_status(report: dict) -> None:
+    st.subheader("外部数据状态")
+    rows = []
+    for name, item in (report.get("sources") or {}).items():
+        rows.append(
+            {
+                "数据源": name,
+                "类型": item.get("connector_type"),
+                "状态": _plain_research_status(item.get("status")),
+                "说明": item.get("reason"),
+            }
+        )
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    else:
+        st.info("当前没有注册外部数据连接器。")
+    st.caption("外部数据只作为证据来源；没有来源和抓取记录的内容不会进入报告。")
+
+
+def _render_event_polling(report) -> None:
+    st.subheader("事件源轮询结果")
+    rows = []
+    for ingest in report.ingests:
+        for result in ingest.monitor_results:
+            rows.append(
+                {
+                    "事件源": ingest.source_id,
+                    "事件": result.event_text,
+                    "匹配情景": result.matched_template or "未匹配",
+                    "触发级别": result.trigger_level,
+                    "建议": result.recommended_action,
+                }
+            )
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    else:
+        st.info("没有事件触发情景模板。")
+    if report.alerts:
+        st.warning("产生提醒：" + "；".join(item.message for item in report.alerts))
 
 
 def _render_backtest(report) -> None:

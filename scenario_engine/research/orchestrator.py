@@ -226,9 +226,8 @@ class ResearchOrchestrator:
             status = SourceFetchStatus("external_research", "orchestrator", "skipped", 0, "external research disabled")
             statuses.append(status)
             self.repository.save_source_status(crawl_id, status)
-            stored = self.repository.top_relevant(plan.queries, limit=20)
-            self.repository.finish_crawl(crawl_id, len(stored), 0, 1)
-            return ResearchBundle(plan, stored, [], statuses, agent_traces, self._audit(enabled, "disabled", crawl_id, stored, statuses))
+            self.repository.finish_crawl(crawl_id, 0, 0, 1)
+            return ResearchBundle(plan, [], [], statuses, agent_traces, self._audit(enabled, "disabled", crawl_id, [], statuses))
 
         for source in self.sources:
             self.repository.save_source(source)

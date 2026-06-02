@@ -160,21 +160,28 @@ class ScenarioFullAgentWorkflow:
         query = " ".join([report.scenario_spec.user_query, report.scenario_spec.event_name, *report.scenario_spec.affected_entities])
 
         context_id = report.scenario_id
-        steps.append(
-            self._send_a2a_step(bus, "Scenario Coordinator Agent", "Memory Retrieval Agent", context_id, "检索跨天情景记忆和复盘教训", {"query": query})
-        )
-        steps.append(
-            self._send_a2a_step(bus, "Scenario Coordinator Agent", "Research Retrieval Agent", context_id, "检索本地外部研究证据库", {"query": query})
-        )
-        steps.append(
-            self._send_a2a_step(bus, "Scenario Coordinator Agent", "RAG Retrieval Agent", context_id, "检索本地图谱和文本证据", {"query": query})
-        )
+        memory_step = self._send_a2a_step(bus, "Scenario Coordinator Agent", "Memory Retrieval Agent", context_id, "检索跨天情景记忆和复盘教训", {"query": query})
+        steps.append(memory_step)
+        research_step = self._send_a2a_step(bus, "Scenario Coordinator Agent", "Research Retrieval Agent", context_id, "检索本地外部研究证据库", {"query": query})
+        steps.append(research_step)
+        rag_step = self._send_a2a_step(bus, "Scenario Coordinator Agent", "RAG Retrieval Agent", context_id, "检索本地图谱和文本证据", {"query": query})
+        steps.append(rag_step)
+        retrieved_evidence_ids = sorted(set([*research_step.evidence_ids, *rag_step.evidence_ids]))
         for remote_agent, objective in [
             ("Bull Debate Agent", "寻找有证据的正向传导路径"),
             ("Bear Debate Agent", "寻找有证据的负向传导路径"),
             ("Risk Debate Agent", "识别组合脆弱点和数据边界"),
         ]:
-            steps.append(self._send_a2a_step(bus, "Scenario Coordinator Agent", remote_agent, context_id, objective, {}))
+            steps.append(
+                self._send_a2a_step(
+                    bus,
+                    "Scenario Coordinator Agent",
+                    remote_agent,
+                    context_id,
+                    objective,
+                    {"retrieved_evidence_ids": retrieved_evidence_ids},
+                )
+            )
         critic = self._send_a2a_step(
             bus,
             "Scenario Coordinator Agent",
@@ -246,17 +253,17 @@ class ScenarioFullAgentWorkflow:
         register(
             "Bull Debate Agent",
             "通过 A2A task 生成有证据约束的正向传导审查。",
-            lambda task: self._task_from_step(task, self._debate_agent(report, "Bull Debate Agent")),
+            lambda task: self._task_from_step(task, self._debate_agent(report, "Bull Debate Agent", self._task_payload(task).get("retrieved_evidence_ids", []))),
         )
         register(
             "Bear Debate Agent",
             "通过 A2A task 生成有证据约束的负向传导审查。",
-            lambda task: self._task_from_step(task, self._debate_agent(report, "Bear Debate Agent")),
+            lambda task: self._task_from_step(task, self._debate_agent(report, "Bear Debate Agent", self._task_payload(task).get("retrieved_evidence_ids", []))),
         )
         register(
             "Risk Debate Agent",
             "通过 A2A task 识别组合脆弱点和数据边界。",
-            lambda task: self._task_from_step(task, self._debate_agent(report, "Risk Debate Agent")),
+            lambda task: self._task_from_step(task, self._debate_agent(report, "Risk Debate Agent", self._task_payload(task).get("retrieved_evidence_ids", []))),
         )
         register(
             "Evidence Critic Agent",
@@ -387,16 +394,27 @@ class ScenarioFullAgentWorkflow:
 
     def _debate_agents(self, report: ScenarioReport) -> list[AgentReasoningStep]:
         return [
-            self._debate_agent(report, "Bull Debate Agent"),
-            self._debate_agent(report, "Bear Debate Agent"),
-            self._debate_agent(report, "Risk Debate Agent"),
+            self._debate_agent(report, "Bull Debate Agent", []),
+            self._debate_agent(report, "Bear Debate Agent", []),
+            self._debate_agent(report, "Risk Debate Agent", []),
         ]
 
-    def _debate_agent(self, report: ScenarioReport, agent_name: str) -> AgentReasoningStep:
+    def _debate_agent(self, report: ScenarioReport, agent_name: str, retrieved_evidence_ids: list[str] | None = None) -> AgentReasoningStep:
         known = {item.evidence_id for item in report.evidence}
         quantified = [item for item in report.portfolio_impacts if item.base_return_range is not None]
-        evidence_ids = sorted({eid for impact in quantified for eid in impact.evidence_ids if eid in known})
+        retrieved = [eid for eid in (retrieved_evidence_ids or []) if eid in known]
+        evidence_ids = sorted({eid for impact in quantified for eid in impact.evidence_ids if eid in known} | set(retrieved))
+        external_evidence = [
+            item
+            for item in report.evidence
+            if item.evidence_id in evidence_ids and (str(item.evidence_type).startswith("external_") or item.evidence_type in {"knowledge_graph", "graph_text_document"})
+        ]
         observations = []
+        if external_evidence:
+            observations.append(f"本轮辩论纳入 {len(external_evidence)} 条研究/RAG证据，不能只复述量化区间。")
+            observations.extend([f"证据：{item.title}" for item in external_evidence[:3]])
+        else:
+            observations.append("没有可用研究/RAG证据，辩论只能基于本地量化和数据边界。")
         if quantified:
             best = max(quantified, key=lambda item: item.bull_return_range[1] if item.bull_return_range else -1)
             worst = min(quantified, key=lambda item: item.bear_return_range[0] if item.bear_return_range else 1)

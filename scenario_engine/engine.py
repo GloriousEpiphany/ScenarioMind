@@ -17,6 +17,7 @@ from .data_provider import ScenarioDataProvider
 from .event_monitor import EventMonitor
 from .event_scheduler import EventPollingScheduler
 from .enterprise import AccessControl, EnterpriseAudit, ReportVersioner
+from .evidence_adjuster import EvidenceImpactAdjuster
 from .evals import ScenarioEvaluationSuite
 from .external_data import ExternalDataRegistry, McpJsonRpcEventConnector
 from .factors import FactorExposureEstimator
@@ -132,6 +133,7 @@ class ScenarioEngine:
         self.batch_stress_tester = BatchPortfolioStressTester(self._run_for_backtest)
         self.external_data_registry = ExternalDataRegistry()
         self.research_orchestrator = ResearchOrchestrator(self.data_provider, llm_client=self.llm_client)
+        self.evidence_adjuster = EvidenceImpactAdjuster()
         self.multi_asset_coverage_checker = MultiAssetCoverage(self.data_provider)
         self.access_control = AccessControl()
         self.enterprise_audit = EnterpriseAudit()
@@ -220,13 +222,32 @@ class ScenarioEngine:
             constraints.by_symbol,
             proxy_model_impacts,
         )
+        adjustment = self.evidence_adjuster.adjust(
+            research_bundle=research_bundle,
+            impacts=impacts,
+            total_impact=total_impact,
+            paths=paths,
+        )
+        impacts = adjustment.impacts
+        total_impact = adjustment.total_impact
+        paths = adjustment.paths
         self._checkpoint(
             spec.scenario_id,
             "QUANT_READY",
             {"quantified_position_weight": total_impact.get("quantified_position_weight")},
         )
 
-        evidence = external_evidence + shock_evidence + constraints.evidences + analogs.evidences + graph_evidence + exposure_evidence + proxy_evidence + simulator_evidence
+        evidence = (
+            external_evidence
+            + adjustment.evidences
+            + shock_evidence
+            + constraints.evidences
+            + analogs.evidences
+            + graph_evidence
+            + exposure_evidence
+            + proxy_evidence
+            + simulator_evidence
+        )
         audit = {
             "method": (
                 "llm_structured_parser_plus_deterministic_v2_local_data_kg_and_audit_no_llm_numeric_generation"
@@ -248,6 +269,7 @@ class ScenarioEngine:
             "registered_asset_proxies": asset_proxies,
             "external_research": research_bundle.audit,
             "external_research_assessment": self._assess_external_research(research_bundle),
+            "external_research_adjustment": adjustment.audit,
             "agent_research": research_bundle.agent_traces,
             "state_trace": [
                 "CREATED",
@@ -332,7 +354,14 @@ class ScenarioEngine:
             main_risks.extend(self._plain_investor_text(item) for item in worst.key_drivers[:2])
         main_risks.extend(self._plain_investor_text(item) for item in report.uncertainty[:3])
         external_assessment = report.audit.get("external_research_assessment") or {}
+        external_adjustment = report.audit.get("external_research_adjustment") or {}
         main_risks.extend(external_assessment.get("risk_findings", [])[:3])
+        if external_adjustment.get("status") == "applied":
+            direction = external_adjustment.get("direction")
+            if direction == "risk_tilt":
+                main_risks.append("外部证据更偏向风险提示，系统已经把下行情形看得更保守。")
+            elif direction == "mixed_or_uncertain":
+                main_risks.append("外部证据正反信号混合，当前结论的不确定性被上调。")
         actions = [
             "先把该结果当成风险体检：确认最差下沿是否超过你的亏损承受阈值。",
             "若超过阈值，优先降低最大拖累标的或提高现金仓位，再用调仓方案比较功能复测。",

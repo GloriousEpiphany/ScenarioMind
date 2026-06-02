@@ -302,6 +302,17 @@ class ResearchRepository:
                 if doc.evidence_id not in seen:
                     seen.add(doc.evidence_id)
                     docs.append(doc)
+        if len(docs) < limit:
+            for row in self._load_candidate_rows():
+                doc = self._row_to_document(row)
+                if doc.evidence_id in seen:
+                    continue
+                if doc.evidence_score < 0.5 and doc.relevance_score < 0.5:
+                    continue
+                seen.add(doc.evidence_id)
+                docs.append(doc)
+                if len(docs) >= limit:
+                    break
         docs.sort(key=lambda item: item.evidence_score, reverse=True)
         return docs[:limit]
 
