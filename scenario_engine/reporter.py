@@ -90,7 +90,7 @@ class ReportComposer:
             decision.get("bottom_line", report.executive_summary),
             "",
             f"- 风险等级：{decision.get('risk_level', '不可判定')}",
-            f"- 可信度说明：{decision.get('confidence_note', '仅基于本地可审计数据和已接入的 Agent/RAG/LLM 流程。')}",
+            f"- 可信度说明：{decision.get('confidence_note', '仅基于本地可核查数据和已接入的证据流程。')}",
             "",
             "## 普通投资者版摘要",
             "",
@@ -121,6 +121,28 @@ class ReportComposer:
             lines.append(f"- {item}")
         if not decision.get("watch_points"):
             lines.append("- 事件是否按你输入的幅度发生；最大风险持仓是否继续扩大亏损贡献；证据缺口是否被补齐。")
+        sandbox = report.audit.get("financial_sandbox") or {}
+        if sandbox.get("status") == "completed":
+            lines.extend([
+                "",
+                "## 市场可能怎么反应",
+                "",
+                sandbox.get("plain_summary", "系统已完成市场反应推演。"),
+                "",
+            ])
+            for action in sandbox.get("actions", [])[:5]:
+                lines.append(
+                    f"- 第 {action.get('round_num')} 步，{action.get('participant_name')}："
+                    f"{self._clean_user_text(action.get('action_summary'))}"
+                )
+            path_scores = sandbox.get("path_scores") or {}
+            if path_scores:
+                lines.extend(["", "这不是涨跌预测，只是用来判断哪条解释路径更需要关注："])
+                for item in list(path_scores.values())[:4]:
+                    label = self._clean_user_text(item.get("label"))
+                    score = item.get("support_score")
+                    reason = self._clean_user_text(item.get("reason"))
+                    lines.append(f"- {label}：关注度 {score}，{reason}")
         lines.extend([
             "",
             "## 本次分析看什么",

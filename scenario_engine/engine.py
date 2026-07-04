@@ -21,6 +21,7 @@ from .evidence_adjuster import EvidenceImpactAdjuster
 from .evals import ScenarioEvaluationSuite
 from .external_data import ExternalDataRegistry, McpJsonRpcEventConnector
 from .factors import FactorExposureEstimator
+from .financial_sandbox import FinancialSandbox
 from .knowledge_graph import LocalKnowledgeGraph
 from .llm import ScenarioLLMClient, llm_enabled_from_environment
 from .multi_asset import MultiAssetCoverage
@@ -134,6 +135,7 @@ class ScenarioEngine:
         self.external_data_registry = ExternalDataRegistry()
         self.research_orchestrator = ResearchOrchestrator(self.data_provider, llm_client=self.llm_client)
         self.evidence_adjuster = EvidenceImpactAdjuster()
+        self.financial_sandbox = FinancialSandbox()
         self.multi_asset_coverage_checker = MultiAssetCoverage(self.data_provider)
         self.access_control = AccessControl()
         self.enterprise_audit = EnterpriseAudit()
@@ -165,6 +167,8 @@ class ScenarioEngine:
         research_network: bool = False,
         research_source_types: list[str] | None = None,
         research_read_articles: bool = False,
+        enable_financial_sandbox: bool = True,
+        sandbox_rounds: int = 3,
     ) -> ScenarioReport:
         self._require_access(user_id, role, "run_scenario")
         if mode not in {"quick", "standard", "deep"}:
@@ -231,6 +235,23 @@ class ScenarioEngine:
         impacts = adjustment.impacts
         total_impact = adjustment.total_impact
         paths = adjustment.paths
+        sandbox_report = self.financial_sandbox.run(
+            spec=spec,
+            portfolio=portfolio,
+            research_bundle=research_bundle,
+            paths=paths,
+            enabled=enable_financial_sandbox,
+            rounds=sandbox_rounds,
+        )
+        total_impact = {
+            **total_impact,
+            "financial_sandbox_summary": {
+                "enabled": sandbox_report.get("enabled", False),
+                "status": sandbox_report.get("status"),
+                "numeric_generation_allowed": sandbox_report.get("numeric_generation_allowed", False),
+                "plain_summary": sandbox_report.get("plain_summary", ""),
+            },
+        }
         self._checkpoint(
             spec.scenario_id,
             "QUANT_READY",
@@ -270,6 +291,7 @@ class ScenarioEngine:
             "external_research": research_bundle.audit,
             "external_research_assessment": self._assess_external_research(research_bundle),
             "external_research_adjustment": adjustment.audit,
+            "financial_sandbox": sandbox_report,
             "agent_research": research_bundle.agent_traces,
             "state_trace": [
                 "CREATED",
@@ -278,6 +300,7 @@ class ScenarioEngine:
                 "EXTERNAL_RESEARCH_READY" if enable_external_research else "EXTERNAL_RESEARCH_SKIPPED",
                 "EVIDENCE_READY",
                 "QUANT_READY",
+                "FINANCIAL_SANDBOX_READY" if enable_financial_sandbox else "FINANCIAL_SANDBOX_SKIPPED",
                 "AGENT_REVIEW_READY",
                 "VALIDATED",
                 "REPORTED",
@@ -355,7 +378,10 @@ class ScenarioEngine:
         main_risks.extend(self._plain_investor_text(item) for item in report.uncertainty[:3])
         external_assessment = report.audit.get("external_research_assessment") or {}
         external_adjustment = report.audit.get("external_research_adjustment") or {}
+        sandbox = report.audit.get("financial_sandbox") or {}
         main_risks.extend(external_assessment.get("risk_findings", [])[:3])
+        if sandbox.get("status") == "completed":
+            main_risks.append(sandbox.get("plain_summary", "市场反应推演已完成，但不会单独生成涨跌数字。"))
         if external_adjustment.get("status") == "applied":
             direction = external_adjustment.get("direction")
             if direction == "risk_tilt":
@@ -383,6 +409,7 @@ class ScenarioEngine:
                 "未量化持仓占比是否过高",
                 "调仓后下沿是否明显改善",
                 *external_assessment.get("watch_points", [])[:3],
+                *sandbox.get("watch_points", [])[:4],
             ],
             "confidence_note": f"当前量化覆盖约 {total.get('quantified_position_weight', 0):.1%} 的持仓；未覆盖部分仍需要人工判断。",
         }

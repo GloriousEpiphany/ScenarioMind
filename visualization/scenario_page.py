@@ -31,18 +31,24 @@ def show_scenario_page():
 
     with st.sidebar:
         st.subheader("分析设置")
-        as_of_date = st.date_input("基准日期", value=date(2020, 3, 20)).strftime("%Y-%m-%d")
+        as_of_date = st.date_input("从哪一天开始看", value=date(2020, 3, 20)).strftime("%Y-%m-%d")
         horizon_label = st.radio("观察周期", ["1周", "1个月", "3个月", "6个月"], index=1)
         mode_label = st.radio("分析深度", ["快速", "标准", "深度"], index=1)
-        use_llm = st.toggle("LLM 解析情景", value=True)
-        enable_external_research = st.toggle("外部研究证据", value=False, help="启用后才会尝试外部数据采集；失败不会伪造证据。")
-        research_network = st.toggle("允许联网采集", value=False, help="需要本机网络可用；关闭时仅使用本地证据库。")
-        research_source_labels = st.multiselect(
-            "外部研究源",
-            ["政策官网", "公告官网", "RSS", "热榜"],
-            default=["政策官网", "公告官网", "RSS"],
+        use_llm = st.toggle("智能解析我的问题", value=True, help="开启后，系统会先把你的自然语言问题整理成可计算的情景。")
+        enable_financial_sandbox = st.toggle(
+            "解释市场可能怎么反应",
+            value=True,
+            help="用通俗语言说明政策、机构资金、媒体和你的重仓股可能怎样影响结果；它不单独生成涨跌数字。",
         )
-        research_read_articles = st.toggle("读取高相关正文", value=False, help="会增加耗时；默认只用标题/摘要/页面快照。")
+        sandbox_rounds = st.slider("市场反应解释步数", min_value=1, max_value=5, value=3, step=1)
+        enable_external_research = st.toggle("查找新闻/公告证据", value=False, help="启用后才会尝试查找政策、公告和新闻证据；失败不会编造内容。")
+        research_network = st.toggle("允许联网查找", value=False, help="需要本机网络可用；关闭时仅使用本地已保存的证据。")
+        research_source_labels = st.multiselect(
+            "查哪些来源",
+            ["政策官网", "公告官网", "订阅新闻", "市场热榜"],
+            default=["政策官网", "公告官网", "订阅新闻"],
+        )
+        research_read_articles = st.toggle("打开重点文章正文", value=False, help="会增加耗时；默认只用标题、摘要和页面快照。")
         loss_threshold = st.slider("我能承受的月度亏损", min_value=0.03, max_value=0.30, value=0.08, step=0.01)
 
     scenario_options = [
@@ -120,8 +126,8 @@ def show_scenario_page():
         for label, item in {
             "政策官网": "policy",
             "公告官网": "announcement",
-            "RSS": "rss",
-            "热榜": "hotlist",
+            "订阅新闻": "rss",
+            "市场热榜": "hotlist",
         }.items()
         if label in research_source_labels
     ]
@@ -164,6 +170,8 @@ def show_scenario_page():
                 research_network=research_network,
                 research_source_types=research_source_types,
                 research_read_articles=research_read_articles,
+                enable_financial_sandbox=enable_financial_sandbox,
+                sandbox_rounds=sandbox_rounds,
             )
             reverse_report = engine.reverse_stress(
                 loss_threshold=loss_threshold,
@@ -205,9 +213,9 @@ def show_scenario_page():
     cols = st.columns(4)
     base_range = total.get("base_range")
     cols[0].metric("风险等级", decision.get("risk_level", "不可判定"))
-    cols[1].metric("组合冲击区间", "未量化" if base_range is None else f"{base_range[0]:.2%} ~ {base_range[1]:.2%}")
+    cols[1].metric("组合可能涨跌", "未量化" if base_range is None else f"{base_range[0]:.2%} ~ {base_range[1]:.2%}")
     cols[2].metric("最大风险持仓", _risk_holding(report))
-    cols[3].metric("可量化仓位", f"{total.get('quantified_position_weight', 0):.1%}")
+    cols[3].metric("已覆盖仓位", f"{total.get('quantified_position_weight', 0):.1%}")
 
     with st.container(border=True):
         st.markdown("**普通投资者版摘要**")
@@ -222,18 +230,20 @@ def show_scenario_page():
             for item in decision.get("possible_actions", [])[:5]:
                 st.write(f"- {item}")
 
+    _render_financial_sandbox(report)
+
     st.subheader("关键数字")
     cols = st.columns(4)
-    cols[0].metric("可量化仓位", f"{total.get('quantified_position_weight', 0):.1%}")
-    cols[1].metric("组合冲击区间", "未量化" if base_range is None else f"{base_range[0]:.2%} ~ {base_range[1]:.2%}")
+    cols[0].metric("已覆盖仓位", f"{total.get('quantified_position_weight', 0):.1%}")
+    cols[1].metric("组合可能涨跌", "未量化" if base_range is None else f"{base_range[0]:.2%} ~ {base_range[1]:.2%}")
     risk = _risk_holding(report)
     upside = _upside_holding(report)
     cols[2].metric("最大风险持仓", risk)
-    cols[3].metric("最大正向受益", upside)
+    cols[3].metric("较可能受益", upside)
     if report.uncertainty:
         st.warning("需要你留意：" + "；".join(_plain_user_text(item) for item in report.uncertainty[:3]))
 
-    st.subheader("风险暴露在哪里")
+    st.subheader("风险主要在哪里")
     impacts_df = pd.DataFrame(
         [
             {
@@ -277,13 +287,13 @@ def show_scenario_page():
         if path_chart:
             st.plotly_chart(path_chart, use_container_width=True)
         else:
-            st.caption("缺少可量化路径区间，暂不展示多路径组合收益图。")
+            st.caption("缺少足够数据，暂不展示三种结果对比图。")
     with col2:
         radar = _factor_radar_chart(report)
         if radar:
             st.plotly_chart(radar, use_container_width=True)
         else:
-            st.caption("缺少可估计因子暴露，暂不展示风险因子雷达图。")
+            st.caption("缺少足够数据，暂不展示风险来源图。")
 
     analog_chart = _historical_analog_chart(report)
     if analog_chart:
@@ -652,6 +662,56 @@ def _render_reverse_stress(report) -> None:
         st.markdown(report.markdown)
     with st.expander("审计信息", expanded=False):
         st.json(report.audit)
+
+
+def _render_financial_sandbox(report) -> None:
+    sandbox = report.audit.get("financial_sandbox") or {}
+    if sandbox.get("status") != "completed":
+        return
+    st.subheader("市场可能怎么反应")
+    st.caption("这部分解释市场参与者可能怎么理解这个事件，不单独生成涨跌数字。")
+    st.info(sandbox.get("plain_summary", "系统已完成市场反应推演。"))
+
+    actions = sandbox.get("actions") or []
+    if actions:
+        rows = [
+            {
+                "步骤": item.get("round_num"),
+                "谁在反应": item.get("participant_name"),
+                "发生什么": _plain_user_text(item.get("action_summary")),
+                "是否需要重算": "可能需要" if item.get("requires_quant_recalc") else "暂不需要",
+            }
+            for item in actions[:5]
+        ]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    path_scores = sandbox.get("path_scores") or {}
+    if path_scores:
+        st.markdown("**哪条解释路径更值得关注**")
+        score_rows = [
+            {
+                "路径": _plain_user_text(item.get("label")),
+                "关注度": item.get("support_score"),
+                "怎么理解": _plain_user_text(item.get("reason")),
+            }
+            for item in path_scores.values()
+        ]
+        st.dataframe(
+            pd.DataFrame(score_rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={"关注度": st.column_config.NumberColumn(format="%.2f")},
+        )
+
+    watch_points = sandbox.get("watch_points") or []
+    if watch_points:
+        st.markdown("**接下来重点看什么**")
+        for point in watch_points[:5]:
+            st.write(f"- {_plain_user_text(point)}")
+
+    graph_summary = sandbox.get("graph_summary") or {}
+    if graph_summary:
+        st.caption(_plain_user_text(graph_summary.get("plain_description", "")))
 
 
 def _render_external_research(report) -> None:

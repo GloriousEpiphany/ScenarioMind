@@ -2020,6 +2020,62 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertTrue(any("external_policy_support" in step["evidence_ids"] for step in debate_steps))
         self.assertTrue(any("本轮辩论纳入" in " ".join(step["observations"]) for step in debate_steps))
 
+    def test_v2_1_financial_sandbox_is_audited_and_non_numeric(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我的平安银行持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_financial_sandbox=True,
+                sandbox_rounds=3,
+            )
+        finally:
+            engine.close()
+
+        sandbox = report.audit["financial_sandbox"]
+        self.assertEqual(sandbox["status"], "completed")
+        self.assertFalse(sandbox["numeric_generation_allowed"])
+        self.assertTrue(sandbox["participants"])
+        self.assertTrue(sandbox["actions"])
+        self.assertIn("FINANCIAL_SANDBOX_READY", report.audit["state_trace"])
+        self.assertIn("financial_sandbox_summary", report.portfolio_total_impact)
+        self.assertIn("市场可能怎么反应", report.markdown)
+        self.assertIn("不单独产生收益数字", sandbox["plain_summary"])
+        for banned in ["MiroFish", "order-book", "evidence_id", "market_beta"]:
+            self.assertNotIn(banned, report.markdown)
+
+    def test_v2_1_financial_sandbox_can_be_disabled(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_financial_sandbox=False,
+            )
+        finally:
+            engine.close()
+
+        sandbox = report.audit["financial_sandbox"]
+        self.assertEqual(sandbox["status"], "disabled")
+        self.assertIn("FINANCIAL_SANDBOX_SKIPPED", report.audit["state_trace"])
+        self.assertNotIn("## 市场可能怎么反应", report.markdown)
+
+    def test_frontend_exposes_sandbox_with_plain_language(self):
+        with open("visualization/scenario_page.py", encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertIn("解释市场可能怎么反应", source)
+        self.assertIn("_render_financial_sandbox", source)
+        self.assertIn("查找新闻/公告证据", source)
+        self.assertIn("组合可能涨跌", source)
+        self.assertNotIn("LLM 解析情景", source)
+        self.assertNotIn("\"RSS\"", source)
+
 
 if __name__ == "__main__":
     unittest.main()

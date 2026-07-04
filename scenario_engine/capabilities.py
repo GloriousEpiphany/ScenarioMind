@@ -87,7 +87,24 @@ def build_capability_report(external_sources: dict | None = None) -> dict:
         },
         "v2_external_data_and_graphrag": {
             "status": "partial" if available_external else "local_only",
-            "implemented": ["local property graph", "manual graph import", "MCP JSON-RPC tools/call adapter", "GDELT DOC connector"],
+            "implemented": [
+                "local property graph",
+                "manual graph import",
+                "deterministic financial participant sandbox",
+                "MCP JSON-RPC tools/call adapter",
+                "GDELT DOC connector",
+            ],
             "not_claimed": ["external GraphRAG service", "LightRAG backend", "Neo4j/LlamaIndex property graph backend"],
+        },
+        "v2_1_financial_sandbox": {
+            "status": "implemented",
+            "implemented": [
+                "local financial participant profiles",
+                "market reaction steps",
+                "path attention scores",
+                "plain-language Streamlit display",
+                "no numeric generation from sandbox",
+            ],
+            "not_claimed": ["order-book simulation", "autonomous trading agents", "MiroFish runtime dependency"],
         },
     }
