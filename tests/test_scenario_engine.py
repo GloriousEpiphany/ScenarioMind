@@ -12,6 +12,8 @@ from scenario_engine import (
     get_golden_scenarios,
     get_scenario_report_schema,
     get_scenario_spec_schema,
+    get_v2_1_financial_contract_schemas,
+    get_v2_2_recursive_contract_schemas,
     validate_runtime_environment,
 )
 from scenario_engine.schema_contracts import validate_required_contract
@@ -2047,6 +2049,66 @@ class ScenarioEngineTestCase(unittest.TestCase):
         for banned in ["MiroFish", "order-book", "evidence_id", "market_beta"]:
             self.assertNotIn(banned, report.markdown)
 
+    def test_v2_1_financial_contracts_validate_sandbox_outputs(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我重仓平安银行，会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_financial_sandbox=True,
+                sandbox_rounds=4,
+            )
+        finally:
+            engine.close()
+
+        schemas = get_v2_1_financial_contract_schemas()
+        sandbox = report.audit["financial_sandbox"]
+        graph = sandbox["financial_graph"]
+        self.assertEqual(validate_required_contract(graph["nodes"][0], schemas["FinancialGraphNode"]), [])
+        self.assertEqual(validate_required_contract(graph["edges"][0], schemas["FinancialGraphEdge"]), [])
+        self.assertEqual(validate_required_contract(sandbox["participants"][0], schemas["MarketParticipantProfile"]), [])
+        self.assertEqual(validate_required_contract(sandbox["config"], schemas["FinancialSandboxConfig"]), [])
+        self.assertEqual(validate_required_contract(sandbox["actions"][0], schemas["FinancialAgentAction"]), [])
+        node_types = {node["node_type"] for node in graph["nodes"]}
+        self.assertIn("PolicyAuthority", node_types)
+        self.assertIn("PortfolioPosition", node_types)
+        self.assertIn("MacroFactor", node_types)
+        self.assertTrue(sandbox["quant_recalc_requests"])
+        self.assertTrue(all(not trace["audit"]["numeric_generation_allowed"] for trace in sandbox["agent_traces"]))
+        self.assertIn("对你的组合意味着什么", report.markdown)
+        self.assertIn("数据边界、模型边界与合规说明", report.markdown)
+
+    def test_v2_1_sandbox_persistence_tables_are_written(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我重仓平安银行，会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_financial_sandbox=True,
+                sandbox_rounds=3,
+            )
+        finally:
+            engine.close()
+        conn = self.db.connect()
+        node_count = conn.execute("SELECT COUNT(*) FROM scenario_financial_graph_nodes").fetchone()[0]
+        edge_count = conn.execute("SELECT COUNT(*) FROM scenario_financial_graph_edges").fetchone()[0]
+        config_count = conn.execute("SELECT COUNT(*) FROM scenario_sandbox_configs WHERE scenario_id = ?", (report.scenario_id,)).fetchone()[0]
+        run_count = conn.execute("SELECT COUNT(*) FROM scenario_sandbox_runs WHERE scenario_id = ?", (report.scenario_id,)).fetchone()[0]
+        action_count = conn.execute("SELECT COUNT(*) FROM scenario_sandbox_actions").fetchone()[0]
+        trace_count = conn.execute("SELECT COUNT(*) FROM scenario_agent_traces WHERE scenario_id = ?", (report.scenario_id,)).fetchone()[0]
+        self.assertGreater(node_count, 0)
+        self.assertGreater(edge_count, 0)
+        self.assertEqual(config_count, 1)
+        self.assertEqual(run_count, 1)
+        self.assertGreater(action_count, 0)
+        self.assertGreater(trace_count, 0)
+
     def test_v2_1_financial_sandbox_can_be_disabled(self):
         engine = ScenarioEngine(self.db_path, persist=False)
         try:
@@ -2066,13 +2128,111 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertIn("FINANCIAL_SANDBOX_SKIPPED", report.audit["state_trace"])
         self.assertNotIn("## 市场可能怎么反应", report.markdown)
 
+    def test_v2_2_future_events_are_hypotheses_not_evidence(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我重仓平安银行，会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_financial_sandbox=True,
+                enable_future_event_generation=True,
+                max_future_events=4,
+            )
+        finally:
+            engine.close()
+
+        forecast = report.audit["recursive_forecast"]
+        self.assertTrue(forecast["future_events"])
+        self.assertTrue(forecast["branches"])
+        self.assertIn("后续可能事件树", report.markdown)
+        self.assertIn("生成内容边界", report.markdown)
+        for event in forecast["future_events"]:
+            self.assertEqual(event["boundary_label"], "generated_hypothesis")
+        for packet in forecast["information_packets"]:
+            self.assertEqual(packet["evidence_boundary"], "generated_hypothesis")
+            self.assertFalse(packet["structured_facts"]["is_observed_evidence"])
+            self.assertIn("直接修改组合收益区间", packet["disallowed_uses"])
+        generated_ids = {packet["packet_id"] for packet in forecast["information_packets"]}
+        evidence_ids = {item.evidence_id for item in report.evidence}
+        self.assertFalse(generated_ids & evidence_ids)
+
+    def test_v2_2_recursive_contracts_and_budget_control(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我重仓平安银行，会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_financial_sandbox=True,
+                enable_future_event_generation=True,
+                enable_recursive_forecast=True,
+                max_future_events=3,
+                max_branch_depth=1,
+                max_total_branch_runs=2,
+                require_user_confirmation_for_generated_branches=False,
+            )
+        finally:
+            engine.close()
+
+        schemas = get_v2_2_recursive_contract_schemas()
+        forecast = report.audit["recursive_forecast"]
+        self.assertEqual(validate_required_contract(forecast, schemas["RecursiveScenarioForecast"]), [])
+        self.assertEqual(validate_required_contract(forecast["future_events"][0], schemas["FutureEventHypothesis"]), [])
+        self.assertEqual(validate_required_contract(forecast["information_packets"][0], schemas["GeneratedInformationPacket"]), [])
+        self.assertEqual(validate_required_contract(forecast["branches"][0], schemas["ScenarioBranch"]), [])
+        self.assertLessEqual(len(forecast["future_events"]), 3)
+        self.assertLessEqual(forecast["audit"]["child_runs_completed"], 2)
+        self.assertTrue(all(branch["depth"] <= 1 for branch in forecast["branches"]))
+        self.assertTrue(all(branch["event_hypothesis"]["boundary_label"] == "generated_hypothesis" for branch in forecast["branches"]))
+
+    def test_v2_2_recursive_persistence_tables_are_written_without_external_evidence_pollution(self):
+        engine = ScenarioEngine(self.db_path, persist=True)
+        try:
+            report = engine.run(
+                user_query="如果央行降息25bp，我重仓平安银行，会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_financial_sandbox=True,
+                enable_future_event_generation=True,
+                max_future_events=3,
+            )
+        finally:
+            engine.close()
+
+        conn = self.db.connect()
+        event_count = conn.execute("SELECT COUNT(*) FROM scenario_future_event_hypotheses WHERE root_scenario_id = ?", (report.scenario_id,)).fetchone()[0]
+        packet_count = conn.execute("SELECT COUNT(*) FROM scenario_generated_information_packets").fetchone()[0]
+        branch_count = conn.execute("SELECT COUNT(*) FROM scenario_branches WHERE root_scenario_id = ?", (report.scenario_id,)).fetchone()[0]
+        forecast_count = conn.execute("SELECT COUNT(*) FROM scenario_recursive_forecasts WHERE root_scenario_id = ?", (report.scenario_id,)).fetchone()[0]
+        external_generated_count = conn.execute(
+            "SELECT COUNT(*) FROM scenario_external_evidence WHERE evidence_id LIKE 'packet_%' OR evidence_id LIKE 'future_event_%'"
+        ).fetchone()[0]
+        self.assertGreater(event_count, 0)
+        self.assertGreater(packet_count, 0)
+        self.assertGreater(branch_count, 0)
+        self.assertEqual(forecast_count, 1)
+        self.assertEqual(external_generated_count, 0)
+
     def test_frontend_exposes_sandbox_with_plain_language(self):
         with open("visualization/scenario_page.py", encoding="utf-8") as fh:
             source = fh.read()
         self.assertIn("解释市场可能怎么反应", source)
         self.assertIn("_render_financial_sandbox", source)
+        self.assertIn("谁会影响这件事", source)
+        self.assertIn("哪些情况会改变判断", source)
+        self.assertIn("_plain_agent_name", source)
         self.assertIn("查找新闻/公告证据", source)
         self.assertIn("组合可能涨跌", source)
+        self.assertIn("生成后续可能事件树", source)
+        self.assertIn("_render_recursive_forecast", source)
+        self.assertIn("假设，不是真实证据", source)
         self.assertNotIn("LLM 解析情景", source)
         self.assertNotIn("\"RSS\"", source)
 

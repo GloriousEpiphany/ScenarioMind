@@ -33,6 +33,7 @@ from .reporter import ReportComposer
 from .report_exporter import ReportExporter
 from .repository import ScenarioRepository
 from .research import ResearchOrchestrator
+from .recursive_forecast import RecursiveForecastEngine
 from .reverse_stress import ReverseStressEngine
 from .schema_contracts import SCENARIO_REPORT_SCHEMA, SCENARIO_SPEC_SCHEMA, validate_required_contract
 from .schemas import (
@@ -136,6 +137,7 @@ class ScenarioEngine:
         self.research_orchestrator = ResearchOrchestrator(self.data_provider, llm_client=self.llm_client)
         self.evidence_adjuster = EvidenceImpactAdjuster()
         self.financial_sandbox = FinancialSandbox()
+        self.recursive_forecaster = RecursiveForecastEngine()
         self.multi_asset_coverage_checker = MultiAssetCoverage(self.data_provider)
         self.access_control = AccessControl()
         self.enterprise_audit = EnterpriseAudit()
@@ -167,8 +169,17 @@ class ScenarioEngine:
         research_network: bool = False,
         research_source_types: list[str] | None = None,
         research_read_articles: bool = False,
+        enable_financial_graph: bool = True,
+        enable_sandbox: bool | None = None,
         enable_financial_sandbox: bool = True,
         sandbox_rounds: int = 3,
+        sandbox_interventions: list[dict] | None = None,
+        enable_future_event_generation: bool = False,
+        enable_recursive_forecast: bool = False,
+        max_future_events: int = 5,
+        max_branch_depth: int = 1,
+        max_total_branch_runs: int = 5,
+        require_user_confirmation_for_generated_branches: bool = True,
     ) -> ScenarioReport:
         self._require_access(user_id, role, "run_scenario")
         if mode not in {"quick", "standard", "deep"}:
@@ -235,13 +246,15 @@ class ScenarioEngine:
         impacts = adjustment.impacts
         total_impact = adjustment.total_impact
         paths = adjustment.paths
+        sandbox_enabled = enable_financial_sandbox if enable_sandbox is None else enable_sandbox
         sandbox_report = self.financial_sandbox.run(
             spec=spec,
             portfolio=portfolio,
             research_bundle=research_bundle,
             paths=paths,
-            enabled=enable_financial_sandbox,
+            enabled=bool(enable_financial_graph and sandbox_enabled),
             rounds=sandbox_rounds,
+            interventions=sandbox_interventions,
         )
         total_impact = {
             **total_impact,
@@ -293,6 +306,7 @@ class ScenarioEngine:
             "external_research_adjustment": adjustment.audit,
             "financial_sandbox": sandbox_report,
             "agent_research": research_bundle.agent_traces,
+            "agent_sandbox": sandbox_report.get("agent_traces", []),
             "state_trace": [
                 "CREATED",
                 "PARSED",
@@ -300,7 +314,7 @@ class ScenarioEngine:
                 "EXTERNAL_RESEARCH_READY" if enable_external_research else "EXTERNAL_RESEARCH_SKIPPED",
                 "EVIDENCE_READY",
                 "QUANT_READY",
-                "FINANCIAL_SANDBOX_READY" if enable_financial_sandbox else "FINANCIAL_SANDBOX_SKIPPED",
+                "FINANCIAL_SANDBOX_READY" if bool(enable_financial_graph and sandbox_enabled) else "FINANCIAL_SANDBOX_SKIPPED",
                 "AGENT_REVIEW_READY",
                 "VALIDATED",
                 "REPORTED",
@@ -320,6 +334,40 @@ class ScenarioEngine:
         report.audit["agent_review"] = [item.__dict__ for item in self.agent_review.review(report)]
         report.audit["investor_decision"] = self._build_investor_decision(report)
         self._attach_llm_investor_synthesis(report)
+        if enable_future_event_generation or enable_recursive_forecast:
+            report.audit["recursive_forecast"] = self._build_recursive_forecast(
+                root_report=report,
+                portfolio=portfolio,
+                mode=mode,
+                horizon=horizon,
+                enable_recursive_forecast=enable_recursive_forecast,
+                max_future_events=max_future_events,
+                max_branch_depth=max_branch_depth,
+                max_total_branch_runs=max_total_branch_runs,
+                require_user_confirmation_for_generated_branches=require_user_confirmation_for_generated_branches,
+                research_source_types=research_source_types,
+                enable_external_research=enable_external_research,
+                research_network=research_network,
+                research_read_articles=research_read_articles,
+                enable_financial_graph=enable_financial_graph,
+                sandbox_enabled=bool(enable_financial_graph and sandbox_enabled),
+                sandbox_rounds=sandbox_rounds,
+            ).to_dict()
+            report.portfolio_total_impact = {
+                **report.portfolio_total_impact,
+                "recursive_forecast_summary": {
+                    "enabled": True,
+                    "future_event_count": len(report.audit["recursive_forecast"].get("future_events") or []),
+                    "branch_count": len(report.audit["recursive_forecast"].get("branches") or []),
+                    "completed_branch_runs": report.audit["recursive_forecast"].get("audit", {}).get("child_runs_completed", 0),
+                    "numeric_generation_allowed": False,
+                },
+            }
+        else:
+            report.audit["recursive_forecast"] = {
+                "status": "disabled",
+                "boundary": "未开启后续假设分支生成。",
+            }
         self._checkpoint(spec.scenario_id, "AGENT_REVIEW_READY", {"reviewer_count": len(report.audit["agent_review"])})
         report.markdown = self.reporter._to_markdown(report)
         report.audit["scenario_evals"] = self.evaluation_suite.evaluate(report)
@@ -335,6 +383,8 @@ class ScenarioEngine:
             report.audit["state_trace"].append("SAVED_TO_MEMORY")
             report.markdown = self.reporter._to_markdown(report)
             self.repository.save(report)
+            self.repository.save_financial_sandbox(report)
+            self.repository.save_recursive_forecast(report)
             self.repository.save_memory_from_report(report)
             self._checkpoint(spec.scenario_id, "SAVED_TO_MEMORY", {"memory_type": "event_memory"})
             self._trace(
@@ -346,6 +396,89 @@ class ScenarioEngine:
                 model_snapshot_id=report.audit["model_snapshot_id"],
             )
         return report
+
+    def run_recursive_forecast(
+        self,
+        root_query: str,
+        as_of_date: str,
+        portfolio: PortfolioSnapshot,
+        max_depth: int = 1,
+        max_branches_per_node: int = 3,
+        max_total_runs: int = 5,
+        confirmed: bool = False,
+        mode: str = "deep",
+        horizon: str | None = None,
+    ):
+        """Run a root scenario plus bounded generated hypothesis branches."""
+        return self.run(
+            user_query=root_query,
+            as_of_date=as_of_date,
+            portfolio=portfolio,
+            horizon=horizon,
+            mode=mode,
+            confirmed=confirmed,
+            enable_financial_sandbox=True,
+            sandbox_rounds=4,
+            enable_future_event_generation=True,
+            enable_recursive_forecast=True,
+            max_future_events=max_branches_per_node,
+            max_branch_depth=max_depth,
+            max_total_branch_runs=max_total_runs,
+            require_user_confirmation_for_generated_branches=False,
+            persist=False,
+        )
+
+    def _build_recursive_forecast(
+        self,
+        *,
+        root_report: ScenarioReport,
+        portfolio: PortfolioSnapshot,
+        mode: str,
+        horizon: str | None,
+        enable_recursive_forecast: bool,
+        max_future_events: int,
+        max_branch_depth: int,
+        max_total_branch_runs: int,
+        require_user_confirmation_for_generated_branches: bool,
+        research_source_types: list[str] | None,
+        enable_external_research: bool,
+        research_network: bool,
+        research_read_articles: bool,
+        enable_financial_graph: bool,
+        sandbox_enabled: bool,
+        sandbox_rounds: int,
+    ):
+        run_children = bool(enable_recursive_forecast and not require_user_confirmation_for_generated_branches)
+
+        def child_runner(query: str) -> ScenarioReport:
+            return self.run(
+                user_query=query,
+                as_of_date=root_report.as_of_date,
+                portfolio=portfolio,
+                horizon=horizon,
+                mode=mode,
+                persist=False,
+                confirmed=True,
+                enable_external_research=enable_external_research,
+                research_network=research_network,
+                research_source_types=research_source_types,
+                research_read_articles=research_read_articles,
+                enable_financial_graph=enable_financial_graph,
+                enable_financial_sandbox=sandbox_enabled,
+                sandbox_rounds=sandbox_rounds,
+                enable_future_event_generation=False,
+                enable_recursive_forecast=False,
+            )
+
+        return self.recursive_forecaster.build(
+            root_report=root_report,
+            portfolio=portfolio,
+            max_future_events=max_future_events,
+            max_branch_depth=max_branch_depth,
+            max_total_branch_runs=max_total_branch_runs,
+            run_children=run_children,
+            child_runner=child_runner,
+        )
 
     def _build_investor_decision(self, report: ScenarioReport) -> dict:
         total = report.portfolio_total_impact

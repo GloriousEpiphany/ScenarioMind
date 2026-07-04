@@ -7,7 +7,12 @@ or documented templates.
 """
 
 from .engine import ScenarioEngine
-from .schema_contracts import get_scenario_report_schema, get_scenario_spec_schema
+from .schema_contracts import (
+    get_scenario_report_schema,
+    get_scenario_spec_schema,
+    get_v2_1_financial_contract_schemas,
+    get_v2_2_recursive_contract_schemas,
+)
 from .capabilities import build_capability_report
 from .golden_scenarios import get_golden_scenarios
 from .environment import validate_runtime_environment
@@ -76,6 +81,8 @@ __all__ = [
     "EventPollingScheduler",
     "get_scenario_report_schema",
     "get_scenario_spec_schema",
+    "get_v2_1_financial_contract_schemas",
+    "get_v2_2_recursive_contract_schemas",
     "build_capability_report",
     "get_golden_scenarios",
     "validate_runtime_environment",

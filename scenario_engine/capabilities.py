@@ -99,12 +99,36 @@ def build_capability_report(external_sources: dict | None = None) -> dict:
         "v2_1_financial_sandbox": {
             "status": "implemented",
             "implemented": [
+                "built-in financial ontology",
+                "financial graph node and edge contracts",
                 "local financial participant profiles",
+                "stepwise sandbox configuration",
                 "market reaction steps",
+                "sandbox state and action audit",
+                "sandbox persistence tables",
+                "agent trace records for sandbox stages",
                 "path attention scores",
                 "plain-language Streamlit display",
                 "no numeric generation from sandbox",
             ],
             "not_claimed": ["order-book simulation", "autonomous trading agents", "MiroFish runtime dependency"],
+        },
+        "v2_2_recursive_forecast": {
+            "status": "implemented",
+            "implemented": [
+                "deterministic future-event hypothesis generation",
+                "generated information packet boundary gate",
+                "scenario branch queue",
+                "bounded recursive child scenario runs",
+                "multi-branch synthesis",
+                "recursive forecast persistence tables",
+                "plain-language report and Streamlit display",
+                "generated hypotheses kept separate from external evidence",
+            ],
+            "not_claimed": [
+                "unbounded autonomous recursion",
+                "generated news treated as observed evidence",
+                "LLM-generated numeric impacts",
+            ],
         },
     }

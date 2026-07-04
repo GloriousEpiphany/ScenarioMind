@@ -41,6 +41,18 @@ def show_scenario_page():
             help="用通俗语言说明政策、机构资金、媒体和你的重仓股可能怎样影响结果；它不单独生成涨跌数字。",
         )
         sandbox_rounds = st.slider("市场反应解释步数", min_value=1, max_value=5, value=3, step=1)
+        enable_future_event_generation = st.toggle(
+            "生成后续可能事件树",
+            value=True,
+            help="列出接下来可能需要验证的分支，并明确标注为假设，不当作真实新闻或公告。",
+        )
+        enable_recursive_forecast = st.toggle(
+            "自动深度推演少量分支",
+            value=False,
+            help="开启后，系统会挑选少量高优先级假设分支再次跑压力测试；会更耗时。",
+        )
+        max_future_events = st.slider("最多生成几个后续分支", min_value=1, max_value=5, value=4, step=1)
+        max_total_branch_runs = st.slider("最多自动推演几个分支", min_value=0, max_value=3, value=1, step=1)
         enable_external_research = st.toggle("查找新闻/公告证据", value=False, help="启用后才会尝试查找政策、公告和新闻证据；失败不会编造内容。")
         research_network = st.toggle("允许联网查找", value=False, help="需要本机网络可用；关闭时仅使用本地已保存的证据。")
         research_source_labels = st.multiselect(
@@ -172,6 +184,12 @@ def show_scenario_page():
                 research_read_articles=research_read_articles,
                 enable_financial_sandbox=enable_financial_sandbox,
                 sandbox_rounds=sandbox_rounds,
+                enable_future_event_generation=enable_future_event_generation,
+                enable_recursive_forecast=enable_recursive_forecast,
+                max_future_events=max_future_events,
+                max_branch_depth=1,
+                max_total_branch_runs=max_total_branch_runs,
+                require_user_confirmation_for_generated_branches=not enable_recursive_forecast,
             )
             reverse_report = engine.reverse_stress(
                 loss_threshold=loss_threshold,
@@ -231,6 +249,7 @@ def show_scenario_page():
                 st.write(f"- {item}")
 
     _render_financial_sandbox(report)
+    _render_recursive_forecast(report)
 
     st.subheader("关键数字")
     cols = st.columns(4)
@@ -525,6 +544,35 @@ def _plain_research_tag(tag: object) -> str:
     }.get(str(tag or ""), str(tag or ""))
 
 
+def _plain_agent_name(name: object) -> str:
+    return {
+        "OntologyAgent": "关系图检查",
+        "ProfileAgent": "市场角色检查",
+        "SandboxConfigAgent": "推演步骤检查",
+        "FinancialSandboxRunner": "市场反应推演",
+        "RetailReportAgent": "通俗表达检查",
+        "PolicyAgent": "政策口径检查",
+        "RiskAgent": "组合风险检查",
+        "EvidenceCriticAgent": "证据质量检查",
+    }.get(str(name or ""), _plain_user_text(name))
+
+
+def _plain_tool_call(name: object) -> str:
+    return {
+        "load_builtin_financial_ontology": "读取金融关系模板",
+        "build_financial_graph": "连接事件、持仓和证据",
+        "load_profile_templates": "读取市场角色模板",
+        "attach_portfolio_context": "加入你的持仓",
+        "generate_time_config": "生成时间步骤",
+        "generate_event_config": "整理事件条件",
+        "generate_observation_metrics": "整理观察信号",
+        "advance_rounds": "推进反应步骤",
+        "record_actions": "记录每一步动作",
+        "emit_quant_recalc_requests": "提示是否需要复核数字区间",
+        "plain_language_summary": "改写成通俗说法",
+    }.get(str(name or ""), _plain_user_text(name))
+
+
 def _render_empty_state() -> None:
     st.subheader("你会得到什么")
     cols = st.columns(3)
@@ -672,11 +720,29 @@ def _render_financial_sandbox(report) -> None:
     st.caption("这部分解释市场参与者可能怎么理解这个事件，不单独生成涨跌数字。")
     st.info(sandbox.get("plain_summary", "系统已完成市场反应推演。"))
 
+    participants = sandbox.get("participants") or []
+    if participants:
+        st.markdown("**谁会影响这件事**")
+        participant_rows = []
+        for item in participants[:8]:
+            delay = item.get("response_delay") or {}
+            participant_rows.append(
+                {
+                    "角色": item.get("name"),
+                    "怎么看": _plain_user_text(item.get("mandate")),
+                    "通常何时反应": _plain_user_text(delay.get("plain", "")),
+                    "会受什么限制": "；".join(_plain_user_text(text) for text in (item.get("constraints") or [])[:2]),
+                }
+            )
+        st.dataframe(pd.DataFrame(participant_rows), use_container_width=True, hide_index=True)
+
     actions = sandbox.get("actions") or []
     if actions:
+        st.markdown("**一步步可能发生什么**")
         rows = [
             {
                 "步骤": item.get("round_num"),
+                "时间": item.get("simulated_time"),
                 "谁在反应": item.get("participant_name"),
                 "发生什么": _plain_user_text(item.get("action_summary")),
                 "是否需要重算": "可能需要" if item.get("requires_quant_recalc") else "暂不需要",
@@ -703,6 +769,12 @@ def _render_financial_sandbox(report) -> None:
             column_config={"关注度": st.column_config.NumberColumn(format="%.2f")},
         )
 
+    triggered = sandbox.get("triggered_conditions") or []
+    if triggered:
+        st.markdown("**哪些情况会改变判断**")
+        for item in triggered[:5]:
+            st.write(f"- {_plain_user_text(item.get('plain'))}")
+
     watch_points = sandbox.get("watch_points") or []
     if watch_points:
         st.markdown("**接下来重点看什么**")
@@ -712,6 +784,88 @@ def _render_financial_sandbox(report) -> None:
     graph_summary = sandbox.get("graph_summary") or {}
     if graph_summary:
         st.caption(_plain_user_text(graph_summary.get("plain_description", "")))
+        st.caption(f"本次本地图谱连接了 {graph_summary.get('node_count', 0)} 个对象和 {graph_summary.get('edge_count', 0)} 条关系，用来解释路径，不预测价格。")
+
+    traces = sandbox.get("agent_traces") or []
+    if traces:
+        with st.expander("这段解释是怎么生成的", expanded=False):
+            trace_rows = [
+                {
+                    "检查者": _plain_agent_name(item.get("agent_name")),
+                    "做了什么": "、".join(_plain_tool_call(tool) for tool in (item.get("tool_calls") or [])[:3]),
+                    "边界": "不生成涨跌数字",
+                }
+                for item in traces[:6]
+            ]
+            st.dataframe(pd.DataFrame(trace_rows), use_container_width=True, hide_index=True)
+
+
+def _render_recursive_forecast(report) -> None:
+    forecast = report.audit.get("recursive_forecast") or {}
+    if not forecast or forecast.get("status") == "disabled":
+        return
+    st.subheader("后续可能事件树")
+    st.caption("这里列出的是压力测试用的假设分支，不是已经发生的新闻、公告或财报。")
+
+    branches = forecast.get("branches") or []
+    if not branches:
+        st.info("本次没有生成可用的后续假设分支。")
+        return
+
+    rows = []
+    for branch in branches[:5]:
+        event = branch.get("event_hypothesis") or {}
+        rows.append(
+            {
+                "假设分支": _plain_user_text(event.get("title")),
+                "为什么要看": _plain_user_text(event.get("generation_reason")),
+                "当前状态": _plain_branch_status(branch.get("run_status")),
+                "重点观察": "；".join(_plain_user_text(item) for item in (event.get("watch_signals") or [])[:4]),
+                "边界": "假设，不是真实证据",
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    summary = forecast.get("branch_impact_summary") or {}
+    cols = st.columns(3)
+    cols[0].metric("已自动推演", f"{summary.get('completed_branch_count', 0)} 个")
+    cols[1].metric("等待确认", f"{summary.get('queued_branch_count', 0)} 个")
+    cols[2].metric("是否生成涨跌数字", "否")
+
+    branch_reports = summary.get("child_ranges") or []
+    if branch_reports:
+        st.markdown("**已跑完的子情景**")
+        child_rows = [
+            {
+                "分支": _plain_user_text(item.get("title")),
+                "组合可能涨跌": "未量化" if item.get("base_range") is None else f"{item['base_range'][0]:.2%} ~ {item['base_range'][1]:.2%}",
+                "风险等级": item.get("risk_level", "不可判定"),
+                "说明": _plain_user_text(item.get("plain_summary")),
+            }
+            for item in branch_reports[:5]
+        ]
+        st.dataframe(pd.DataFrame(child_rows), use_container_width=True, hide_index=True)
+
+    if forecast.get("common_risks"):
+        st.markdown("**共同风险**")
+        for item in forecast.get("common_risks", [])[:5]:
+            st.write(f"- {_plain_user_text(item)}")
+    if forecast.get("watchlist"):
+        st.markdown("**接下来重点看什么**")
+        for item in forecast.get("watchlist", [])[:6]:
+            st.write(f"- {_plain_user_text(item)}")
+
+    with st.expander("假设分支边界", expanded=False):
+        st.write("这些分支只用来提醒你后续要验证什么，不能当作真实公告、新闻、财报或行情。")
+        st.write("即使自动跑了子情景，涨跌区间也仍然来自本地量化链，不由这些假设直接生成。")
+
+
+def _plain_branch_status(status: object) -> str:
+    return {
+        "queued": "等待你确认",
+        "completed": "已跑完",
+        "failed": "运行失败",
+    }.get(str(status or ""), "未运行")
 
 
 def _render_external_research(report) -> None:

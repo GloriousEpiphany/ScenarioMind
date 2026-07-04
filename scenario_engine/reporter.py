@@ -89,12 +89,25 @@ class ReportComposer:
             "",
             decision.get("bottom_line", report.executive_summary),
             "",
+            "## 行动判断",
+            "",
+            f"- 当前判断：{self._action_judgement(report, decision)}",
+            "- 这不是自动买卖指令；只有当关键证据被验证后，才适合比较调仓或提高现金后的压力测试结果。",
+            "",
             f"- 风险等级：{decision.get('risk_level', '不可判定')}",
             f"- 可信度说明：{decision.get('confidence_note', '仅基于本地可核查数据和已接入的证据流程。')}",
             "",
             "## 普通投资者版摘要",
             "",
             decision.get("plain_summary", report.executive_summary),
+            "",
+            "## 对你的组合意味着什么",
+            "",
+            self._portfolio_meaning(report),
+            "",
+            "## 最大风险持仓与风险来源",
+            "",
+            self._largest_risk_text(report),
             "",
             "## 你现在可以做什么",
             "",
@@ -130,11 +143,20 @@ class ReportComposer:
                 sandbox.get("plain_summary", "系统已完成市场反应推演。"),
                 "",
             ])
+            participant_text = self._participant_reaction_text(sandbox)
+            if participant_text:
+                lines.append(participant_text)
+                lines.append("")
             for action in sandbox.get("actions", [])[:5]:
                 lines.append(
                     f"- 第 {action.get('round_num')} 步，{action.get('participant_name')}："
                     f"{self._clean_user_text(action.get('action_summary'))}"
                 )
+            triggered = sandbox.get("triggered_conditions") or []
+            if triggered:
+                lines.extend(["", "需要特别注意的反向条件："])
+                for item in triggered[:5]:
+                    lines.append(f"- {self._clean_user_text(item.get('plain'))}")
             path_scores = sandbox.get("path_scores") or {}
             if path_scores:
                 lines.extend(["", "这不是涨跌预测，只是用来判断哪条解释路径更需要关注："])
@@ -143,6 +165,41 @@ class ReportComposer:
                     score = item.get("support_score")
                     reason = self._clean_user_text(item.get("reason"))
                     lines.append(f"- {label}：关注度 {score}，{reason}")
+        recursive = report.audit.get("recursive_forecast") or {}
+        if recursive and recursive.get("status") != "disabled":
+            lines.extend([
+                "",
+                "## 后续可能事件树",
+                "",
+                "下面这些不是已经发生的新闻或公告，而是系统为了做压力测试提出的后续假设。只有被真实证据验证后，才可以把它们当作判断依据。",
+                "",
+            ])
+            branches = recursive.get("branches") or []
+            if branches:
+                for branch in branches[:5]:
+                    event = branch.get("event_hypothesis") or {}
+                    packet = (branch.get("information_packets") or [{}])[0]
+                    title = self._clean_user_text(event.get("title"))
+                    reason = self._clean_user_text(event.get("generation_reason"))
+                    status = self._plain_branch_status(branch.get("run_status"))
+                    lines.append(f"- 假设分支：{title}。为什么要看：{reason}。当前状态：{status}。")
+                    summary = self._clean_user_text(packet.get("plain_summary"))
+                    if summary:
+                        lines.append(f"  说明：{summary}")
+            else:
+                lines.append("- 当前没有生成可用的后续假设分支。")
+            synthesis = recursive.get("branch_impact_summary") or {}
+            lines.extend(["", "## 多分支综合评估", ""])
+            lines.append(
+                f"- 已自动推演分支：{synthesis.get('completed_branch_count', 0)} 个；"
+                f"待用户确认分支：{synthesis.get('queued_branch_count', 0)} 个。"
+            )
+            if recursive.get("common_risks"):
+                lines.append("- 共同风险：" + "；".join(self._clean_user_text(item) for item in recursive.get("common_risks", [])[:4]))
+            if recursive.get("highest_risk_branch_id"):
+                lines.append(f"- 当前最需要警惕的分支ID：{recursive.get('highest_risk_branch_id')}。这只是分支排序，不代表一定发生。")
+            if recursive.get("watchlist"):
+                lines.append("- 后续重点看：" + "；".join(self._clean_user_text(item) for item in recursive.get("watchlist", [])[:6]))
         lines.extend([
             "",
             "## 本次分析看什么",
@@ -163,7 +220,7 @@ class ReportComposer:
             lines.append(
                 f"| {impact.symbol} {impact.name} | {impact.position_weight:.1%} | {base} | {note} |"
             )
-        lines.extend(["", "## 三种结果区间", ""])
+        lines.extend(["", "## 三种结果区间", "", "下面三种情况分别对应正常、更差和更好的解释路径。"])
         for path_name, attr in [("正常情况", "base_return_range"), ("更差情况", "bear_return_range"), ("更好情况", "bull_return_range")]:
             low = 0.0
             high = 0.0
@@ -201,7 +258,7 @@ class ReportComposer:
             for candidate in impact.hedge_candidates
         ]
         if hedge_rows:
-            lines.extend(["", "## 可复核的调仓方向", "", "| 标的 | 可考虑复核的方向 |", "|---|---|"])
+            lines.extend(["", "## 调仓/对冲候选方案", "", "这些只用于压力测试比较，不是要求你立刻交易。", "", "| 标的 | 可考虑复核的方向 |", "|---|---|"])
             for symbol, candidate in hedge_rows:
                 lines.append(f"| {symbol} | {self._clean_user_text(candidate)} |")
         external_research = report.audit.get("external_research") or {}
@@ -230,6 +287,29 @@ class ReportComposer:
         lines.extend(["", "## 参考依据", ""])
         for item in report.evidence:
             lines.append(f"- {self._clean_user_text(item.title)}")
+        agent_review = report.audit.get("agent_review") or []
+        if agent_review:
+            lines.extend(["", "## Agent 审查记录", ""])
+            for item in agent_review[:8]:
+                findings = item.get("findings") or []
+                lines.append(f"- {self._clean_user_text(item.get('reviewer'))}：{self._clean_user_text(findings[0] if findings else '已完成检查。')}")
+        lines.extend(
+            [
+                "",
+                "## 数据边界、模型边界与合规说明",
+                "",
+                f"- 数据边界：{self._clean_user_text(report.audit.get('data_boundary', '仅使用当前可审计数据。'))}",
+                "- 模型边界：收益区间来自本地历史、因子、代理资产或已审计证据修正；沙盘和 Agent 只解释路径，不生成收益数字。",
+                "- 生成内容边界：后续事件树只是假设分支，不能当作真实公告、新闻、财报或行情，也不能直接改变收益区间。",
+                "- 合规说明：本报告用于情景分析和风险沟通，不替代持牌投资顾问意见，不提供确定性买卖指令。",
+                "",
+                "## 可复盘项",
+                "",
+                "- 未来几个交易日复核事件是否按假设发生。",
+                "- 复核最大风险持仓是否继续主导组合涨跌。",
+                "- 复核反向证据是否出现，并用情景复盘功能检查真实结果是否落在区间内。",
+            ]
+        )
         return "\n".join(lines)
 
     def _plain_horizon(self, horizon: str) -> str:
@@ -252,6 +332,59 @@ class ReportComposer:
         if low < 0 < high:
             return "方向不确定，既可能受压也可能修复"
         return "影响较小"
+
+    def _action_judgement(self, report: ScenarioReport, decision: dict) -> str:
+        risk = decision.get("risk_level", "不可判定")
+        base_range = report.portfolio_total_impact.get("base_range")
+        if base_range is None:
+            return "证据不足，先等待确认"
+        if risk == "高":
+            return "需要复核风险，并比较降低集中仓位或提高现金后的结果"
+        if risk == "中":
+            return "暂不急于行动，但要等待关键条件确认"
+        if risk == "低":
+            return "暂不行动，继续观察关键证据"
+        return "等待确认"
+
+    def _portfolio_meaning(self, report: ScenarioReport) -> str:
+        total = report.portfolio_total_impact
+        base_range = total.get("base_range")
+        if base_range is None:
+            return "当前信息不足，系统不能说明组合大致会落在哪个涨跌区间。请先补充事件幅度、时间和持仓。"
+        quantified = total.get("quantified_position_weight", 0.0)
+        return (
+            f"系统目前能覆盖约 {quantified:.1%} 的持仓。可量化部分的组合区间约为 "
+            f"{base_range[0]:.2%} 至 {base_range[1]:.2%}。这个数字用来衡量压力，不代表未来一定会这样走。"
+        )
+
+    def _largest_risk_text(self, report: ScenarioReport) -> str:
+        quantified = [impact for impact in report.portfolio_impacts if impact.expected_contribution_range is not None]
+        if not quantified:
+            return "暂时没有足够数据识别最大风险持仓。"
+        worst = min(quantified, key=lambda item: item.expected_contribution_range[0])
+        drivers = "；".join(self._clean_user_text(item) for item in worst.key_drivers[:2]) or "主要来自本次情景和该持仓的历史波动关系。"
+        return f"最需要先看的持仓是 {worst.symbol} {worst.name}，因为它对组合下沿的拖累最大。主要原因：{drivers}"
+
+    def _participant_reaction_text(self, sandbox: dict) -> str:
+        participants = sandbox.get("participants") or []
+        if not participants:
+            return ""
+        first = next((item for item in participants if item.get("participant_type") == "policy_authority"), participants[0])
+        amplifier = next((item for item in participants if item.get("participant_id") == "retail_and_leverage"), None)
+        buffer = next((item for item in participants if item.get("participant_id") == "institutional_money"), None)
+        parts = [f"谁先反应：{first.get('name')} 通常先决定事件口径是否清楚。"]
+        if amplifier:
+            parts.append(f"谁可能放大波动：{amplifier.get('name')} 容易受短期涨跌影响。")
+        if buffer:
+            parts.append(f"谁可能缓冲冲击：{buffer.get('name')} 会在确认估值和风险后再调整。")
+        return " ".join(parts)
+
+    def _plain_branch_status(self, status: object) -> str:
+        return {
+            "queued": "等待你确认后再推演",
+            "completed": "已作为子情景跑完",
+            "failed": "子情景运行失败，未纳入结论",
+        }.get(str(status or ""), "未运行")
 
     def _clean_user_text(self, text: object) -> str:
         value = str(text or "")

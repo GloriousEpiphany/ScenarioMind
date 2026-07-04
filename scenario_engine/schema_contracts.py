@@ -180,6 +180,295 @@ SCENARIO_REPORT_SCHEMA = {
     },
 }
 
+FINANCIAL_GRAPH_NODE_SCHEMA = {
+    "title": "FinancialGraphNode",
+    "type": "object",
+    "required": [
+        "node_id",
+        "node_type",
+        "name",
+        "description",
+        "source",
+        "confidence",
+        "as_of_date",
+        "attributes",
+        "evidence_ids",
+        "audit",
+    ],
+    "properties": {
+        "node_id": {"type": "string", "minLength": 1},
+        "node_type": {"type": "string"},
+        "name": {"type": "string"},
+        "description": {"type": "string"},
+        "source": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "as_of_date": {"type": "string"},
+        "attributes": {"type": "object"},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "audit": {"type": "object"},
+    },
+}
+
+FINANCIAL_GRAPH_EDGE_SCHEMA = {
+    "title": "FinancialGraphEdge",
+    "type": "object",
+    "required": [
+        "edge_id",
+        "source_node_id",
+        "target_node_id",
+        "relation_type",
+        "direction",
+        "confidence",
+        "lag_days",
+        "evidence_ids",
+        "validation_status",
+        "audit",
+    ],
+    "properties": {
+        "edge_id": {"type": "string", "minLength": 1},
+        "source_node_id": {"type": "string"},
+        "target_node_id": {"type": "string"},
+        "relation_type": {"type": "string"},
+        "direction": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "lag_days": {"type": ["array", "null"]},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "validation_status": {"type": "string"},
+        "audit": {"type": "object"},
+    },
+}
+
+MARKET_PARTICIPANT_PROFILE_SCHEMA = {
+    "title": "MarketParticipantProfile",
+    "type": "object",
+    "required": [
+        "participant_id",
+        "participant_type",
+        "name",
+        "mandate",
+        "information_sources",
+        "decision_rules",
+        "risk_preferences",
+        "response_delay",
+        "influence_weight",
+        "constraints",
+        "likely_actions",
+        "evidence_ids",
+        "confidence",
+    ],
+    "properties": {
+        "participant_id": {"type": "string"},
+        "participant_type": {"type": "string"},
+        "name": {"type": "string"},
+        "mandate": {"type": "string"},
+        "information_sources": {"type": "array", "items": {"type": "string"}},
+        "decision_rules": {"type": "array", "items": {"type": "string"}},
+        "risk_preferences": {"type": "object"},
+        "response_delay": {"type": "object"},
+        "influence_weight": {"type": "number", "minimum": 0, "maximum": 1},
+        "constraints": {"type": "array", "items": {"type": "string"}},
+        "likely_actions": {"type": "array", "items": {"type": "string"}},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+}
+
+FINANCIAL_SANDBOX_CONFIG_SCHEMA = {
+    "title": "FinancialSandboxConfig",
+    "type": "object",
+    "required": [
+        "sandbox_id",
+        "scenario_id",
+        "as_of_date",
+        "time_config",
+        "participant_profiles",
+        "event_config",
+        "market_mechanism",
+        "observation_metrics",
+        "intervention_points",
+        "audit",
+    ],
+    "properties": {
+        "sandbox_id": {"type": "string"},
+        "scenario_id": {"type": "string"},
+        "as_of_date": {"type": "string"},
+        "time_config": {"type": "object"},
+        "participant_profiles": {"type": "array", "items": MARKET_PARTICIPANT_PROFILE_SCHEMA},
+        "event_config": {"type": "object"},
+        "market_mechanism": {"type": "object"},
+        "observation_metrics": {"type": "array", "items": {"type": "string"}},
+        "intervention_points": {"type": "array"},
+        "audit": {"type": "object"},
+    },
+}
+
+FINANCIAL_AGENT_ACTION_SCHEMA = {
+    "title": "FinancialAgentAction",
+    "type": "object",
+    "required": [
+        "round_num",
+        "simulated_time",
+        "participant_id",
+        "participant_name",
+        "action_type",
+        "action_summary",
+        "evidence_ids",
+        "affected_paths",
+        "confidence",
+        "requires_quant_recalc",
+        "audit",
+    ],
+    "properties": {
+        "round_num": {"type": "number"},
+        "simulated_time": {"type": "string"},
+        "participant_id": {"type": "string"},
+        "participant_name": {"type": "string"},
+        "action_type": {"type": "string"},
+        "action_summary": {"type": "string"},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "affected_paths": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "requires_quant_recalc": {"type": "boolean"},
+        "audit": {"type": "object"},
+    },
+}
+
+FUTURE_EVENT_HYPOTHESIS_SCHEMA = {
+    "title": "FutureEventHypothesis",
+    "type": "object",
+    "required": [
+        "event_id",
+        "title",
+        "plain_summary",
+        "generation_reason",
+        "source_uncertainties",
+        "affected_symbols",
+        "watch_signals",
+        "branch_priority",
+        "confidence",
+        "status",
+        "boundary_label",
+        "audit",
+    ],
+    "properties": {
+        "event_id": {"type": "string"},
+        "title": {"type": "string"},
+        "plain_summary": {"type": "string"},
+        "generation_reason": {"type": "string"},
+        "source_uncertainties": {"type": "array", "items": {"type": "string"}},
+        "affected_symbols": {"type": "array", "items": {"type": "string"}},
+        "watch_signals": {"type": "array", "items": {"type": "string"}},
+        "branch_priority": {"type": "number", "minimum": 0, "maximum": 1},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "status": {"type": "string"},
+        "boundary_label": {"type": "string"},
+        "audit": {"type": "object"},
+    },
+}
+
+GENERATED_INFORMATION_PACKET_SCHEMA = {
+    "title": "GeneratedInformationPacket",
+    "type": "object",
+    "required": [
+        "packet_id",
+        "event_id",
+        "packet_type",
+        "title",
+        "plain_summary",
+        "structured_facts",
+        "assumptions",
+        "source_basis",
+        "forbidden_claims_checked",
+        "evidence_boundary",
+        "allowed_uses",
+        "disallowed_uses",
+        "audit",
+    ],
+    "properties": {
+        "packet_id": {"type": "string"},
+        "event_id": {"type": "string"},
+        "packet_type": {"type": "string"},
+        "title": {"type": "string"},
+        "plain_summary": {"type": "string"},
+        "structured_facts": {"type": "object"},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
+        "source_basis": {"type": "array", "items": {"type": "string"}},
+        "forbidden_claims_checked": {"type": "array", "items": {"type": "string"}},
+        "evidence_boundary": {"type": "string"},
+        "allowed_uses": {"type": "array", "items": {"type": "string"}},
+        "disallowed_uses": {"type": "array", "items": {"type": "string"}},
+        "audit": {"type": "object"},
+    },
+}
+
+SCENARIO_BRANCH_SCHEMA = {
+    "title": "ScenarioBranch",
+    "type": "object",
+    "required": [
+        "branch_id",
+        "root_scenario_id",
+        "parent_scenario_id",
+        "depth",
+        "event_hypothesis",
+        "information_packets",
+        "injected_query",
+        "injected_assumptions",
+        "run_status",
+        "child_report_id",
+        "audit",
+    ],
+    "properties": {
+        "branch_id": {"type": "string"},
+        "root_scenario_id": {"type": "string"},
+        "parent_scenario_id": {"type": "string"},
+        "depth": {"type": "number"},
+        "event_hypothesis": FUTURE_EVENT_HYPOTHESIS_SCHEMA,
+        "information_packets": {"type": "array", "items": GENERATED_INFORMATION_PACKET_SCHEMA},
+        "injected_query": {"type": "string"},
+        "injected_assumptions": {"type": "array", "items": {"type": "string"}},
+        "run_status": {"type": "string"},
+        "child_report_id": {"type": "string"},
+        "audit": {"type": "object"},
+    },
+}
+
+RECURSIVE_SCENARIO_FORECAST_SCHEMA = {
+    "title": "RecursiveScenarioForecast",
+    "type": "object",
+    "required": [
+        "forecast_id",
+        "root_scenario_id",
+        "branch_reports",
+        "common_risks",
+        "divergent_paths",
+        "branch_impact_summary",
+        "highest_risk_branch_id",
+        "most_decision_relevant_branch_id",
+        "watchlist",
+        "agent_review",
+        "future_events",
+        "information_packets",
+        "branches",
+        "audit",
+    ],
+    "properties": {
+        "forecast_id": {"type": "string"},
+        "root_scenario_id": {"type": "string"},
+        "branch_reports": {"type": "array"},
+        "common_risks": {"type": "array", "items": {"type": "string"}},
+        "divergent_paths": {"type": "array", "items": {"type": "string"}},
+        "branch_impact_summary": {"type": "object"},
+        "highest_risk_branch_id": {"type": "string"},
+        "most_decision_relevant_branch_id": {"type": "string"},
+        "watchlist": {"type": "array", "items": {"type": "string"}},
+        "agent_review": {"type": "array"},
+        "future_events": {"type": "array", "items": FUTURE_EVENT_HYPOTHESIS_SCHEMA},
+        "information_packets": {"type": "array", "items": GENERATED_INFORMATION_PACKET_SCHEMA},
+        "branches": {"type": "array", "items": SCENARIO_BRANCH_SCHEMA},
+        "audit": {"type": "object"},
+    },
+}
+
 
 def get_scenario_spec_schema() -> dict:
     return SCENARIO_SPEC_SCHEMA.copy()
@@ -187,6 +476,29 @@ def get_scenario_spec_schema() -> dict:
 
 def get_scenario_report_schema() -> dict:
     return SCENARIO_REPORT_SCHEMA.copy()
+
+
+def get_v2_1_financial_contract_schemas() -> dict:
+    return {
+        "FinancialGraphNode": FINANCIAL_GRAPH_NODE_SCHEMA.copy(),
+        "FinancialGraphEdge": FINANCIAL_GRAPH_EDGE_SCHEMA.copy(),
+        "MarketParticipantProfile": MARKET_PARTICIPANT_PROFILE_SCHEMA.copy(),
+        "FinancialSandboxConfig": FINANCIAL_SANDBOX_CONFIG_SCHEMA.copy(),
+        "FinancialAgentAction": FINANCIAL_AGENT_ACTION_SCHEMA.copy(),
+    }
+
+
+def get_v2_2_recursive_contract_schemas() -> dict:
+    schemas = get_v2_1_financial_contract_schemas()
+    schemas.update(
+        {
+            "FutureEventHypothesis": FUTURE_EVENT_HYPOTHESIS_SCHEMA.copy(),
+            "GeneratedInformationPacket": GENERATED_INFORMATION_PACKET_SCHEMA.copy(),
+            "ScenarioBranch": SCENARIO_BRANCH_SCHEMA.copy(),
+            "RecursiveScenarioForecast": RECURSIVE_SCENARIO_FORECAST_SCHEMA.copy(),
+        }
+    )
+    return schemas
 
 
 def _resolve_ref(schema: dict, ref: str) -> dict:

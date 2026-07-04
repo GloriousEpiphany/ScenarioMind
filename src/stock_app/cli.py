@@ -89,13 +89,15 @@ def download_stocks(
     if result.get('success', 0) > 0:
         console.print("[green]数据已保存到数据库[/green]")
 
+    failed_path = os.path.join(config.DATA_DIR, 'failed_stock_downloads.txt')
     failed_symbols = result.get('failed_symbols', [])
     if failed_symbols:
-        failed_path = os.path.join(config.DATA_DIR, 'failed_stock_downloads.txt')
         with open(failed_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(failed_symbols))
             f.write('\n')
         console.print(f"[yellow]失败股票代码已写入: {failed_path}[/yellow]")
+    elif os.path.exists(failed_path):
+        os.remove(failed_path)
     
     db.close()
 

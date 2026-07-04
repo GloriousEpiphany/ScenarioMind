@@ -129,6 +129,276 @@ class ScenarioRepository:
             )
         conn.commit()
 
+    def save_financial_sandbox(self, report: ScenarioReport) -> None:
+        sandbox = report.audit.get("financial_sandbox") or {}
+        if sandbox.get("status") != "completed":
+            return
+        conn = self.data_provider.db.connect()
+        now = datetime.now().isoformat(timespec="seconds")
+        graph = sandbox.get("financial_graph") or {}
+        config = sandbox.get("config") or {}
+        state = sandbox.get("state") or {}
+        sandbox_id = config.get("sandbox_id") or state.get("sandbox_id") or f"sandbox_{report.scenario_id}"
+
+        for node in graph.get("nodes") or []:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scenario_financial_graph_nodes
+                (node_id, node_type, name, description, source, confidence, as_of_date,
+                 attributes_json, evidence_ids_json, audit_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM scenario_financial_graph_nodes WHERE node_id = ?), ?), ?)
+                """,
+                (
+                    node.get("node_id"),
+                    node.get("node_type"),
+                    node.get("name"),
+                    node.get("description", ""),
+                    node.get("source", ""),
+                    node.get("confidence", 0.0),
+                    node.get("as_of_date", ""),
+                    json.dumps(node.get("attributes") or {}, ensure_ascii=False),
+                    json.dumps(node.get("evidence_ids") or [], ensure_ascii=False),
+                    json.dumps(node.get("audit") or {}, ensure_ascii=False),
+                    node.get("node_id"),
+                    now,
+                    now,
+                ),
+            )
+        for edge in graph.get("edges") or []:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scenario_financial_graph_edges
+                (edge_id, source_node_id, target_node_id, relation_type, direction, confidence,
+                 lag_days_json, evidence_ids_json, validation_status, audit_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM scenario_financial_graph_edges WHERE edge_id = ?), ?), ?)
+                """,
+                (
+                    edge.get("edge_id"),
+                    edge.get("source_node_id"),
+                    edge.get("target_node_id"),
+                    edge.get("relation_type"),
+                    edge.get("direction", ""),
+                    edge.get("confidence", 0.0),
+                    json.dumps(edge.get("lag_days"), ensure_ascii=False),
+                    json.dumps(edge.get("evidence_ids") or [], ensure_ascii=False),
+                    edge.get("validation_status", "unverified"),
+                    json.dumps(edge.get("audit") or {}, ensure_ascii=False),
+                    edge.get("edge_id"),
+                    now,
+                    now,
+                ),
+            )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_sandbox_configs
+            (sandbox_id, scenario_id, as_of_date, config_json, generated_by, audit_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM scenario_sandbox_configs WHERE sandbox_id = ?), ?))
+            """,
+            (
+                sandbox_id,
+                report.scenario_id,
+                report.as_of_date,
+                json.dumps(config, ensure_ascii=False),
+                (config.get("audit") or {}).get("generated_by", "SandboxConfigAgent"),
+                json.dumps(config.get("audit") or {}, ensure_ascii=False),
+                sandbox_id,
+                now,
+            ),
+        )
+        run_id = f"run_{sandbox_id}"
+        conn.execute("DELETE FROM scenario_sandbox_actions WHERE run_id = ?", (run_id,))
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_sandbox_runs
+            (run_id, sandbox_id, scenario_id, status, current_round, total_rounds,
+             path_scores_json, triggered_conditions_json, latest_quant_snapshot_id,
+             audit_json, started_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT started_at FROM scenario_sandbox_runs WHERE run_id = ?), ?), ?)
+            """,
+            (
+                run_id,
+                sandbox_id,
+                report.scenario_id,
+                state.get("status", sandbox.get("status", "")),
+                state.get("current_round", 0),
+                state.get("total_rounds", 0),
+                json.dumps(state.get("path_scores") or sandbox.get("path_scores") or {}, ensure_ascii=False),
+                json.dumps(state.get("triggered_conditions") or sandbox.get("triggered_conditions") or [], ensure_ascii=False),
+                state.get("latest_quant_snapshot_id") or "",
+                json.dumps(state.get("audit") or {}, ensure_ascii=False),
+                run_id,
+                now,
+                now,
+            ),
+        )
+        for action in sandbox.get("actions") or []:
+            conn.execute(
+                """
+                INSERT INTO scenario_sandbox_actions
+                (run_id, round_num, simulated_time, participant_id, participant_name, action_type,
+                 action_summary, evidence_ids_json, affected_paths_json, confidence,
+                 requires_quant_recalc, audit_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    action.get("round_num"),
+                    action.get("simulated_time"),
+                    action.get("participant_id"),
+                    action.get("participant_name", ""),
+                    action.get("action_type"),
+                    action.get("action_summary", ""),
+                    json.dumps(action.get("evidence_ids") or [], ensure_ascii=False),
+                    json.dumps(action.get("affected_paths") or [], ensure_ascii=False),
+                    action.get("confidence", 0.0),
+                    1 if action.get("requires_quant_recalc") else 0,
+                    json.dumps(action.get("audit") or {}, ensure_ascii=False),
+                ),
+            )
+        for trace in sandbox.get("agent_traces") or []:
+            trace_id = self._sandbox_trace_id(report.scenario_id, trace)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scenario_agent_traces
+                (trace_id, scenario_id, agent_name, stage, input_snapshot_id, output_json,
+                 tool_calls_json, evidence_ids_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trace_id,
+                    report.scenario_id,
+                    trace.get("agent_name", ""),
+                    "financial_sandbox",
+                    trace.get("input_snapshot_id", ""),
+                    json.dumps(trace.get("output") or {}, ensure_ascii=False),
+                    json.dumps(trace.get("tool_calls") or [], ensure_ascii=False),
+                    json.dumps(trace.get("evidence_ids") or [], ensure_ascii=False),
+                    (trace.get("audit") or {}).get("created_at") or now,
+                ),
+            )
+        conn.commit()
+
+    def save_recursive_forecast(self, report: ScenarioReport) -> None:
+        forecast = report.audit.get("recursive_forecast") or {}
+        if not forecast or forecast.get("status") == "disabled":
+            return
+        conn = self.data_provider.db.connect()
+        now = datetime.now().isoformat(timespec="seconds")
+        for event in forecast.get("future_events") or []:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scenario_future_event_hypotheses
+                (event_id, root_scenario_id, title, plain_summary, generation_reason,
+                 source_uncertainties_json, affected_symbols_json, watch_signals_json,
+                 branch_priority, confidence, status, boundary_label, audit_json,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        COALESCE((SELECT created_at FROM scenario_future_event_hypotheses WHERE event_id = ?), ?), ?)
+                """,
+                (
+                    event.get("event_id"),
+                    report.scenario_id,
+                    event.get("title", ""),
+                    event.get("plain_summary", ""),
+                    event.get("generation_reason", ""),
+                    json.dumps(event.get("source_uncertainties") or [], ensure_ascii=False),
+                    json.dumps(event.get("affected_symbols") or [], ensure_ascii=False),
+                    json.dumps(event.get("watch_signals") or [], ensure_ascii=False),
+                    event.get("branch_priority", 0),
+                    event.get("confidence", 0),
+                    event.get("status", "proposed"),
+                    event.get("boundary_label", "generated_hypothesis"),
+                    json.dumps(event.get("audit") or {}, ensure_ascii=False),
+                    event.get("event_id"),
+                    now,
+                    now,
+                ),
+            )
+        for packet in forecast.get("information_packets") or []:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scenario_generated_information_packets
+                (packet_id, event_id, packet_type, title, plain_summary,
+                 structured_facts_json, assumptions_json, source_basis_json,
+                 forbidden_claims_checked_json, evidence_boundary, allowed_uses_json,
+                 disallowed_uses_json, audit_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        COALESCE((SELECT created_at FROM scenario_generated_information_packets WHERE packet_id = ?), ?))
+                """,
+                (
+                    packet.get("packet_id"),
+                    packet.get("event_id"),
+                    packet.get("packet_type", ""),
+                    packet.get("title", ""),
+                    packet.get("plain_summary", ""),
+                    json.dumps(packet.get("structured_facts") or {}, ensure_ascii=False),
+                    json.dumps(packet.get("assumptions") or [], ensure_ascii=False),
+                    json.dumps(packet.get("source_basis") or [], ensure_ascii=False),
+                    json.dumps(packet.get("forbidden_claims_checked") or [], ensure_ascii=False),
+                    packet.get("evidence_boundary", "generated_hypothesis"),
+                    json.dumps(packet.get("allowed_uses") or [], ensure_ascii=False),
+                    json.dumps(packet.get("disallowed_uses") or [], ensure_ascii=False),
+                    json.dumps(packet.get("audit") or {}, ensure_ascii=False),
+                    packet.get("packet_id"),
+                    now,
+                ),
+            )
+        for branch in forecast.get("branches") or []:
+            event = branch.get("event_hypothesis") or {}
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scenario_branches
+                (branch_id, root_scenario_id, parent_scenario_id, depth, event_id,
+                 packet_ids_json, injected_query, injected_assumptions_json,
+                 run_status, child_report_id, audit_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        COALESCE((SELECT created_at FROM scenario_branches WHERE branch_id = ?), ?), ?)
+                """,
+                (
+                    branch.get("branch_id"),
+                    branch.get("root_scenario_id", report.scenario_id),
+                    branch.get("parent_scenario_id", report.scenario_id),
+                    branch.get("depth", 0),
+                    event.get("event_id", ""),
+                    json.dumps([packet.get("packet_id") for packet in branch.get("information_packets") or []], ensure_ascii=False),
+                    branch.get("injected_query", ""),
+                    json.dumps(branch.get("injected_assumptions") or [], ensure_ascii=False),
+                    branch.get("run_status", "queued"),
+                    branch.get("child_report_id", ""),
+                    json.dumps(branch.get("audit") or {}, ensure_ascii=False),
+                    branch.get("branch_id"),
+                    now,
+                    now,
+                ),
+            )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_recursive_forecasts
+            (forecast_id, root_scenario_id, branch_reports_json, common_risks_json,
+             divergent_paths_json, branch_impact_summary_json, highest_risk_branch_id,
+             most_decision_relevant_branch_id, watchlist_json, agent_review_json,
+             audit_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT created_at FROM scenario_recursive_forecasts WHERE forecast_id = ?), ?))
+            """,
+            (
+                forecast.get("forecast_id"),
+                forecast.get("root_scenario_id", report.scenario_id),
+                json.dumps(forecast.get("branch_reports") or [], ensure_ascii=False),
+                json.dumps(forecast.get("common_risks") or [], ensure_ascii=False),
+                json.dumps(forecast.get("divergent_paths") or [], ensure_ascii=False),
+                json.dumps(forecast.get("branch_impact_summary") or {}, ensure_ascii=False),
+                forecast.get("highest_risk_branch_id", ""),
+                forecast.get("most_decision_relevant_branch_id", ""),
+                json.dumps(forecast.get("watchlist") or [], ensure_ascii=False),
+                json.dumps(forecast.get("agent_review") or [], ensure_ascii=False),
+                json.dumps(forecast.get("audit") or {}, ensure_ascii=False),
+                forecast.get("forecast_id"),
+                now,
+            ),
+        )
+        conn.commit()
+
     def save_memory_from_report(self, report: ScenarioReport) -> ScenarioMemoryRecord:
         base_range = report.portfolio_total_impact.get("base_range")
         impact_text = "未量化" if base_range is None else f"{base_range[0]:.2%} 至 {base_range[1]:.2%}"
@@ -1383,6 +1653,185 @@ class ScenarioRepository:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_financial_graph_nodes (
+                node_id TEXT PRIMARY KEY,
+                node_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                source TEXT DEFAULT '',
+                confidence REAL DEFAULT 0,
+                as_of_date TEXT DEFAULT '',
+                attributes_json TEXT DEFAULT '{}',
+                evidence_ids_json TEXT DEFAULT '[]',
+                audit_json TEXT DEFAULT '{}',
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_financial_graph_edges (
+                edge_id TEXT PRIMARY KEY,
+                source_node_id TEXT NOT NULL,
+                target_node_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                direction TEXT DEFAULT '',
+                confidence REAL DEFAULT 0,
+                lag_days_json TEXT DEFAULT 'null',
+                evidence_ids_json TEXT DEFAULT '[]',
+                validation_status TEXT DEFAULT 'unverified',
+                audit_json TEXT DEFAULT '{}',
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_sandbox_configs (
+                sandbox_id TEXT PRIMARY KEY,
+                scenario_id TEXT NOT NULL,
+                as_of_date TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                generated_by TEXT DEFAULT '',
+                audit_json TEXT DEFAULT '{}',
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_sandbox_runs (
+                run_id TEXT PRIMARY KEY,
+                sandbox_id TEXT NOT NULL,
+                scenario_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                current_round INTEGER DEFAULT 0,
+                total_rounds INTEGER DEFAULT 0,
+                path_scores_json TEXT DEFAULT '{}',
+                triggered_conditions_json TEXT DEFAULT '[]',
+                latest_quant_snapshot_id TEXT DEFAULT '',
+                audit_json TEXT DEFAULT '{}',
+                started_at TEXT,
+                finished_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_sandbox_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                round_num INTEGER NOT NULL,
+                simulated_time TEXT NOT NULL,
+                participant_id TEXT NOT NULL,
+                participant_name TEXT DEFAULT '',
+                action_type TEXT NOT NULL,
+                action_summary TEXT DEFAULT '',
+                evidence_ids_json TEXT DEFAULT '[]',
+                affected_paths_json TEXT DEFAULT '[]',
+                confidence REAL DEFAULT 0,
+                requires_quant_recalc INTEGER DEFAULT 0,
+                audit_json TEXT DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_agent_traces (
+                trace_id TEXT PRIMARY KEY,
+                scenario_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                input_snapshot_id TEXT DEFAULT '',
+                output_json TEXT DEFAULT '{}',
+                tool_calls_json TEXT DEFAULT '[]',
+                evidence_ids_json TEXT DEFAULT '[]',
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_future_event_hypotheses (
+                event_id TEXT PRIMARY KEY,
+                root_scenario_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                plain_summary TEXT DEFAULT '',
+                generation_reason TEXT DEFAULT '',
+                source_uncertainties_json TEXT DEFAULT '[]',
+                affected_symbols_json TEXT DEFAULT '[]',
+                watch_signals_json TEXT DEFAULT '[]',
+                branch_priority REAL DEFAULT 0,
+                confidence REAL DEFAULT 0,
+                status TEXT DEFAULT 'proposed',
+                boundary_label TEXT DEFAULT 'generated_hypothesis',
+                audit_json TEXT DEFAULT '{}',
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_generated_information_packets (
+                packet_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                packet_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                plain_summary TEXT DEFAULT '',
+                structured_facts_json TEXT DEFAULT '{}',
+                assumptions_json TEXT DEFAULT '[]',
+                source_basis_json TEXT DEFAULT '[]',
+                forbidden_claims_checked_json TEXT DEFAULT '[]',
+                evidence_boundary TEXT NOT NULL,
+                allowed_uses_json TEXT DEFAULT '[]',
+                disallowed_uses_json TEXT DEFAULT '[]',
+                audit_json TEXT DEFAULT '{}',
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_branches (
+                branch_id TEXT PRIMARY KEY,
+                root_scenario_id TEXT NOT NULL,
+                parent_scenario_id TEXT NOT NULL,
+                depth INTEGER DEFAULT 0,
+                event_id TEXT NOT NULL,
+                packet_ids_json TEXT DEFAULT '[]',
+                injected_query TEXT DEFAULT '',
+                injected_assumptions_json TEXT DEFAULT '[]',
+                run_status TEXT DEFAULT 'queued',
+                child_report_id TEXT DEFAULT '',
+                audit_json TEXT DEFAULT '{}',
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_recursive_forecasts (
+                forecast_id TEXT PRIMARY KEY,
+                root_scenario_id TEXT NOT NULL,
+                branch_reports_json TEXT DEFAULT '[]',
+                common_risks_json TEXT DEFAULT '[]',
+                divergent_paths_json TEXT DEFAULT '[]',
+                branch_impact_summary_json TEXT DEFAULT '{}',
+                highest_risk_branch_id TEXT DEFAULT '',
+                most_decision_relevant_branch_id TEXT DEFAULT '',
+                watchlist_json TEXT DEFAULT '[]',
+                agent_review_json TEXT DEFAULT '[]',
+                audit_json TEXT DEFAULT '{}',
+                created_at TEXT
+            )
+            """
+        )
         columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(scenario_report_versions)").fetchall()
@@ -1394,6 +1843,11 @@ class ScenarioRepository:
     def _memory_id(self, scenario_id: str, memory_type: str, date_value: str) -> str:
         digest = hashlib.sha1(f"{scenario_id}|{memory_type}|{date_value}".encode("utf-8")).hexdigest()[:12]
         return f"memory_{digest}"
+
+    def _sandbox_trace_id(self, scenario_id: str, trace: dict) -> str:
+        raw = json.dumps(trace, ensure_ascii=False, sort_keys=True, default=str)
+        digest = hashlib.sha1(f"{scenario_id}|sandbox_trace|{raw}".encode("utf-8")).hexdigest()[:16]
+        return f"trace_{digest}"
 
     def _memory_row_to_dict(self, row) -> dict:
         return {
