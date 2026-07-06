@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from scenario_engine import ScenarioEngine
+from scenario_engine.data_provider import ScenarioDataProvider
 from scenario_engine.templates import SCENARIO_TEMPLATES
 from visualization.data_loader import StockDataLoader
 
@@ -53,7 +54,7 @@ def show_scenario_page():
         )
         max_future_events = st.slider("最多生成几个后续分支", min_value=1, max_value=5, value=4, step=1)
         max_total_branch_runs = st.slider("最多自动推演几个分支", min_value=0, max_value=3, value=1, step=1)
-        enable_external_research = st.toggle("查找新闻/公告证据", value=False, help="启用后才会尝试查找政策、公告和新闻证据；失败不会编造内容。")
+        enable_external_research = st.toggle("查找新闻/公告证据", value=True, help="启用后才会尝试查找政策、公告和新闻证据；失败不会编造内容。")
         research_network = st.toggle("允许联网查找", value=False, help="需要本机网络可用；关闭时仅使用本地已保存的证据。")
         research_source_labels = st.multiselect(
             "查哪些来源",
@@ -190,34 +191,54 @@ def show_scenario_page():
 
     try:
         symbols, weights = _portfolio_from_editor(portfolio_df)
+        effective_as_of_date, date_note = _effective_analysis_date(symbols, as_of_date)
+        if date_note:
+            st.warning(date_note)
         engine = ScenarioEngine(persist=False, use_llm=use_llm)
         try:
-            report = engine.run(
-                user_query=enriched_query,
-                as_of_date=as_of_date,
-                symbols=symbols,
-                weights=weights,
-                cash_weight=cash_weight,
-                horizon=horizon,
-                mode=mode,
-                require_confirmation=True,
-                confirmed=True,
-                enable_external_research=enable_external_research,
-                research_network=research_network,
-                research_source_types=research_source_types,
-                research_read_articles=research_read_articles,
-                enable_financial_sandbox=enable_financial_sandbox,
-                sandbox_rounds=sandbox_rounds,
-                enable_future_event_generation=enable_future_event_generation,
-                enable_recursive_forecast=enable_recursive_forecast,
-                max_future_events=max_future_events,
-                max_branch_depth=1,
-                max_total_branch_runs=max_total_branch_runs,
-                require_user_confirmation_for_generated_branches=not enable_recursive_forecast,
-            )
+            progress = st.progress(0, text="研究协调：整理设置、持仓和情景问题")
+            status_box = st.status("自动推理进行中", expanded=True)
+            with status_box:
+                st.write("研究协调：已读取你的设置和持仓。")
+                progress.progress(12, text="情景发现：整理根情景和候选风险")
+                st.write("情景发现：准备把问题转成可计算情景。")
+                progress.progress(25, text="证据检索：查找本地证据和可选外部证据")
+                st.write("证据检索：如果没有真实来源，系统不会编造新闻或公告。")
+                progress.progress(40, text="量化压力：计算组合区间和持仓贡献")
+                report = engine.run(
+                    user_query=enriched_query,
+                    as_of_date=effective_as_of_date,
+                    symbols=symbols,
+                    weights=weights,
+                    cash_weight=cash_weight,
+                    horizon=horizon,
+                    mode=mode,
+                    require_confirmation=True,
+                    confirmed=True,
+                    enable_external_research=enable_external_research,
+                    research_network=research_network,
+                    research_source_types=research_source_types,
+                    research_read_articles=research_read_articles,
+                    enable_financial_sandbox=enable_financial_sandbox,
+                    sandbox_rounds=sandbox_rounds,
+                    enable_future_event_generation=enable_future_event_generation,
+                    enable_recursive_forecast=enable_recursive_forecast,
+                    max_future_events=max_future_events,
+                    max_branch_depth=1,
+                    max_total_branch_runs=max_total_branch_runs,
+                    require_user_confirmation_for_generated_branches=not enable_recursive_forecast,
+                )
+                progress.progress(68, text="市场沙盘：解释资金、媒体和持仓传导")
+                st.write("市场沙盘：已生成市场参与者反应路径。")
+                progress.progress(82, text="事件预测：生成后续假设分支")
+                st.write("事件预测：已生成后续可能事件树，且全部标记为假设。")
+                progress.progress(92, text="边界审查：检查证据、措辞和买卖指令风险")
+                st.write("边界审查：已检查数字来源和过度确定表达。")
+                progress.progress(100, text="报告生成：完成投资者版摘要、调仓和选股候选")
+                status_box.update(label="自动推理完成", state="complete", expanded=False)
             reverse_report = engine.reverse_stress(
                 loss_threshold=loss_threshold,
-                as_of_date=as_of_date,
+                as_of_date=effective_as_of_date,
                 symbols=symbols,
                 weights=weights,
                 cash_weight=cash_weight,
@@ -229,7 +250,7 @@ def show_scenario_page():
                 proposed_symbols, proposed_weights = _portfolio_from_editor(proposed_df)
                 comparison = engine.compare_rebalance_plan(
                     user_query=enriched_query,
-                    as_of_date=as_of_date,
+                    as_of_date=effective_as_of_date,
                     current_symbols=symbols,
                     current_weights=weights,
                     proposed_symbols=proposed_symbols,
@@ -316,6 +337,7 @@ def show_scenario_page():
         st.plotly_chart(chart, use_container_width=True)
 
     st.subheader("要不要调仓")
+    _render_action_plan(report, reverse_report)
     for item in report.recommendations:
         st.write(f"- {_plain_user_text(item.get('content'))}")
     if comparison:
@@ -464,6 +486,24 @@ def _portfolio_from_editor(df: pd.DataFrame) -> tuple[list[str], list[float]]:
     return [symbol for symbol, _ in rows], [weight for _, weight in rows]
 
 
+def _effective_analysis_date(symbols: list[str], requested_date: str) -> tuple[str, str]:
+    provider = ScenarioDataProvider()
+    latest_dates = []
+    for symbol in symbols:
+        latest = provider.get_latest_price_on_or_before(symbol, requested_date)
+        if latest and latest.get("date"):
+            latest_dates.append(str(latest["date"]))
+    if not latest_dates:
+        return requested_date, ""
+    effective = min(latest_dates)
+    if effective < requested_date:
+        return (
+            effective,
+            f"你选择的日期是 {requested_date}，但部分持仓在这一天之前没有足够行情。系统已自动用共同可分析日期 {effective} 做压力测试，避免结果大面积不可量化。",
+        )
+    return requested_date, ""
+
+
 def _build_enriched_query(query: str, policy_details: dict[str, str]) -> str:
     base = (query or "").strip()
     details = []
@@ -553,6 +593,8 @@ def _render_agent_family_plan(plan: dict) -> None:
 
 def _plain_user_text(text: object) -> str:
     value = str(text or "")
+    if _looks_mojibake(value):
+        return "外部页面标题编码异常，已保留来源记录供审计。"
     replacements = {
         "market_beta": "市场敏感度",
         "beta": "市场敏感度",
@@ -567,6 +609,15 @@ def _plain_user_text(text: object) -> str:
         "quantification_status": "参考状态",
         "not_quantified": "未量化",
         "deterministic": "规则化",
+        "Scenario Parser Review Agent (deterministic)": "情景解析检查",
+        "Evidence Review Agent (deterministic)": "证据检查",
+        "Quant Review Agent (deterministic)": "量化检查",
+        "Bull Review Agent (deterministic)": "正向路径检查",
+        "Bear/Risk Review Agent (deterministic)": "风险路径检查",
+        "Policy Review Agent (deterministic)": "政策口径检查",
+        "Critic Review Agent (deterministic)": "边界审查",
+        "Report Review Agent (deterministic)": "报告检查",
+        "branch_": "分支",
         "What-If 比较": "调仓前后对比",
         "What-If": "调仓对比",
         "仓位集中度": "单一股票占比",
@@ -575,6 +626,97 @@ def _plain_user_text(text: object) -> str:
     for old, new in replacements.items():
         value = value.replace(old, new)
     return value
+
+
+def _looks_mojibake(value: str) -> bool:
+    markers = ["ä", "å", "è", "æ", "º", "½", "/g0"]
+    return sum(1 for marker in markers if marker in value) >= 2
+
+
+def _render_action_plan(report, reverse_report) -> None:
+    rows = _build_rebalance_candidates(report)
+    st.markdown("**自动调仓候选**")
+    st.caption("下面是用于比较的候选方案，不是要求你立刻交易。真正执行前，应结合你的风险承受度和交易成本。")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    stock_rows = _build_stock_selection_candidates(report)
+    st.markdown("**选股/换股观察清单**")
+    st.caption("系统优先把持仓分成三类：需要降风险、可以继续观察、暂不适合作为加仓依据。")
+    st.dataframe(pd.DataFrame(stock_rows), use_container_width=True, hide_index=True)
+
+    threshold = getattr(reverse_report, "loss_threshold", None)
+    candidates = getattr(reverse_report, "candidates", []) or []
+    if candidates:
+        first = candidates[0]
+        explanation = _plain_user_text(getattr(first, "explanation", ""))
+        if threshold is not None:
+            st.info(f"亏损线参考：当组合接近 {threshold:.1%} 的亏损线时，优先执行防守方案。{explanation}")
+        else:
+            st.info(f"亏损线参考：{explanation}")
+
+
+def _build_rebalance_candidates(report) -> list[dict]:
+    impacts = list(report.portfolio_impacts)
+    total = report.portfolio_total_impact
+    quantified = [item for item in impacts if item.expected_contribution_range is not None]
+    unknown = [item for item in impacts if item.expected_contribution_range is None]
+    worst = min(quantified, key=lambda item: item.expected_contribution_range[0]) if quantified else None
+    heavy_unknown = max(unknown, key=lambda item: item.position_weight, default=None)
+    risk_name = _holding_label(worst or heavy_unknown)
+    cash_now = float(total.get("cash_weight", 0.0) or 0.0)
+    return [
+        {
+            "方案": "防守方案",
+            "适合什么时候": "组合下沿接近你的亏损线，或关键证据仍不清楚",
+            "怎么调": f"先把 {risk_name} 降低约20%-30%，把现金提高到 {max(cash_now, 0.20):.0%} 左右",
+            "看什么结果": "重新比较组合下沿是否明显改善",
+        },
+        {
+            "方案": "均衡方案",
+            "适合什么时候": "风险中等，但不想完全离场",
+            "怎么调": "把单一股票权重压到约30%以内，剩余仓位分散到低相关持仓或现金",
+            "看什么结果": "最大风险持仓不再单独决定组合表现",
+        },
+        {
+            "方案": "观察方案",
+            "适合什么时候": "事件是假设分支，还没有真实证据验证",
+            "怎么调": "暂不加仓，只设置观察信号；证据验证后再运行调仓前后比较",
+            "看什么结果": "后续事件树中的观察信号是否真的出现",
+        },
+    ]
+
+
+def _build_stock_selection_candidates(report) -> list[dict]:
+    rows = []
+    for item in report.portfolio_impacts:
+        if item.base_return_range is None:
+            action = "暂不作为加仓依据"
+            reason = "数据不足，不能给出可靠涨跌区间"
+        elif item.expected_contribution_range and item.expected_contribution_range[0] < -0.03:
+            action = "优先复核或降权"
+            reason = "对组合下沿拖累较大"
+        elif item.bull_return_range and item.bull_return_range[1] > 0:
+            action = "可继续观察"
+            reason = "在较好路径中有修复弹性，但不是买入指令"
+        else:
+            action = "维持观察"
+            reason = "情景下影响相对有限"
+        rows.append(
+            {
+                "股票": _holding_label(item),
+                "当前仓位": f"{item.position_weight:.1%}",
+                "系统分类": action,
+                "原因": _plain_user_text(reason),
+                "下一步": "用调仓前后比较功能复测，而不是只看单只股票结论",
+            }
+        )
+    return rows or [{"股票": "暂无", "当前仓位": "-", "系统分类": "无法判断", "原因": "没有持仓数据", "下一步": "先录入持仓"}]
+
+
+def _holding_label(item) -> str:
+    if item is None:
+        return "最大不确定持仓"
+    return f"{getattr(item, 'symbol', '')} {getattr(item, 'name', '')}".strip()
 
 
 def _impact_note(item) -> str:
@@ -1015,7 +1157,7 @@ def _render_external_research(report) -> None:
 
     external_rows = [
         {
-            "标题": item.title,
+            "标题": _plain_user_text(item.title),
             "来源": item.source_uri,
             "参考程度": _confidence_label(item.confidence),
             "相关标的": "、".join(item.metrics.get("related_symbols") or []),

@@ -197,7 +197,8 @@ class ReportComposer:
             if recursive.get("common_risks"):
                 lines.append("- 共同风险：" + "；".join(self._clean_user_text(item) for item in recursive.get("common_risks", [])[:4]))
             if recursive.get("highest_risk_branch_id"):
-                lines.append(f"- 当前最需要警惕的分支ID：{recursive.get('highest_risk_branch_id')}。这只是分支排序，不代表一定发生。")
+                branch_title = self._branch_title(recursive, recursive.get("highest_risk_branch_id"))
+                lines.append(f"- 当前最需要警惕的分支：{branch_title}。这只是分支排序，不代表一定发生。")
             if recursive.get("watchlist"):
                 lines.append("- 后续重点看：" + "；".join(self._clean_user_text(item) for item in recursive.get("watchlist", [])[:6]))
         lines.extend([
@@ -292,13 +293,13 @@ class ReportComposer:
             lines.extend(["", "## Agent 审查记录", ""])
             for item in agent_review[:8]:
                 findings = item.get("findings") or []
-                lines.append(f"- {self._clean_user_text(item.get('reviewer'))}：{self._clean_user_text(findings[0] if findings else '已完成检查。')}")
+                lines.append(f"- {self._plain_agent_name(item.get('reviewer'))}：{self._clean_user_text(findings[0] if findings else '已完成检查。')}")
         lines.extend(
             [
                 "",
                 "## 数据边界、模型边界与合规说明",
                 "",
-                f"- 数据边界：{self._clean_user_text(report.audit.get('data_boundary', '仅使用当前可审计数据。'))}",
+                f"- 数据边界：{self._plain_data_boundary(report.audit.get('data_boundary', '仅使用当前可审计数据。'))}",
                 "- 模型边界：收益区间来自本地历史、因子、代理资产或已审计证据修正；沙盘和 Agent 只解释路径，不生成收益数字。",
                 "- 生成内容边界：后续事件树只是假设分支，不能当作真实公告、新闻、财报或行情，也不能直接改变收益区间。",
                 "- 合规说明：本报告用于情景分析和风险沟通，不替代持牌投资顾问意见，不提供确定性买卖指令。",
@@ -311,6 +312,13 @@ class ReportComposer:
             ]
         )
         return "\n".join(lines)
+
+    def _branch_title(self, recursive: dict, branch_id: object) -> str:
+        for branch in recursive.get("branches") or []:
+            if branch.get("branch_id") == branch_id:
+                event = branch.get("event_hypothesis") or {}
+                return self._clean_user_text(event.get("title") or "未命名分支")
+        return "系统排序最高的假设分支"
 
     def _plain_horizon(self, horizon: str) -> str:
         return {"1w": "约 1 周", "1m": "约 1 个月", "3m": "约 3 个月", "6m": "约 6 个月"}.get(horizon, horizon)
@@ -388,6 +396,8 @@ class ReportComposer:
 
     def _clean_user_text(self, text: object) -> str:
         value = str(text or "")
+        if self._looks_mojibake(value):
+            return "外部页面标题编码异常，已保留来源记录供审计。"
         replacements = {
             "market_beta": "市场敏感度",
             "beta": "市场敏感度",
@@ -401,6 +411,14 @@ class ReportComposer:
             "volatility_proxy": "波动压力",
             "liquidity_proxy": "流动性压力",
             "not_quantified": "未量化",
+            "Scenario Parser Review Agent (deterministic)": "情景解析检查",
+            "Evidence Review Agent (deterministic)": "证据检查",
+            "Quant Review Agent (deterministic)": "量化检查",
+            "Bull Review Agent (deterministic)": "正向路径检查",
+            "Bear/Risk Review Agent (deterministic)": "风险路径检查",
+            "Policy Review Agent (deterministic)": "政策口径检查",
+            "Critic Review Agent (deterministic)": "边界审查",
+            "Report Review Agent (deterministic)": "报告检查",
             "市场 beta": "市场敏感度",
             "默认 beta": "默认市场敏感度",
             "beta 部分": "市场敏感度部分",
@@ -419,6 +437,29 @@ class ReportComposer:
         for old, new in replacements.items():
             value = value.replace(old, new)
         return value
+
+    def _looks_mojibake(self, value: str) -> bool:
+        markers = ["ä", "å", "è", "æ", "º", "½", "/g0"]
+        return sum(1 for marker in markers if marker in value) >= 2
+
+    def _plain_agent_name(self, name: object) -> str:
+        return {
+            "Scenario Parser Review Agent (deterministic)": "情景解析检查",
+            "Evidence Review Agent (deterministic)": "证据检查",
+            "Quant Review Agent (deterministic)": "量化检查",
+            "Bull Review Agent (deterministic)": "正向路径检查",
+            "Bear/Risk Review Agent (deterministic)": "风险路径检查",
+            "Policy Review Agent (deterministic)": "政策口径检查",
+            "Critic Review Agent (deterministic)": "边界审查",
+            "Report Review Agent (deterministic)": "报告检查",
+        }.get(str(name or ""), self._clean_user_text(name))
+
+    def _plain_data_boundary(self, boundary: object) -> str:
+        value = str(boundary or "")
+        if value.startswith("only local data on or before "):
+            date = value.replace("only local data on or before ", "")
+            return f"只使用 {date} 当天及以前可审计的数据。"
+        return self._clean_user_text(value)
 
     def _fallback_decision(self, report: ScenarioReport) -> dict:
         total = report.portfolio_total_impact

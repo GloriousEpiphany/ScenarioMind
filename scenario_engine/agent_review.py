@@ -101,7 +101,15 @@ class ScenarioAgentReview:
         return AgentReviewItem("Critic Review Agent (deterministic)", status, findings or ["未发现无来源数值或断裂证据链。"])
 
     def _report_review(self, report: ScenarioReport) -> AgentReviewItem:
-        required_sections = ["## 一句话结论", "## 普通投资者版摘要", "## 场景定义", "## 持仓影响", "## 多路径结果", "## 审计", "## 证据"]
+        required_sections = [
+            "## 一句话结论",
+            "## 普通投资者版摘要",
+            "## 对你的组合意味着什么",
+            "## 持仓可能怎么受影响",
+            "## 三种结果区间",
+            "## 参考依据",
+            "## 数据边界、模型边界与合规说明",
+        ]
         findings = []
         for section in required_sections:
             if section not in report.markdown:
