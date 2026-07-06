@@ -97,6 +97,142 @@ class RecursiveForecastEngine:
     """Builds a bounded future-event tree and optional child scenario runs."""
 
     FORBIDDEN_FACT_CLAIMS = ["已公告", "已披露", "真实新闻", "真实公告", "公司已发布", "央行已公告"]
+    DOMAIN_TEMPLATES: tuple[dict[str, Any], ...] = (
+        {
+            "domain": "interest_rate_bank",
+            "terms": ("降息", "lpr", "mlf", "银行", "rate", "利率"),
+            "events": [
+                {
+                    "title": "存款利率同步下调",
+                    "summary": "如果降息后存款利率也下调，银行负债成本压力可能缓冲，银行股修复路径更容易被验证。",
+                    "reason": "判断银行净息差压力能否被缓冲。",
+                    "watch": ["存款挂牌利率", "商业银行公告", "净息差披露"],
+                    "priority": 0.92,
+                },
+                {
+                    "title": "社融和地产销售没有改善",
+                    "summary": "如果降息后信用数据仍弱，市场可能把降息理解为经济压力，银行资产质量担忧会重新升温。",
+                    "reason": "验证宽信用是否真的成立。",
+                    "watch": ["社融", "信贷", "地产销售", "不良贷款线索"],
+                    "priority": 0.88,
+                },
+                {
+                    "title": "市场先交易利好后回落",
+                    "summary": "如果市场前期已经抢跑，后续数据验证不足时，相关板块可能出现兑现和回撤。",
+                    "reason": "检查预期交易和验证不足的二阶反馈。",
+                    "watch": ["相关板块成交", "机构观点", "财报", "资金流"],
+                    "priority": 0.78,
+                },
+                {
+                    "title": "融资盘放大短线波动",
+                    "summary": "如果利好解读分歧扩大并触发短线资金减仓，重仓组合波动可能被放大。",
+                    "reason": "检查短线杠杆资金是否放大下跌。",
+                    "watch": ["融资余额", "盘中波动", "成交放大"],
+                    "priority": 0.72,
+                },
+            ],
+        },
+        {
+            "domain": "fx_pressure",
+            "terms": ("人民币", "汇率", "贬值", "升值", "美元", "fx", "cny"),
+            "events": [
+                {
+                    "title": "汇率压力向外资和进口成本传导",
+                    "summary": "如果汇率波动继续扩大，外资风险偏好和进口成本可能先影响高外资持仓、航空、消费和原材料相关股票。",
+                    "reason": "判断汇率冲击是短线情绪扰动，还是会进入企业成本和资金流。",
+                    "watch": ["人民币中间价", "北向资金", "美元指数", "进口成本"],
+                    "priority": 0.86,
+                },
+                {
+                    "title": "稳汇率信号缓冲市场担忧",
+                    "summary": "如果后续出现稳汇率政策信号，市场可能先修复风险偏好，但仍要看资金是否真正回流。",
+                    "reason": "检查政策缓冲能否改变汇率冲击路径。",
+                    "watch": ["外汇政策表态", "离岸人民币", "外资流向"],
+                    "priority": 0.74,
+                },
+            ],
+        },
+        {
+            "domain": "trade_policy",
+            "terms": ("关税", "贸易战", "出口", "制裁", "禁令", "tariff", "出口管制"),
+            "events": [
+                {
+                    "title": "企业公布受影响订单或替代市场",
+                    "summary": "如果持仓公司或同行披露订单影响、转单或替代市场，原先的行业冲击需要重新量化。",
+                    "reason": "把宏观贸易冲击落到具体公司收入和订单上。",
+                    "watch": ["公司公告", "订单变化", "客户区域", "同行披露"],
+                    "priority": 0.88,
+                },
+                {
+                    "title": "政策反制或豁免清单改变影响范围",
+                    "summary": "如果后续出现反制措施、豁免清单或谈判缓和，受冲击行业和个股范围可能明显变化。",
+                    "reason": "检查政策边界是否收窄或扩大。",
+                    "watch": ["政策公告", "豁免清单", "谈判进展", "行业协会表态"],
+                    "priority": 0.82,
+                },
+            ],
+        },
+        {
+            "domain": "commodity_oil",
+            "terms": ("油价", "原油", "大宗", "煤炭", "铜", "commodity", "oil"),
+            "events": [
+                {
+                    "title": "成本压力传导到下游利润",
+                    "summary": "如果上游价格继续走高，下游制造、航空、化工等行业的利润压力可能更快显现。",
+                    "reason": "判断商品价格冲击是否已经从价格进入利润表。",
+                    "watch": ["原材料价格", "航空油料成本", "化工价差", "毛利率"],
+                    "priority": 0.84,
+                },
+                {
+                    "title": "供给扰动缓解后价格回落",
+                    "summary": "如果供给扰动缓解，前期按涨价逻辑交易的板块可能回吐，而成本受压行业可能修复。",
+                    "reason": "检查商品冲击是否存在反向修复路径。",
+                    "watch": ["库存", "产量", "地缘消息", "期货价格"],
+                    "priority": 0.76,
+                },
+            ],
+        },
+        {
+            "domain": "market_drop_liquidity",
+            "terms": ("暴跌", "下跌", "大跌", "流动性", "market", "指数", "沪深300", "上证"),
+            "events": [
+                {
+                    "title": "赎回和融资压力形成二次下跌",
+                    "summary": "如果下跌后出现赎回、融资余额下降或成交缩量，短期压力可能从指数扩散到高波动个股。",
+                    "reason": "识别市场下跌后的流动性二次冲击。",
+                    "watch": ["融资余额", "成交额", "基金申赎", "跌停家数"],
+                    "priority": 0.86,
+                },
+                {
+                    "title": "政策托底或资金回流改变下跌节奏",
+                    "summary": "如果后续出现托底信号或资金回流，市场可能先止跌，但组合是否修复仍取决于重仓股弹性。",
+                    "reason": "检查系统性风险是否被缓冲。",
+                    "watch": ["政策表态", "指数成交", "资金流", "重仓股反弹力度"],
+                    "priority": 0.78,
+                },
+            ],
+        },
+        {
+            "domain": "earnings_company",
+            "terms": ("财报", "业绩", "利润", "暴雷", "预告", "公告", "earnings"),
+            "events": [
+                {
+                    "title": "同行业绩验证行业是否共振",
+                    "summary": "如果同行财报也走弱，风险可能不是单一公司问题；如果同行稳定，冲击可能更偏个股。",
+                    "reason": "区分公司自身问题和行业共同压力。",
+                    "watch": ["同行财报", "业绩预告", "毛利率", "现金流"],
+                    "priority": 0.82,
+                },
+                {
+                    "title": "管理层解释改变市场信任",
+                    "summary": "如果公司后续解释清楚一次性因素，市场担忧可能缓和；如果解释含糊，估值折价可能扩大。",
+                    "reason": "检查信息披露能否修复投资者信任。",
+                    "watch": ["业绩说明会", "监管问询", "审计意见", "回购或增持"],
+                    "priority": 0.74,
+                },
+            ],
+        },
+    )
 
     def build(
         self,
@@ -112,6 +248,7 @@ class RecursiveForecastEngine:
         max_future_events = max(0, min(int(max_future_events), 5))
         max_branch_depth = max(0, min(int(max_branch_depth), 2))
         max_total_branch_runs = max(0, min(int(max_total_branch_runs), 5))
+        agent_council = self._agent_council_audit(root_report)
         events = self._generate_events(root_report, portfolio, max_future_events)
         packets = [self._packet_for_event(event, root_report) for event in events]
         branches = [
@@ -162,6 +299,7 @@ class RecursiveForecastEngine:
                 "child_runs_completed": len(child_summaries),
                 "numeric_generation_allowed": False,
                 "forbidden_storage": "generated packets are not external evidence",
+                "agent_council": agent_council,
             },
         )
 
@@ -177,39 +315,10 @@ class RecursiveForecastEngine:
         triggered = [item.get("plain") for item in sandbox.get("triggered_conditions") or [] if item.get("plain")]
         candidates: list[dict[str, Any]] = []
         text = " ".join([report.scenario_spec.user_query, report.scenario_spec.event_name]).lower()
-        if any(term in text for term in ["降息", "lpr", "mlf", "银行", "rate"]):
-            candidates.extend(
-                [
-                    {
-                        "title": "存款利率同步下调",
-                        "summary": "如果降息后存款利率也下调，银行负债成本压力可能缓冲，银行股修复路径更容易被验证。",
-                        "reason": "判断银行净息差压力能否被缓冲。",
-                        "watch": ["存款挂牌利率", "商业银行公告", "净息差披露"],
-                        "priority": 0.92,
-                    },
-                    {
-                        "title": "社融和地产销售没有改善",
-                        "summary": "如果降息后信用数据仍弱，市场可能把降息理解为经济压力，银行资产质量担忧会重新升温。",
-                        "reason": "验证宽信用是否真的成立。",
-                        "watch": ["社融", "信贷", "地产销售", "不良贷款线索"],
-                        "priority": 0.88,
-                    },
-                    {
-                        "title": "市场先交易利好后回落",
-                        "summary": "如果市场前期已经抢跑，后续数据验证不足时，银行股可能出现兑现和回撤。",
-                        "reason": "检查预期交易和验证不足的二阶反馈。",
-                        "watch": ["银行板块成交", "机构观点", "财报", "资金流"],
-                        "priority": 0.78,
-                    },
-                    {
-                        "title": "融资盘放大短线波动",
-                        "summary": "如果利好解读分歧扩大并触发短线资金减仓，重仓银行的组合波动可能被放大。",
-                        "reason": "检查短线杠杆资金是否放大下跌。",
-                        "watch": ["融资余额", "盘中波动", "成交放大"],
-                        "priority": 0.72,
-                    },
-                ]
-            )
+        matched_domains = self._matched_domains(text)
+        for template in matched_domains:
+            for event in template["events"]:
+                candidates.append({**event, "domain": template["domain"], "source_agent": "FutureEventGeneratorAgent"})
         for item in followups:
             candidates.append(
                 {
@@ -218,8 +327,11 @@ class RecursiveForecastEngine:
                     "reason": str(item.get("why") or "来自沙盘配置的后续观察点。"),
                     "watch": [str(item.get("plain") or ""), *watch_points[:2]],
                     "priority": 0.65,
+                    "domain": "sandbox_followup",
+                    "source_agent": "SandboxFollowupMinerAgent",
                 }
             )
+        candidates.extend(self._uncertainty_candidates(report, watch_points, triggered))
         if not candidates:
             candidates.append(
                 {
@@ -228,6 +340,8 @@ class RecursiveForecastEngine:
                     "reason": "根报告仍有未决问题，需要建立后续验证分支。",
                     "watch": [*watch_points[:3], *triggered[:2]],
                     "priority": 0.6,
+                    "domain": "generic_evidence_check",
+                    "source_agent": "UncertaintyMinerAgent",
                 }
             )
         affected_symbols = [position.symbol for position in portfolio.positions[:5]]
@@ -251,15 +365,83 @@ class RecursiveForecastEngine:
                     branch_priority=float(candidate["priority"]),
                     confidence=min(0.78, max(0.45, float(candidate["priority"]) - 0.12)),
                     audit={
-                        "agent_name": "FutureEventGeneratorAgent",
-                        "source": "root_report_uncertainty_and_sandbox_followups",
+                        "agent_name": candidate.get("source_agent", "FutureEventGeneratorAgent"),
+                        "domain": candidate.get("domain", "generic"),
+                        "source": "root_report_uncertainty_sandbox_and_domain_templates",
                         "numeric_generation_allowed": False,
+                        "tool_calls": ["mine_uncertainties", "match_financial_domain", "propose_followup_event"],
                     },
                 )
             )
             if len(events) >= limit:
                 break
         return events
+
+    def _matched_domains(self, text: str) -> list[dict[str, Any]]:
+        matches = [
+            template
+            for template in self.DOMAIN_TEMPLATES
+            if any(str(term).lower() in text for term in template["terms"])
+        ]
+        if matches:
+            return matches
+        return []
+
+    def _uncertainty_candidates(
+        self,
+        report: ScenarioReport,
+        watch_points: list[str],
+        triggered: list[str],
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        for index, item in enumerate(report.uncertainty[:2]):
+            plain = self._clean_text(item)
+            if not plain:
+                continue
+            candidates.append(
+                {
+                    "title": f"补齐关键缺口：{plain[:24]}",
+                    "summary": f"如果后续能补齐“{plain}”，本次情景的方向和可信度可能需要重新检查。",
+                    "reason": "根报告把它列为不确定点，说明它会影响结论可靠性。",
+                    "watch": [plain, *watch_points[:2], *triggered[:1]],
+                    "priority": 0.58 - index * 0.04,
+                    "domain": "uncertainty_mining",
+                    "source_agent": "UncertaintyMinerAgent",
+                }
+            )
+        return candidates
+
+    def _agent_council_audit(self, report: ScenarioReport) -> list[dict[str, Any]]:
+        return [
+            {
+                "agent_name": "UncertaintyMinerAgent",
+                "plain_name": "先找结论里最不确定的地方",
+                "tool_calls": ["read_root_uncertainty", "read_sandbox_watch_points"],
+                "input_boundary": "只读取根报告、沙盘观察点和已审计证据摘要",
+                "numeric_generation_allowed": False,
+            },
+            {
+                "agent_name": "FutureEventGeneratorAgent",
+                "plain_name": "提出后续可能需要验证的事件",
+                "tool_calls": ["match_financial_domain", "propose_followup_event"],
+                "input_boundary": f"根情景：{self._clean_text(report.scenario_spec.event_name)}",
+                "numeric_generation_allowed": False,
+            },
+            {
+                "agent_name": "GeneratedInformationPacketGate",
+                "plain_name": "检查假设不能冒充真实证据",
+                "tool_calls": ["check_forbidden_fact_claims", "label_generated_hypothesis"],
+                "input_boundary": "禁止写入外部证据表，禁止直接改收益区间",
+                "numeric_generation_allowed": False,
+            },
+            {
+                "agent_name": "ScenarioBranchInjectorAgent",
+                "plain_name": "把合格假设变成子情景输入",
+                "tool_calls": ["build_branch_query", "respect_budget_limits"],
+                "input_boundary": "子情景仍走完整量化链",
+                "numeric_generation_allowed": False,
+            },
+        ]
 
     def _packet_for_event(self, event: FutureEventHypothesis, report: ScenarioReport) -> GeneratedInformationPacket:
         return GeneratedInformationPacket(

@@ -63,21 +63,62 @@ def show_scenario_page():
         research_read_articles = st.toggle("打开重点文章正文", value=False, help="会增加耗时；默认只用标题、摘要和页面快照。")
         loss_threshold = st.slider("我能承受的月度亏损", min_value=0.03, max_value=0.30, value=0.08, step=0.01)
 
-    scenario_options = [
-        "如果央行降息25bp，我的持仓会怎样？",
-        "如果人民币贬值3%，我的持仓会怎样？",
-        "如果中美贸易战升级，对半导体板块加征25%关税，我的持仓会怎样？",
-        "如果油价上涨20%，我的持仓会怎样？",
-        "如果海外市场暴跌5%，我的持仓会怎样？",
-        "自定义情景",
-    ]
-    selected_scenario = st.selectbox("选择一个常见情景，或直接输入你的问题", scenario_options, index=2)
-    default_query = "" if selected_scenario == "自定义情景" else selected_scenario
+    st.subheader("我的持仓")
+    portfolio_df = _render_portfolio_input(
+        title="当前持仓",
+        state_key="scenario_portfolio_df",
+        editor_key="scenario_portfolio_editor",
+        search_key="scenario_portfolio_search",
+        selected_key="scenario_portfolio_selected",
+        default_rows=[{"股票代码": "000001", "仓位": 0.50}, {"股票代码": "600519", "仓位": 0.50}],
+    )
+    cash_weight = st.slider("现金仓位", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+    try:
+        _, preview_weights = _portfolio_from_editor(portfolio_df)
+        preview_total = sum(preview_weights) + cash_weight
+        st.caption(f"当前录入股票仓位合计 {sum(preview_weights):.1%}，加现金后系统将按总权重 {preview_total:.1%} 自动归一化。")
+    except Exception:
+        st.caption("请至少保留一只有效持仓。")
+
+    st.subheader("智能助手（Agent）自动推演入口")
+    st.caption("系统先根据你的持仓提出值得推演的候选风险；你也可以改写问题。事件预测只是其中一环，后面还会有证据、量化、市场解释和边界审查接力。")
+    try:
+        preview_symbols, preview_weights = _portfolio_from_editor(portfolio_df)
+    except Exception:
+        preview_symbols, preview_weights = ["000001", "600519"], [0.5, 0.5]
+    agent_plan = _build_agent_family_plan(preview_symbols, preview_weights, as_of_date)
+    _render_agent_family_plan(agent_plan)
+
+    input_mode = st.radio(
+        "情景来源",
+        ["Agent 自动生成候选", "快捷情景", "手动输入"],
+        index=0,
+        horizontal=True,
+        help="推荐先看 Agent 自动候选，再按自己的判断改写问题。",
+    )
+    if input_mode == "Agent 自动生成候选":
+        candidate_labels = [f"{item['priority']}｜{item['title']}" for item in agent_plan["candidates"]]
+        selected_candidate = st.selectbox("Agent 建议优先推演", candidate_labels, index=0)
+        selected_index = candidate_labels.index(selected_candidate)
+        default_query = agent_plan["candidates"][selected_index]["query"]
+        st.info(agent_plan["candidates"][selected_index]["why"])
+    elif input_mode == "快捷情景":
+        scenario_options = [
+            "如果央行降息25bp，我的持仓会怎样？",
+            "如果人民币贬值3%，我的持仓会怎样？",
+            "如果中美贸易战升级，对半导体板块加征25%关税，我的持仓会怎样？",
+            "如果油价上涨20%，我的持仓会怎样？",
+            "如果海外市场暴跌5%，我的持仓会怎样？",
+        ]
+        default_query = st.selectbox("选择一个快捷情景", scenario_options, index=2)
+    else:
+        default_query = ""
     query = st.text_area(
-        "我担心的情景",
+        "要推演的问题",
         value=default_query,
         placeholder="例如：如果降息25bp，同时人民币贬值2%，我的持仓会怎样？",
         height=88,
+        help="可以直接使用 Agent 候选，也可以把它改成你真正关心的问题。",
     )
     with st.expander("可选：补充政策细节", expanded=False):
         st.caption("这些字段只在你明确填写后进入推演；系统不会自动补写未知政策细节。")
@@ -97,23 +138,6 @@ def show_scenario_page():
             "政策主体": policy_authority,
         },
     )
-
-    st.subheader("我的持仓")
-    portfolio_df = _render_portfolio_input(
-        title="当前持仓",
-        state_key="scenario_portfolio_df",
-        editor_key="scenario_portfolio_editor",
-        search_key="scenario_portfolio_search",
-        selected_key="scenario_portfolio_selected",
-        default_rows=[{"股票代码": "000001", "仓位": 0.50}, {"股票代码": "600519", "仓位": 0.50}],
-    )
-    cash_weight = st.slider("现金仓位", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
-    try:
-        _, preview_weights = _portfolio_from_editor(portfolio_df)
-        preview_total = sum(preview_weights) + cash_weight
-        st.caption(f"当前录入股票仓位合计 {sum(preview_weights):.1%}，加现金后系统将按总权重 {preview_total:.1%} 自动归一化。")
-    except Exception:
-        st.caption("请至少保留一只有效持仓。")
 
     with st.expander("可选：比较一个调仓方案", expanded=False):
         proposed_df = _render_portfolio_input(
@@ -455,6 +479,78 @@ def _build_enriched_query(query: str, policy_details: dict[str, str]) -> str:
     return f"{base}\n补充政策细节：{suffix}"
 
 
+def _build_agent_family_plan(symbols: list[str], weights: list[float], as_of_date: str) -> dict:
+    positions = [
+        {"symbol": symbol, "weight": float(weight)}
+        for symbol, weight in zip(symbols, weights)
+        if symbol
+    ]
+    top = max(positions, key=lambda item: item["weight"]) if positions else {"symbol": "你的重仓股", "weight": 0.0}
+    concentration = top["weight"]
+    candidates = [
+        {
+            "priority": "优先",
+            "title": "重仓股遇到市场下跌",
+            "query": f"如果海外市场暴跌5%，并带动A股风险偏好下降，{top['symbol']} 等持仓会怎样？",
+            "why": "先检查最大仓位遇到系统性下跌时，组合下沿是否超过你的承受范围。",
+        },
+        {
+            "priority": "优先",
+            "title": "人民币汇率波动",
+            "query": "如果人民币贬值3%，我的持仓会怎样？",
+            "why": "汇率会同时影响外资情绪、进口成本和部分出口链，适合作为自动推演的宏观分支。",
+        },
+        {
+            "priority": "关注",
+            "title": "利率变化影响估值",
+            "query": "如果央行降息25bp，我的持仓会怎样？",
+            "why": "利率变化可能同时影响估值、银行息差、信用预期和市场交易情绪。",
+        },
+        {
+            "priority": "关注",
+            "title": "油价或大宗商品上涨",
+            "query": "如果油价上涨20%，我的持仓会怎样？",
+            "why": "原材料价格变化可能影响下游利润，也可能让资源类资产表现分化。",
+        },
+    ]
+    if concentration >= 0.45:
+        candidates.insert(
+            0,
+            {
+                "priority": "最高",
+                "title": f"{top['symbol']} 仓位集中风险",
+                "query": f"如果市场出现利空并且 {top['symbol']} 先下跌8%，我的组合会怎样？",
+                "why": f"{top['symbol']} 仓位约 {concentration:.1%}，系统应先检查单一持仓是否主导组合风险。",
+            },
+        )
+    return {
+        "as_of_date": as_of_date,
+        "positions": positions,
+        "candidates": candidates[:5],
+        "agents": [
+            {"name": "研究协调 Agent", "job": "先把你的持仓、日期和问题组织成一次可执行推演。"},
+            {"name": "情景发现 Agent", "job": "自动提出值得先看的风险候选，而不是只等你手工输入。"},
+            {"name": "证据检索 Agent", "job": "查找本地证据和可选外部证据，找不到就明确说没有。"},
+            {"name": "量化压力 Agent", "job": "用历史、因子和持仓权重计算组合可能涨跌区间。"},
+            {"name": "市场沙盘 Agent", "job": "解释政策、资金、媒体和重仓股可能怎样相互影响。"},
+            {"name": "事件预测 Agent", "job": "提出后续可能需要验证的假设分支，但不把假设当成事实。"},
+            {"name": "边界审查 Agent", "job": "检查有没有编造证据、过度确定或把压力测试写成买卖指令。"},
+            {"name": "通俗报告 Agent", "job": "把结论改写成普通投资者能看懂的短句。"},
+        ],
+    }
+
+
+def _render_agent_family_plan(plan: dict) -> None:
+    cols = st.columns(4)
+    cols[0].metric("候选情景", f"{len(plan.get('candidates', []))} 个")
+    cols[1].metric("协作助手", f"{len(plan.get('agents', []))} 类")
+    cols[2].metric("是否自动编新闻", "否")
+    cols[3].metric("是否自动给买卖指令", "否")
+    with st.expander("多 Agent 如何协作", expanded=False):
+        st.caption("这些智能助手是工程化分工：每一步都有输入、输出和边界。事件预测助手只负责提出后续假设，不负责生成收益数字。")
+        st.dataframe(pd.DataFrame(plan.get("agents", [])), use_container_width=True, hide_index=True)
+
+
 def _plain_user_text(text: object) -> str:
     value = str(text or "")
     replacements = {
@@ -554,6 +650,11 @@ def _plain_agent_name(name: object) -> str:
         "PolicyAgent": "政策口径检查",
         "RiskAgent": "组合风险检查",
         "EvidenceCriticAgent": "证据质量检查",
+        "UncertaintyMinerAgent": "不确定点检查",
+        "FutureEventGeneratorAgent": "后续事件设想",
+        "GeneratedInformationPacketGate": "假设边界检查",
+        "ScenarioBranchInjectorAgent": "子情景生成",
+        "SandboxFollowupMinerAgent": "沙盘观察点整理",
     }.get(str(name or ""), _plain_user_text(name))
 
 
@@ -570,6 +671,15 @@ def _plain_tool_call(name: object) -> str:
         "record_actions": "记录每一步动作",
         "emit_quant_recalc_requests": "提示是否需要复核数字区间",
         "plain_language_summary": "改写成通俗说法",
+        "read_root_uncertainty": "读取本次结论的不确定点",
+        "read_sandbox_watch_points": "读取后续观察信号",
+        "mine_uncertainties": "找出需要继续验证的问题",
+        "match_financial_domain": "匹配事件所属金融场景",
+        "propose_followup_event": "提出后续假设分支",
+        "check_forbidden_fact_claims": "检查是否误写成真实事实",
+        "label_generated_hypothesis": "标记为假设",
+        "build_branch_query": "生成子情景问题",
+        "respect_budget_limits": "控制分支数量和运行次数",
     }.get(str(name or ""), _plain_user_text(name))
 
 
@@ -858,6 +968,19 @@ def _render_recursive_forecast(report) -> None:
     with st.expander("假设分支边界", expanded=False):
         st.write("这些分支只用来提醒你后续要验证什么，不能当作真实公告、新闻、财报或行情。")
         st.write("即使自动跑了子情景，涨跌区间也仍然来自本地量化链，不由这些假设直接生成。")
+        council = (forecast.get("audit") or {}).get("agent_council") or []
+        if council:
+            st.markdown("**系统怎样生成这些分支**")
+            council_rows = [
+                {
+                    "步骤": item.get("plain_name") or _plain_agent_name(item.get("agent_name")),
+                    "做了什么": "、".join(_plain_tool_call(tool) for tool in (item.get("tool_calls") or [])[:3]),
+                    "边界": _plain_user_text(item.get("input_boundary")),
+                    "是否生成涨跌数字": "否",
+                }
+                for item in council
+            ]
+            st.dataframe(pd.DataFrame(council_rows), use_container_width=True, hide_index=True)
 
 
 def _plain_branch_status(status: object) -> str:

@@ -2190,6 +2190,31 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertTrue(all(branch["depth"] <= 1 for branch in forecast["branches"]))
         self.assertTrue(all(branch["event_hypothesis"]["boundary_label"] == "generated_hypothesis" for branch in forecast["branches"]))
 
+    def test_v2_2_future_event_agent_covers_non_rate_scenarios(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果人民币贬值3%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001"],
+                weights=[1.0],
+                confirmed=True,
+                enable_financial_sandbox=True,
+                enable_future_event_generation=True,
+                max_future_events=3,
+            )
+        finally:
+            engine.close()
+
+        forecast = report.audit["recursive_forecast"]
+        titles = [item["title"] for item in forecast["future_events"]]
+        self.assertTrue(any("汇率" in title or "外资" in title for title in titles))
+        council_agents = {item["agent_name"] for item in forecast["audit"]["agent_council"]}
+        self.assertIn("UncertaintyMinerAgent", council_agents)
+        self.assertIn("FutureEventGeneratorAgent", council_agents)
+        self.assertIn("GeneratedInformationPacketGate", council_agents)
+        self.assertTrue(all(not item["numeric_generation_allowed"] for item in forecast["audit"]["agent_council"]))
+
     def test_v2_2_recursive_persistence_tables_are_written_without_external_evidence_pollution(self):
         engine = ScenarioEngine(self.db_path, persist=True)
         try:
@@ -2233,6 +2258,12 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertIn("生成后续可能事件树", source)
         self.assertIn("_render_recursive_forecast", source)
         self.assertIn("假设，不是真实证据", source)
+        self.assertIn("智能助手（Agent）自动推演入口", source)
+        self.assertIn("Agent 自动生成候选", source)
+        self.assertIn("_build_agent_family_plan", source)
+        self.assertIn("事件预测只是其中一环", source)
+        self.assertIn("快捷情景", source)
+        self.assertNotIn("选择一个常见情景，或直接输入你的问题", source)
         self.assertNotIn("LLM 解析情景", source)
         self.assertNotIn("\"RSS\"", source)
 
