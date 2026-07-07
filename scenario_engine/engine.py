@@ -333,6 +333,7 @@ class ScenarioEngine:
         report.audit["validation_issues"] = issues
         report.audit["agent_review"] = [item.__dict__ for item in self.agent_review.review(report)]
         report.audit["investor_decision"] = self._build_investor_decision(report)
+        report.audit["investor_action_plan"] = self._build_investor_action_plan(report)
         self._attach_llm_investor_synthesis(report)
         if enable_future_event_generation or enable_recursive_forecast:
             report.audit["recursive_forecast"] = self._build_recursive_forecast(
@@ -562,6 +563,88 @@ class ScenarioEngine:
         for old, new in replacements.items():
             value = value.replace(old, new)
         return value
+
+    def _build_investor_action_plan(self, report: ScenarioReport) -> dict:
+        """Build structured investor-facing action candidates.
+
+        The plan is deliberately framed as comparable pressure-test candidates,
+        not instructions to trade.
+        """
+        quantified = [item for item in report.portfolio_impacts if item.expected_contribution_range is not None]
+        unquantified = [item for item in report.portfolio_impacts if item.expected_contribution_range is None]
+        worst = min(quantified, key=lambda item: item.expected_contribution_range[0]) if quantified else None
+        heavy_unknown = max(unquantified, key=lambda item: item.position_weight, default=None)
+        focus = worst or heavy_unknown
+        focus_label = self._holding_label(focus) if focus else "最大不确定持仓"
+        cash_weight = float(report.portfolio_total_impact.get("cash_weight", 0.0) or 0.0)
+        base_range = report.portfolio_total_impact.get("base_range")
+        if base_range is None:
+            trigger = "证据不足或持仓覆盖不足时，先补充信息，不宜直接调整。"
+        elif float(base_range[0]) <= -0.08:
+            trigger = "组合下沿已经接近常见风险阈值，优先比较防守方案。"
+        else:
+            trigger = "组合下沿尚未触及高风险阈值，优先观察和复核证据。"
+        rebalance_candidates = [
+            {
+                "name": "防守方案",
+                "when_to_use": "组合下沿接近亏损线，或外部证据偏风险。",
+                "candidate_change": f"优先降低 {focus_label} 的集中度约20%-30%，并把现金仓位提高到 {max(cash_weight, 0.20):.0%} 左右。",
+                "how_to_verify": "用调仓前后比较复测，看组合下沿是否明显改善。",
+                "trade_instruction": False,
+            },
+            {
+                "name": "均衡方案",
+                "when_to_use": "风险中等，但不希望完全转为防守。",
+                "candidate_change": "把单一股票权重压到约30%以内，剩余仓位分散到低相关持仓或现金。",
+                "how_to_verify": "检查最大风险持仓是否不再单独决定组合表现。",
+                "trade_instruction": False,
+            },
+            {
+                "name": "观察方案",
+                "when_to_use": "后续事件仍是假设，尚未被真实新闻、公告或财报验证。",
+                "candidate_change": "暂不加仓，设置观察信号；证据验证后再比较调仓方案。",
+                "how_to_verify": "跟踪后续事件树、外部证据和最大风险持仓的变化。",
+                "trade_instruction": False,
+            },
+        ]
+        stock_watchlist = []
+        for item in report.portfolio_impacts:
+            if item.base_return_range is None:
+                category = "暂不作为加仓依据"
+                reason = "数据不足，不能给出可靠涨跌区间。"
+            elif item.expected_contribution_range and item.expected_contribution_range[0] < -0.03:
+                category = "优先复核或降权"
+                reason = "对组合下沿拖累较大。"
+            elif item.bull_return_range and item.bull_return_range[1] > 0:
+                category = "可继续观察"
+                reason = "在较好路径中有修复弹性，但不是买入指令。"
+            else:
+                category = "维持观察"
+                reason = "本情景下影响相对有限。"
+            stock_watchlist.append(
+                {
+                    "symbol": item.symbol,
+                    "name": item.name,
+                    "weight": item.position_weight,
+                    "category": category,
+                    "reason": self._plain_investor_text(reason),
+                    "next_step": "用调仓前后比较功能复测，不只看单只股票结论。",
+                }
+            )
+        return {
+            "source": "deterministic_investor_action_plan_agent",
+            "goal": "帮助投资者比较调仓和选股观察方向",
+            "trigger": trigger,
+            "rebalance_candidates": rebalance_candidates,
+            "stock_watchlist": stock_watchlist,
+            "selection_policy": "只给可比较候选和观察清单，不给确定性买卖指令或收益承诺。",
+            "evidence_boundary": "真实新闻、公告、财报必须来自外部研究证据；后续事件树只是假设。",
+        }
+
+    def _holding_label(self, item) -> str:
+        if item is None:
+            return "最大不确定持仓"
+        return f"{getattr(item, 'symbol', '')} {getattr(item, 'name', '')}".strip()
 
     def _assess_external_research(self, research_bundle) -> dict:
         documents = research_bundle.documents

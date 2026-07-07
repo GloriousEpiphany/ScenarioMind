@@ -42,7 +42,7 @@ class ResearchPlannerAgent:
             {"tag": "市场预期", "description": "市场是否已经定价、指数和板块热度变化"},
             {"tag": "反向风险", "description": "可能削弱情景利好或放大下行的证据"},
         ]
-        required = ["policy", "announcement", "rss", "hotlist"]
+        required = ["policy", "announcement", "earnings", "rss", "hotlist"]
         budget = {"quick": 2, "standard": 5, "deep": 8}.get(mode, 5)
         return ResearchPlan(
             research_questions=[
@@ -197,6 +197,7 @@ class ResearchOrchestrator:
         self.collector_agents = {
             "policy": PolicyCollectorAgent(self.page_fetcher),
             "announcement": AnnouncementCollectorAgent(self.page_fetcher),
+            "earnings": AnnouncementCollectorAgent(self.page_fetcher),
             "rss": RSSCollectorAgent(self.rss_fetcher),
             "hotlist": HotlistCollectorAgent(self.hotlist_fetcher),
             "news": NewsCollectorAgent(self.page_fetcher),

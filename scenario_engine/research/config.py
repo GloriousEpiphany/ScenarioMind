@@ -33,6 +33,15 @@ DEFAULT_SOURCES = [
         metadata={"official": True, "note": "官方信息披露入口；自动公告 API 需另行配置并审计。"},
     ),
     ResearchSourceConfig(
+        source_id="cninfo_earnings_entry",
+        source_name="巨潮资讯网财报入口",
+        source_type="earnings",
+        endpoint="https://www.cninfo.com.cn/",
+        enabled=True,
+        source_quality_score=0.96,
+        metadata={"official": True, "note": "财报/定期报告入口；精确公告 API 需另行配置并审计。"},
+    ),
+    ResearchSourceConfig(
         source_id="sse_announcement",
         source_name="上海证券交易所公告",
         source_type="announcement",

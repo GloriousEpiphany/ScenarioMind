@@ -91,6 +91,7 @@ def infer_event_tags(text: str) -> list[str]:
         ("oil_price", ["油价", "原油", "opec"]),
         ("tariff", ["关税", "贸易战", "出口管制"]),
         ("company_announcement", ["公告", "年报", "季报", "业绩"]),
+        ("earnings", ["财报", "年报", "季报", "业绩", "利润", "营收", "预告"]),
     ]
     for tag, words in mappings:
         if any(word.lower() in value for word in words):

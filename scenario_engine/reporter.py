@@ -116,6 +116,32 @@ class ReportComposer:
             lines.append(f"- {item}")
         if not decision.get("possible_actions"):
             lines.append("- 先核对情景假设、持仓权重和亏损承受阈值，再决定是否做仓位调整。")
+        action_plan = report.audit.get("investor_action_plan") or {}
+        if action_plan:
+            lines.extend([
+                "",
+                "## 调仓和选股候选",
+                "",
+                "这些是用于比较的候选方案和观察清单，不是自动买卖指令。",
+                "",
+                "### 自动调仓候选",
+                "",
+            ])
+            for item in action_plan.get("rebalance_candidates", []):
+                lines.append(
+                    f"- {self._clean_user_text(item.get('name'))}："
+                    f"{self._clean_user_text(item.get('candidate_change'))}"
+                    f" 验证方法：{self._clean_user_text(item.get('how_to_verify'))}"
+                )
+            lines.extend(["", "### 选股/换股观察清单", ""])
+            for item in action_plan.get("stock_watchlist", []):
+                label = f"{item.get('symbol', '')} {item.get('name', '')}".strip()
+                weight = item.get("weight")
+                weight_text = "" if weight is None else f"（当前仓位 {float(weight):.1%}）"
+                lines.append(
+                    f"- {label}{weight_text}：{self._clean_user_text(item.get('category'))}，"
+                    f"{self._clean_user_text(item.get('reason'))}"
+                )
         lines.extend([
             "",
             "## 主要风险",

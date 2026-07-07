@@ -54,12 +54,12 @@ def show_scenario_page():
         )
         max_future_events = st.slider("最多生成几个后续分支", min_value=1, max_value=5, value=4, step=1)
         max_total_branch_runs = st.slider("最多自动推演几个分支", min_value=0, max_value=3, value=1, step=1)
-        enable_external_research = st.toggle("查找新闻/公告证据", value=True, help="启用后才会尝试查找政策、公告和新闻证据；失败不会编造内容。")
+        enable_external_research = st.toggle("查找新闻/公告/财报证据", value=True, help="启用后才会尝试查找政策、公告、财报和新闻证据；失败不会编造内容。")
         research_network = st.toggle("允许联网查找", value=False, help="需要本机网络可用；关闭时仅使用本地已保存的证据。")
         research_source_labels = st.multiselect(
             "查哪些来源",
-            ["政策官网", "公告官网", "订阅新闻", "市场热榜"],
-            default=["政策官网", "公告官网", "订阅新闻"],
+            ["政策官网", "公告官网", "财报/业绩", "订阅新闻", "市场热榜"],
+            default=["政策官网", "公告官网", "财报/业绩", "订阅新闻"],
         )
         research_read_articles = st.toggle("打开重点文章正文", value=False, help="会增加耗时；默认只用标题、摘要和页面快照。")
         loss_threshold = st.slider("我能承受的月度亏损", min_value=0.03, max_value=0.30, value=0.08, step=0.01)
@@ -152,8 +152,9 @@ def show_scenario_page():
         proposed_cash_weight = st.slider("调仓后现金仓位", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
         run_compare = st.checkbox("同时比较这个调仓方案", value=False)
 
-    parse = st.button("解析情景", use_container_width=True)
-    run = st.button("确认解析并开始推演", type="primary", use_container_width=True)
+    parse = st.button("先检查情景假设（可选）", use_container_width=True)
+    run = st.button("一键开始完整推演", type="primary", use_container_width=True)
+    st.caption("可选预检只帮你查看系统如何理解问题；直接开始完整推演也会自动完成解析、证据检索、量化压力、后续事件树、调仓和选股候选。")
     st.info("结果是情景压力测试，不是收益承诺或自动买卖指令。")
 
     horizon = {"1周": "1w", "1个月": "1m", "3个月": "3m", "6个月": "6m"}[horizon_label]
@@ -163,6 +164,7 @@ def show_scenario_page():
         for label, item in {
             "政策官网": "policy",
             "公告官网": "announcement",
+            "财报/业绩": "earnings",
             "订阅新闻": "rss",
             "市场热榜": "hotlist",
         }.items()
@@ -203,7 +205,7 @@ def show_scenario_page():
                 progress.progress(12, text="情景发现：整理根情景和候选风险")
                 st.write("情景发现：准备把问题转成可计算情景。")
                 progress.progress(25, text="证据检索：查找本地证据和可选外部证据")
-                st.write("证据检索：如果没有真实来源，系统不会编造新闻或公告。")
+                st.write("证据检索：如果没有真实来源，系统不会编造新闻、公告或财报。")
                 progress.progress(40, text="量化压力：计算组合区间和持仓贡献")
                 report = engine.run(
                     user_query=enriched_query,
@@ -656,6 +658,17 @@ def _render_action_plan(report, reverse_report) -> None:
 
 
 def _build_rebalance_candidates(report) -> list[dict]:
+    action_plan = (report.audit.get("investor_action_plan") or {}).get("rebalance_candidates") or []
+    if action_plan:
+        return [
+            {
+                "方案": _plain_user_text(item.get("name")),
+                "适合什么时候": _plain_user_text(item.get("when_to_use")),
+                "怎么调": _plain_user_text(item.get("candidate_change")),
+                "看什么结果": _plain_user_text(item.get("how_to_verify")),
+            }
+            for item in action_plan
+        ]
     impacts = list(report.portfolio_impacts)
     total = report.portfolio_total_impact
     quantified = [item for item in impacts if item.expected_contribution_range is not None]
@@ -687,6 +700,18 @@ def _build_rebalance_candidates(report) -> list[dict]:
 
 
 def _build_stock_selection_candidates(report) -> list[dict]:
+    action_plan = (report.audit.get("investor_action_plan") or {}).get("stock_watchlist") or []
+    if action_plan:
+        return [
+            {
+                "股票": f"{item.get('symbol', '')} {item.get('name', '')}".strip(),
+                "当前仓位": f"{float(item.get('weight', 0.0)):.1%}",
+                "系统分类": _plain_user_text(item.get("category")),
+                "原因": _plain_user_text(item.get("reason")),
+                "下一步": _plain_user_text(item.get("next_step")),
+            }
+            for item in action_plan
+        ]
     rows = []
     for item in report.portfolio_impacts:
         if item.base_return_range is None:
@@ -774,6 +799,7 @@ def _plain_research_tag(tag: object) -> str:
         "oil_price": "油价",
         "tariff": "关税/贸易",
         "company_announcement": "公司公告",
+        "earnings": "财报/业绩",
         "政策信号": "政策信号",
         "持仓公司": "持仓公司",
         "行业影响": "行业影响",
@@ -835,7 +861,7 @@ def _render_empty_state() -> None:
 
 def _render_prepared_scenario(prepared: dict) -> None:
     spec = prepared["scenario_spec"]
-    st.subheader("场景解析结果")
+    st.subheader("情景假设检查结果")
     cols = st.columns(4)
     cols[0].metric("事件", spec.get("event_name", ""))
     cols[1].metric("类型", spec.get("event_type", ""))
@@ -865,7 +891,7 @@ def _render_prepared_scenario(prepared: dict) -> None:
     if missing:
         st.warning("需要确认或补充的信息：" + "；".join(missing))
     else:
-        st.success("解析结果没有必须补充的缺失项。")
+        st.success("系统理解的问题没有必须补充的缺失项。")
 
 
 def _render_advanced_tools(
@@ -1147,7 +1173,7 @@ def _render_external_research(report) -> None:
     elif external_research.get("enabled"):
         st.caption("本次未找到足够高质量且高相关的外部证据，量化结果仍以本地历史和因子数据为主。")
     else:
-        st.caption("外部研究未开启，本次没有使用新闻、公告或政策页面修正结论。")
+        st.caption("外部研究未开启，本次没有使用新闻、公告、财报或政策页面修正结论。")
 
     for label, items in [("支持修复路径的信息", assessment.get("positive_findings", [])), ("需要警惕的信息", assessment.get("risk_findings", [])), ("建议继续观察", assessment.get("watch_points", []))]:
         if items:

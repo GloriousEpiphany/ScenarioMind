@@ -91,10 +91,21 @@ def build_capability_report(external_sources: dict | None = None) -> dict:
                 "local property graph",
                 "manual graph import",
                 "deterministic financial participant sandbox",
+                "audited HTTP/RSS/page-snapshot research collectors for policy, announcements, earnings and news",
                 "MCP JSON-RPC tools/call adapter",
                 "GDELT DOC connector",
             ],
-            "not_claimed": ["external GraphRAG service", "LightRAG backend", "Neo4j/LlamaIndex property graph backend"],
+            "not_claimed": [
+                "external GraphRAG service",
+                "LightRAG backend",
+                "Neo4j/LlamaIndex property graph backend",
+                "network evidence collection when research_network is disabled or no source is configured",
+            ],
+            "production_notes": [
+                "Scenario Lab can collect real web evidence through configured sources when networking is enabled.",
+                "MCP event sources require an explicitly registered runtime connector.",
+                "Unverified or unavailable news, announcement and earnings data is reported as missing rather than fabricated.",
+            ],
         },
         "v2_1_financial_sandbox": {
             "status": "implemented",
@@ -130,5 +141,15 @@ def build_capability_report(external_sources: dict | None = None) -> dict:
                 "generated news treated as observed evidence",
                 "LLM-generated numeric impacts",
             ],
+        },
+        "investor_action_surface": {
+            "status": "implemented",
+            "implemented": [
+                "structured investor decision audit",
+                "defensive, balanced and observation rebalance candidates",
+                "stock selection/watchlist categories",
+                "Streamlit and markdown exposure in plain Chinese",
+            ],
+            "not_claimed": ["deterministic buy/sell instructions", "guaranteed return targets", "licensed investment advice"],
         },
     }

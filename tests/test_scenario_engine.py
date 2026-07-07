@@ -345,6 +345,27 @@ class ScenarioEngineTestCase(unittest.TestCase):
         ]:
             self.assertNotIn(phrase, report.markdown)
 
+    def test_investor_action_plan_structures_rebalance_and_stock_watchlist(self):
+        engine = ScenarioEngine(self.db_path, persist=False)
+        try:
+            report = engine.run(
+                user_query="如果沪深300下跌5%，我的持仓会怎样？",
+                as_of_date="2020-03-20",
+                symbols=["000001", "600519"],
+                weights=[0.7, 0.3],
+                confirmed=True,
+            )
+        finally:
+            engine.close()
+
+        action_plan = report.audit["investor_action_plan"]
+        self.assertEqual(action_plan["source"], "deterministic_investor_action_plan_agent")
+        self.assertEqual(len(action_plan["rebalance_candidates"]), 3)
+        self.assertEqual(len(action_plan["stock_watchlist"]), 2)
+        self.assertTrue(all(item["trade_instruction"] is False for item in action_plan["rebalance_candidates"]))
+        self.assertIn("调仓和选股候选", report.markdown)
+        self.assertIn("选股/换股观察清单", report.markdown)
+
     def test_all_golden_scenarios_parse_to_known_templates(self):
         parser = ScenarioParser()
         queries = [
@@ -2253,7 +2274,8 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertIn("谁会影响这件事", source)
         self.assertIn("哪些情况会改变判断", source)
         self.assertIn("_plain_agent_name", source)
-        self.assertIn("查找新闻/公告证据", source)
+        self.assertIn("查找新闻/公告/财报证据", source)
+        self.assertIn("财报/业绩", source)
         self.assertIn("组合可能涨跌", source)
         self.assertIn("生成后续可能事件树", source)
         self.assertIn("_render_recursive_forecast", source)
@@ -2270,10 +2292,14 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertIn("_render_action_plan", source)
         self.assertIn("自动调仓候选", source)
         self.assertIn("选股/换股观察清单", source)
+        self.assertIn("先检查情景假设（可选）", source)
+        self.assertIn("一键开始完整推演", source)
         self.assertIn("外部页面标题编码异常", source)
         self.assertIn("快捷情景", source)
         self.assertNotIn("选择一个常见情景，或直接输入你的问题", source)
         self.assertNotIn("LLM 解析情景", source)
+        self.assertNotIn("解析情景\", use_container_width=True", source)
+        self.assertNotIn("确认解析并开始推演", source)
         self.assertNotIn("\"RSS\"", source)
 
 
