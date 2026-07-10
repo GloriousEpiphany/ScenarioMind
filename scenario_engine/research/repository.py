@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -30,6 +31,26 @@ class ResearchRepository:
                 source_quality_score REAL DEFAULT 0.5,
                 metadata_json TEXT DEFAULT '{}',
                 updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scenario_financial_statements (
+                statement_id TEXT PRIMARY KEY,
+                evidence_id TEXT NOT NULL,
+                company_symbol TEXT NOT NULL,
+                company_name TEXT DEFAULT '',
+                report_period TEXT NOT NULL,
+                statement_type TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                unit_multiplier REAL NOT NULL,
+                metrics_json TEXT NOT NULL,
+                validation_status TEXT NOT NULL,
+                validation_issues_json TEXT DEFAULT '[]',
+                source_url TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(company_symbol, report_period, statement_type, evidence_id)
             )
             """
         )
@@ -183,6 +204,8 @@ class ResearchRepository:
 
     def save_document(self, document: ExternalEvidenceDocument) -> ExternalEvidenceDocument:
         conn = self.data_provider.db.connect()
+        content_for_hash = "\n".join([document.title, document.summary, document.content_markdown, document.url])
+        document.metadata = {**document.metadata, "content_sha256": hashlib.sha256(content_for_hash.encode("utf-8")).hexdigest()}
         if not document.evidence_id:
             document.evidence_id = make_evidence_id(document.source_id, document.title, document.url, document.guid, document.published_at)
         existing = conn.execute(
@@ -255,6 +278,62 @@ class ResearchRepository:
             )
         conn.commit()
         return document
+
+    def save_financial_statement(self, record) -> None:
+        if record.validation_status != "passed":
+            return
+        conn = self.data_provider.db.connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scenario_financial_statements
+            (statement_id, evidence_id, company_symbol, company_name, report_period,
+             statement_type, currency, unit_multiplier, metrics_json,
+             validation_status, validation_issues_json, source_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.statement_id,
+                record.evidence_id,
+                record.company_symbol,
+                record.company_name,
+                record.report_period,
+                record.statement_type,
+                record.currency,
+                record.unit_multiplier,
+                json.dumps(record.metrics, ensure_ascii=False),
+                record.validation_status,
+                json.dumps(record.validation_issues, ensure_ascii=False),
+                record.source_url,
+                now_iso(),
+            ),
+        )
+        conn.commit()
+
+    def source_health(self, recent_limit: int = 100) -> dict:
+        conn = self.data_provider.db.connect()
+        rows = conn.execute(
+            """
+            SELECT source_id,
+                   COUNT(*) AS runs,
+                   SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failures,
+                   MAX(item_count) AS max_items
+            FROM (
+                SELECT * FROM scenario_external_source_status ORDER BY rowid DESC LIMIT ?
+            )
+            GROUP BY source_id
+            """,
+            (recent_limit,),
+        ).fetchall()
+        return {
+            row[0]: {
+                "runs": int(row[1] or 0),
+                "success_rate": float(row[2] or 0) / max(1, int(row[1] or 0)),
+                "failure_count": int(row[3] or 0),
+                "max_item_count": int(row[4] or 0),
+            }
+            for row in rows
+        }
 
     def search(
         self,

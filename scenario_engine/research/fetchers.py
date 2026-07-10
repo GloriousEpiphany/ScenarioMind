@@ -7,6 +7,7 @@ import random
 import re
 import time
 from html import unescape
+from datetime import datetime, timedelta
 from typing import Any
 
 import requests
@@ -46,10 +47,16 @@ class HttpFetcher:
         self.session.headers.update(DEFAULT_HEADERS)
 
     def get(self, url: str) -> requests.Response:
+        return self.request("GET", url)
+
+    def post(self, url: str, data: dict | None = None) -> requests.Response:
+        return self.request("POST", url, data=data)
+
+    def request(self, method: str, url: str, **kwargs) -> requests.Response:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                response = self.session.get(url, timeout=self.timeout)
+                response = self.session.request(method, url, timeout=self.timeout, **kwargs)
                 response.raise_for_status()
                 return response
             except Exception as exc:
@@ -58,6 +65,91 @@ class HttpFetcher:
                     break
                 time.sleep(random.uniform(self.min_retry_wait, self.max_retry_wait) + attempt * 0.5)
         raise RuntimeError(str(last_error) if last_error else "request failed")
+
+
+class CninfoAnnouncementFetcher:
+    """Fetch concrete company announcements from the official CNINFO platform."""
+
+    SEARCH_URL = "https://www.cninfo.com.cn/new/information/topSearch/query"
+    QUERY_URL = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+    PDF_BASE = "https://static.cninfo.com.cn/"
+
+    def __init__(self, http: HttpFetcher | None = None):
+        self.http = http or HttpFetcher()
+        self.http.session.headers.update({"Referer": "https://www.cninfo.com.cn/", "X-Requested-With": "XMLHttpRequest"})
+
+    def fetch(self, source: ResearchSourceConfig, symbols: list[str], as_of_date: str, max_items: int = 20) -> FetchResult:
+        if not symbols:
+            return FetchResult([], SourceFetchStatus(source.source_id, source.source_type, "skipped", 0, "portfolio has no stock symbols"))
+        try:
+            documents = []
+            end = datetime.strptime(as_of_date, "%Y-%m-%d")
+            start = end - timedelta(days=730)
+            for symbol in symbols[:20]:
+                identity = self._resolve_identity(symbol)
+                if identity is None:
+                    continue
+                payload = self._query_payload(source, identity, start, end, max_items)
+                response = self.http.post(self.QUERY_URL, data=payload)
+                for item in (response.json().get("announcements") or []):
+                    document = self._document(source, item)
+                    if document is not None:
+                        documents.append(document)
+                    if len(documents) >= max_items:
+                        break
+                if len(documents) >= max_items:
+                    break
+            return FetchResult(documents, SourceFetchStatus(source.source_id, source.source_type, "success", len(documents), metadata={"connector": "cninfo_announcements", "concrete_documents": True}))
+        except Exception as exc:
+            return FetchResult([], SourceFetchStatus(source.source_id, source.source_type, "failed", 0, str(exc), {"connector": "cninfo_announcements"}))
+
+    def _resolve_identity(self, symbol: str) -> dict | None:
+        response = self.http.post(self.SEARCH_URL, data={"keyWord": symbol, "maxNum": 10})
+        for item in response.json() if isinstance(response.json(), list) else []:
+            if str(item.get("code")) == symbol and item.get("orgId"):
+                return item
+        return None
+
+    def _query_payload(self, source, identity, start, end, max_items):
+        symbol = str(identity["code"])
+        return {
+            "pageNum": 1,
+            "pageSize": max_items,
+            "column": "szse" if symbol.startswith(("0", "3")) else "sse",
+            "tabName": "fulltext",
+            "plate": "sz" if symbol.startswith(("0", "3")) else "sh",
+            "stock": f"{symbol},{identity['orgId']}",
+            "searchkey": "",
+            "secid": "",
+            "category": source.metadata.get("category", ""),
+            "trade": "",
+            "seDate": f"{start:%Y-%m-%d}~{end:%Y-%m-%d}",
+            "sortName": "",
+            "sortType": "",
+            "isHLtitle": "true",
+        }
+
+    def _document(self, source, item):
+        title = re.sub(r"<[^>]+>", "", str(item.get("announcementTitle") or "")).strip()
+        adjunct = str(item.get("adjunctUrl") or "").strip()
+        if not title or not adjunct:
+            return None
+        timestamp = item.get("announcementTime")
+        published_at = datetime.fromtimestamp(float(timestamp) / 1000).isoformat(timespec="seconds") if timestamp else ""
+        url = self.PDF_BASE + adjunct.lstrip("/")
+        return ExternalEvidenceDocument(
+            evidence_id=make_evidence_id(source.source_id, title, url=url),
+            source_type=source.source_type,
+            source_id=source.source_id,
+            source_name=source.source_name,
+            title=f"{item.get('secCode', '')} {item.get('secName', '')}：{title}".strip(),
+            url=url,
+            published_at=published_at,
+            first_seen_at=now_iso(),
+            last_seen_at=now_iso(),
+            related_symbols=[str(item.get("secCode"))] if item.get("secCode") else [],
+            metadata={"raw_source": "cninfo_announcement_api", "official": True, "announcement_id": item.get("announcementId"), "document_format": item.get("adjunctType")},
+        )
 
 
 class HotlistFetcher:

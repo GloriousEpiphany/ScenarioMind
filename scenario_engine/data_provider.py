@@ -180,6 +180,36 @@ class ScenarioDataProvider:
         )
         return [row[0] for row in cursor.fetchall()]
 
+    def get_market_candidate_features(self, as_of_date: str, limit: int = 300, minimum_days: int = 60) -> list[dict]:
+        """Build a point-in-time candidate universe from local market data only."""
+        symbols = self.get_available_stock_symbols(limit=limit)
+        rows = []
+        for symbol in symbols:
+            history = self.get_stock_history(symbol, as_of_date, lookback_days=120)
+            if len(history) < minimum_days or "close" not in history:
+                continue
+            history = history.dropna(subset=["close"]).copy()
+            if len(history) < minimum_days:
+                continue
+            returns = history["close"].pct_change().dropna()
+            latest = float(history["close"].iloc[-1])
+            previous = float(history["close"].iloc[-21]) if len(history) >= 21 else float(history["close"].iloc[0])
+            amount = history["amount"].tail(20).fillna(0) if "amount" in history else history["volume"].tail(20).fillna(0)
+            info = self.get_stock_info(symbol)
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": info.get("name") or symbol,
+                    "latest_date": str(history["date"].iloc[-1])[:10],
+                    "history_days": len(history),
+                    "latest_close": latest,
+                    "momentum_20d": 0.0 if previous <= 0 else latest / previous - 1.0,
+                    "volatility_60d": float(returns.tail(60).std() or 0.0),
+                    "average_amount_20d": float(amount.mean() or 0.0),
+                }
+            )
+        return rows
+
     def _get_index_history(self, symbol: str, end_date: str, lookback_days: int) -> pd.DataFrame:
         start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=lookback_days * 2)).strftime("%Y-%m-%d")
         df = self.db.get_index_data(symbol, start_date=start_date, end_date=end_date)

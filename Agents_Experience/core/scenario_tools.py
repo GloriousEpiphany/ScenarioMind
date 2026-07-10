@@ -134,11 +134,8 @@ class ScenarioTools:
         threshold: float = 0.4,
         source_types: list[str] | None = None,
     ) -> dict[str, Any]:
-        from scenario_engine.research.search import ResearchSearch
-
-        search = ResearchSearch(self.engine.research_orchestrator.repository)
-        return search.search_news(
-            query=query,
+        return self.engine.research_orchestrator.search_evidence(
+            query,
             search_mode=search_mode,
             limit=limit,
             threshold=threshold,

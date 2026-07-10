@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import threading
+import time
 from typing import Any
 
 
@@ -28,6 +29,8 @@ class EventPollingScheduler:
         alert_channel: str = "dashboard",
         user_id: str | None = None,
         role: str | None = None,
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 1.0,
     ):
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
@@ -42,13 +45,21 @@ class EventPollingScheduler:
         self.alert_channel = alert_channel
         self.user_id = user_id
         self.role = role
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self._stop_event = threading.Event()
+        self._run_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self.run_count = 0
         self.last_report = None
         self.last_error: str | None = None
         self.started_at: str | None = None
         self.stopped_at: str | None = None
+        self.last_started_at: str | None = None
+        self.last_finished_at: str | None = None
+        self.last_duration_seconds: float | None = None
+        self.failure_count = 0
+        self.skipped_overlap_count = 0
 
     def start(self) -> dict[str, Any]:
         if self._thread is not None and self._thread.is_alive():
@@ -68,21 +79,41 @@ class EventPollingScheduler:
         return self.status()
 
     def run_once(self):
-        report = self.engine.poll_event_sources(
-            as_of_date=self.as_of_date,
-            symbols=self.symbols,
-            weights=self.weights,
-            source_ids=self.source_ids,
-            auto_run=self.auto_run,
-            alert_threshold=self.alert_threshold,
-            alert_channel=self.alert_channel,
-            user_id=self.user_id,
-            role=self.role,
-        )
-        self.last_report = report
-        self.run_count += 1
-        self.last_error = None
-        return report
+        if not self._run_lock.acquire(blocking=False):
+            self.skipped_overlap_count += 1
+            raise RuntimeError("event polling run skipped because the previous lease is still active")
+        started = time.monotonic()
+        self.last_started_at = datetime.now().isoformat(timespec="microseconds")
+        try:
+            last_error = None
+            for attempt in range(self.max_retries + 1):
+                try:
+                    report = self.engine.poll_event_sources(
+                        as_of_date=self.as_of_date,
+                        symbols=self.symbols,
+                        weights=self.weights,
+                        source_ids=self.source_ids,
+                        auto_run=self.auto_run,
+                        alert_threshold=self.alert_threshold,
+                        alert_channel=self.alert_channel,
+                        user_id=self.user_id,
+                        role=self.role,
+                    )
+                    self.last_report = report
+                    self.run_count += 1
+                    self.last_error = None
+                    return report
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < self.max_retries:
+                        self._stop_event.wait(self.retry_backoff_seconds * (2**attempt))
+            self.failure_count += 1
+            self.last_error = str(last_error)
+            raise last_error
+        finally:
+            self.last_finished_at = datetime.now().isoformat(timespec="microseconds")
+            self.last_duration_seconds = round(time.monotonic() - started, 6)
+            self._run_lock.release()
 
     def status(self) -> dict[str, Any]:
         running = self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
@@ -95,6 +126,12 @@ class EventPollingScheduler:
             "interval_seconds": self.interval_seconds,
             "started_at": self.started_at,
             "stopped_at": self.stopped_at,
+            "last_started_at": self.last_started_at,
+            "last_finished_at": self.last_finished_at,
+            "last_duration_seconds": self.last_duration_seconds,
+            "failure_count": self.failure_count,
+            "skipped_overlap_count": self.skipped_overlap_count,
+            "max_retries": self.max_retries,
         }
 
     def _run_loop(self) -> None:

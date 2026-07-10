@@ -15,7 +15,7 @@ from .schema_contracts import (
 )
 from .capabilities import build_capability_report
 from .golden_scenarios import get_golden_scenarios
-from .environment import validate_runtime_environment
+from .capabilities import validate_runtime_environment
 from .schemas import (
     BacktestReport,
     BatchBacktestReport,

@@ -14,6 +14,7 @@ from .batch import BatchPortfolioStressTester
 from .capabilities import build_capability_report
 from .constraints import AShareConstraintAnalyzer
 from .data_provider import ScenarioDataProvider
+from .decision_support import PortfolioDecisionSupport
 from .event_monitor import EventMonitor
 from .event_scheduler import EventPollingScheduler
 from .enterprise import AccessControl, EnterpriseAudit, ReportVersioner
@@ -28,7 +29,6 @@ from .multi_asset import MultiAssetCoverage
 from .news_connectors import GdeltDocNewsConnector
 from .parser import ScenarioParser
 from .portfolio import PortfolioBuilder
-from .rebalance import RebalanceComparator
 from .reporter import ReportComposer
 from .report_exporter import ReportExporter
 from .repository import ScenarioRepository
@@ -84,6 +84,8 @@ class ScenarioEngine:
         persist: bool = True,
         use_llm: bool | None = None,
         llm_client=None,
+        research_sources=None,
+        research_mcp_transport=None,
     ):
         self.data_provider = ScenarioDataProvider(db_path)
         self.llm_client = llm_client
@@ -126,7 +128,7 @@ class ScenarioEngine:
         self.full_agent_workflow = ScenarioFullAgentWorkflow()
         self.evaluation_suite = ScenarioEvaluationSuite()
         self.reverse_stress_engine = ReverseStressEngine(self.factor_estimator)
-        self.rebalance_comparator = RebalanceComparator()
+        self.decision_support = PortfolioDecisionSupport(self.data_provider)
         self.repository = ScenarioRepository(self.data_provider) if persist else None
         self.backtester = ScenarioBacktester(self.data_provider, self.portfolio_builder, self._run_for_backtest)
         self.workflow = ScenarioWorkflow()
@@ -134,7 +136,12 @@ class ScenarioEngine:
         self.event_monitor = EventMonitor(self.parser, self._run_for_backtest)
         self.batch_stress_tester = BatchPortfolioStressTester(self._run_for_backtest)
         self.external_data_registry = ExternalDataRegistry()
-        self.research_orchestrator = ResearchOrchestrator(self.data_provider, llm_client=self.llm_client)
+        self.research_orchestrator = ResearchOrchestrator(
+            self.data_provider,
+            llm_client=self.llm_client,
+            sources=research_sources,
+            mcp_transport=research_mcp_transport,
+        )
         self.evidence_adjuster = EvidenceImpactAdjuster()
         self.financial_sandbox = FinancialSandbox()
         self.recursive_forecaster = RecursiveForecastEngine()
@@ -333,7 +340,7 @@ class ScenarioEngine:
         report.audit["validation_issues"] = issues
         report.audit["agent_review"] = [item.__dict__ for item in self.agent_review.review(report)]
         report.audit["investor_decision"] = self._build_investor_decision(report)
-        report.audit["investor_action_plan"] = self._build_investor_action_plan(report)
+        report.audit["investor_action_plan"] = self.decision_support.build(report, portfolio)
         self._attach_llm_investor_synthesis(report)
         if enable_future_event_generation or enable_recursive_forecast:
             report.audit["recursive_forecast"] = self._build_recursive_forecast(
@@ -852,7 +859,7 @@ class ScenarioEngine:
             require_confirmation=True,
             confirmed=True,
         )
-        comparison = self.rebalance_comparator.compare(current, proposed)
+        comparison = self.decision_support.compare(current, proposed)
         if self.repository is not None:
             self.repository.save_rebalance_comparison(comparison)
         return comparison

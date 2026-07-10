@@ -14,6 +14,63 @@ from scenario_engine.templates import SCENARIO_TEMPLATES
 from visualization.data_loader import StockDataLoader
 
 
+def _apply_scenario_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --scenario-ink: #17312d;
+            --scenario-muted: #526762;
+            --scenario-line: #d8e2df;
+            --scenario-surface: #f6f9f8;
+            --scenario-accent: #147d68;
+        }
+        .scenario-flow {
+            display: flex;
+            gap: .5rem;
+            margin: .5rem 0 1.25rem;
+            padding: .65rem .8rem;
+            overflow-x: auto;
+            background: var(--scenario-surface);
+            border: 1px solid var(--scenario-line);
+            border-radius: .55rem;
+        }
+        .scenario-flow span {
+            min-width: max-content;
+            color: var(--scenario-ink);
+            font-size: 1rem;
+            font-weight: 600;
+        }
+        .scenario-flow span:not(:last-child)::after {
+            content: " →";
+            margin-left: .5rem;
+            color: var(--scenario-accent);
+        }
+        [data-testid="stSidebar"] p,
+        [data-testid="stAppViewContainer"] p {
+            line-height: 1.62;
+        }
+        [data-testid="stMetric"] {
+            background: var(--scenario-surface);
+            border: 1px solid var(--scenario-line);
+            padding: .75rem;
+            border-radius: .45rem;
+        }
+        [data-testid="stDataFrame"] {
+            border: 1px solid var(--scenario-line);
+            border-radius: .45rem;
+            overflow: hidden;
+        }
+        @media (max-width: 700px) {
+            .scenario-flow { gap: .25rem; padding: .55rem; }
+            .scenario-flow span { font-size: .92rem; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 @st.cache_data(ttl=300)
 def _scenario_stock_options(keyword: str = "", limit: int = 300) -> list[dict]:
     loader = StockDataLoader()
@@ -27,11 +84,17 @@ def _scenario_stock_options(keyword: str = "", limit: int = 300) -> list[dict]:
 
 
 def show_scenario_page():
+    _apply_scenario_styles()
     st.header("情景推演实验室")
-    st.caption("输入一个担心的事件，系统直接回答：我的持仓会受什么影响、风险暴露在哪里、有哪些可选调仓方向。")
+    st.caption("研究与压力测试版｜用真实证据、历史行情和受控假设回答：风险在哪里、哪些方案值得复测。")
+    st.markdown(
+        "<div class='scenario-flow'><span>1 设置持仓</span><span>2 查证据</span><span>3 做压力测试</span><span>4 比较行动方案</span></div>",
+        unsafe_allow_html=True,
+    )
 
     with st.sidebar:
-        st.subheader("分析设置")
+        st.subheader("本次分析")
+        st.caption("推荐先保持标准模式。只有需要实时资料时再开启联网。")
         as_of_date = st.date_input("从哪一天开始看", value=date(2020, 3, 20)).strftime("%Y-%m-%d")
         horizon_label = st.radio("观察周期", ["1周", "1个月", "3个月", "6个月"], index=1)
         mode_label = st.radio("分析深度", ["快速", "标准", "深度"], index=1)
@@ -56,6 +119,10 @@ def show_scenario_page():
         max_total_branch_runs = st.slider("最多自动推演几个分支", min_value=0, max_value=3, value=1, step=1)
         enable_external_research = st.toggle("查找新闻/公告/财报证据", value=True, help="启用后才会尝试查找政策、公告、财报和新闻证据；失败不会编造内容。")
         research_network = st.toggle("允许联网查找", value=False, help="需要本机网络可用；关闭时仅使用本地已保存的证据。")
+        if enable_external_research and not research_network:
+            st.info("当前使用本地已保存证据，不会实时访问网络。")
+        elif research_network:
+            st.warning("联网只代表尝试采集；是否取得具体文档要看结果页的证据就绪度。")
         research_source_labels = st.multiselect(
             "查哪些来源",
             ["政策官网", "公告官网", "财报/业绩", "订阅新闻", "市场热榜"],
@@ -642,9 +709,19 @@ def _render_action_plan(report, reverse_report) -> None:
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     stock_rows = _build_stock_selection_candidates(report)
-    st.markdown("**选股/换股观察清单**")
-    st.caption("系统优先把持仓分成三类：需要降风险、可以继续观察、暂不适合作为加仓依据。")
+    st.markdown("**选股/换股观察清单（当前持仓）**")
+    st.caption("先看已有持仓中谁需要降风险，再看持仓外候选是否值得送回同一情景复测。")
     st.dataframe(pd.DataFrame(stock_rows), use_container_width=True, hide_index=True)
+
+    candidate_rows = _build_external_stock_candidates(report)
+    st.markdown("**持仓外选股候选池**")
+    coverage = (report.audit.get("investor_action_plan") or {}).get("coverage") or {}
+    if coverage.get("warning"):
+        st.warning(_plain_user_text(coverage["warning"]))
+    if candidate_rows:
+        st.dataframe(pd.DataFrame(candidate_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("本地行情不足，暂时没有通过数据完整性筛查的持仓外候选。")
 
     threshold = getattr(reverse_report, "loss_threshold", None)
     candidates = getattr(reverse_report, "candidates", []) or []
@@ -736,6 +813,20 @@ def _build_stock_selection_candidates(report) -> list[dict]:
             }
         )
     return rows or [{"股票": "暂无", "当前仓位": "-", "系统分类": "无法判断", "原因": "没有持仓数据", "下一步": "先录入持仓"}]
+
+
+def _build_external_stock_candidates(report) -> list[dict]:
+    items = (report.audit.get("investor_action_plan") or {}).get("stock_candidates") or []
+    return [
+        {
+            "候选股票": f"{item.get('symbol', '')} {item.get('name', '')}".strip(),
+            "筛查结论": _plain_user_text(item.get("category")),
+            "行情理由": _plain_user_text(item.get("reason")),
+            "主要缺口": "；".join(_plain_user_text(value) for value in (item.get("counter_evidence") or [])[:2]),
+            "失效条件": "；".join(_plain_user_text(value) for value in (item.get("invalidation_conditions") or [])[:2]),
+        }
+        for item in items
+    ]
 
 
 def _holding_label(item) -> str:
@@ -1163,6 +1254,7 @@ def _render_external_research(report) -> None:
     external_research = report.audit.get("external_research") or {}
     adjustment = report.audit.get("external_research_adjustment") or {}
     assessment = report.audit.get("external_research_assessment") or {}
+    readiness = external_research.get("evidence_readiness") or {}
     cols = st.columns(4)
     cols[0].metric("证据条数", external_research.get("document_count", 0))
     cols[1].metric("采集状态", _plain_research_status(external_research.get("status")))
@@ -1174,6 +1266,10 @@ def _render_external_research(report) -> None:
         st.caption("本次未找到足够高质量且高相关的外部证据，量化结果仍以本地历史和因子数据为主。")
     else:
         st.caption("外部研究未开启，本次没有使用新闻、公告、财报或政策页面修正结论。")
+    if readiness.get("status") == "source_reachable_only":
+        st.warning(readiness.get("warning") or "数据源可以访问，但尚未取得具体新闻、公告或财报，不能把入口页当作有效证据。")
+    elif readiness.get("status") == "ready":
+        st.caption(f"已取得 {readiness.get('concrete_document_count', 0)} 条带具体来源的外部资料。")
 
     for label, items in [("支持修复路径的信息", assessment.get("positive_findings", [])), ("需要警惕的信息", assessment.get("risk_findings", [])), ("建议继续观察", assessment.get("watch_points", []))]:
         if items:

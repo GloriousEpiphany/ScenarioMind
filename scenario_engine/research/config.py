@@ -30,7 +30,7 @@ DEFAULT_SOURCES = [
         endpoint="https://www.cninfo.com.cn/",
         enabled=True,
         source_quality_score=0.96,
-        metadata={"official": True, "note": "官方信息披露入口；自动公告 API 需另行配置并审计。"},
+        metadata={"official": True, "connector": "cninfo_announcements", "note": "通过巨潮证券主体查询与公告查询取得具体公告 URL。"},
     ),
     ResearchSourceConfig(
         source_id="cninfo_earnings_entry",
@@ -39,7 +39,7 @@ DEFAULT_SOURCES = [
         endpoint="https://www.cninfo.com.cn/",
         enabled=True,
         source_quality_score=0.96,
-        metadata={"official": True, "note": "财报/定期报告入口；精确公告 API 需另行配置并审计。"},
+        metadata={"official": True, "connector": "cninfo_announcements", "category": "category_ndbg_szsh", "note": "通过巨潮公告查询取得具体年度报告 PDF。"},
     ),
     ResearchSourceConfig(
         source_id="sse_announcement",

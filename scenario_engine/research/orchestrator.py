@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any
 
 from scenario_engine.schemas import Evidence, PortfolioSnapshot, ScenarioSpec
@@ -11,8 +12,10 @@ from scenario_engine.schemas import Evidence, PortfolioSnapshot, ScenarioSpec
 from .ai_filter import ScenarioEvidenceClassifier
 from .article_reader import ArticleContentReader
 from .config import load_research_sources
-from .fetchers import HotlistFetcher, PageSnapshotFetcher
+from .fetchers import CninfoAnnouncementFetcher, HotlistFetcher, PageSnapshotFetcher
 from .models import ExternalEvidenceDocument, ResearchBundle, ResearchPlan, ResearchSourceConfig, SourceFetchStatus
+from .mcp_fetcher import MCPResearchFetcher
+from .financial_statements import FinancialStatementNormalizer
 from .quality import now_iso, score_document
 from .repository import ResearchRepository
 from .rss_fetcher import RSSFetcher
@@ -54,7 +57,7 @@ class ResearchPlannerAgent:
             required_sources=required,
             tags=tags,
             article_reading_budget=budget,
-            audit={"planner": "ResearchPlannerAgent", "symbols": symbols_to_names},
+            audit={"planner": "ResearchPlannerAgent", "symbols": symbols_to_names, "as_of_date": spec.as_of_date},
         )
 
     def _dedupe(self, values: list[str]) -> list[str]:
@@ -91,7 +94,13 @@ class AnnouncementCollectorAgent(CollectorAgent):
     agent_name = "AnnouncementCollectorAgent"
     source_type = "announcement"
 
+    def __init__(self, page_fetcher, cninfo_fetcher):
+        super().__init__(page_fetcher)
+        self.cninfo_fetcher = cninfo_fetcher
+
     def collect(self, source: ResearchSourceConfig, plan: ResearchPlan):
+        if source.metadata.get("connector") == "cninfo_announcements":
+            return self.cninfo_fetcher.fetch(source, list((plan.audit.get("symbols") or {}).keys()), plan.audit.get("as_of_date") or datetime.now().strftime("%Y-%m-%d"))
         return self.fetcher.fetch(source, keywords=plan.queries)
 
 
@@ -113,6 +122,14 @@ class NewsCollectorAgent(CollectorAgent):
         return self.fetcher.fetch(source, keywords=plan.queries)
 
 
+class MCPCollectorAgent(CollectorAgent):
+    agent_name = "MCPCollectorAgent"
+    source_type = "mcp"
+
+    def collect(self, source: ResearchSourceConfig, plan: ResearchPlan):
+        return self.fetcher.fetch(source, keywords=plan.queries)
+
+
 class ArticleReaderAgent:
     agent_name = "ArticleReaderAgent"
 
@@ -127,8 +144,8 @@ class ArticleReaderAgent:
         for doc in candidates:
             result = self.reader.read(doc.url)
             if result.get("success"):
-                by_id[doc.evidence_id].content_markdown = str(result.get("content") or "")[:12000]
-                by_id[doc.evidence_id].metadata = {**doc.metadata, "article_reader": result.get("reader")}
+                by_id[doc.evidence_id].content_markdown = str(result.get("content") or "")[:200000]
+                by_id[doc.evidence_id].metadata = {**doc.metadata, "article_reader": result.get("reader"), "page_count": result.get("page_count")}
                 read_count += 1
             else:
                 failures.append({"evidence_id": doc.evidence_id, "error": result.get("error")})
@@ -180,6 +197,7 @@ class ResearchOrchestrator:
         sources: list[ResearchSourceConfig] | None = None,
         enable_network: bool = False,
         read_articles: bool = False,
+        mcp_transport=None,
     ):
         self.data_provider = data_provider
         self.repository = ResearchRepository(data_provider)
@@ -192,16 +210,20 @@ class ResearchOrchestrator:
         self.hotlist_fetcher = HotlistFetcher()
         self.rss_fetcher = RSSFetcher()
         self.page_fetcher = PageSnapshotFetcher()
+        self.cninfo_fetcher = CninfoAnnouncementFetcher()
+        self.mcp_fetcher = MCPResearchFetcher(mcp_transport)
+        self.financial_statement_normalizer = FinancialStatementNormalizer()
         self.article_reader = ArticleContentReader()
         self.article_reader_agent = ArticleReaderAgent(self.article_reader)
         self.collector_agents = {
             "policy": PolicyCollectorAgent(self.page_fetcher),
-            "announcement": AnnouncementCollectorAgent(self.page_fetcher),
-            "earnings": AnnouncementCollectorAgent(self.page_fetcher),
+            "announcement": AnnouncementCollectorAgent(self.page_fetcher, self.cninfo_fetcher),
+            "earnings": AnnouncementCollectorAgent(self.page_fetcher, self.cninfo_fetcher),
             "rss": RSSCollectorAgent(self.rss_fetcher),
             "hotlist": HotlistCollectorAgent(self.hotlist_fetcher),
             "news": NewsCollectorAgent(self.page_fetcher),
             "macro": PolicyCollectorAgent(self.page_fetcher),
+            "mcp": MCPCollectorAgent(self.mcp_fetcher),
         }
 
     def collect(
@@ -267,6 +289,7 @@ class ResearchOrchestrator:
         if self.read_articles and self.enable_network:
             classified = self._read_article_bodies(classified, article_budget or plan.article_reading_budget, agent_traces)
         saved = self.repository.save_documents(classified)
+        financial_statement_audit = self._normalize_financial_statements(saved)
         stored = self.repository.top_relevant(plan.queries, limit=30)
         merged = self._merge_documents(saved, stored)
         success_count = sum(1 for status in statuses if status.status == "success")
@@ -274,10 +297,27 @@ class ResearchOrchestrator:
         self.repository.finish_crawl(crawl_id, len(saved), success_count, failed_count)
         audit = self._audit(enabled, "completed", crawl_id, merged, statuses)
         audit["classification"] = classification_audit
+        audit["financial_statements"] = financial_statement_audit
+        audit["source_health"] = self.repository.source_health()
         return ResearchBundle(plan, merged, saved, statuses, agent_traces, audit)
 
     def to_scenario_evidence(self, bundle: ResearchBundle, limit: int = 20) -> list[Evidence]:
         return self.adapter.to_scenario_evidence(bundle.documents, limit=limit)
+
+    def search_evidence(
+        self,
+        query: str,
+        search_mode: str = "keyword",
+        limit: int = 50,
+        threshold: float = 0.4,
+        source_types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        results = self.repository.search(query, mode=search_mode, limit=limit, threshold=threshold, source_types=source_types)
+        return {
+            "success": True,
+            "summary": {"query": query, "search_mode": search_mode, "returned": len(results), "source_types": source_types or "all"},
+            "data": [document.to_dict() for document in results],
+        }
 
     def _fetch_source(self, source: ResearchSourceConfig, plan: ResearchPlan):
         agent = self.collector_agents.get(source.source_type)
@@ -294,6 +334,20 @@ class ResearchOrchestrator:
         updated, output = self.article_reader_agent.read_documents(documents, budget)
         agent_traces.append({"agent": self.article_reader_agent.agent_name, "status": "completed", "output": output})
         return updated
+
+    def _normalize_financial_statements(self, documents: list[ExternalEvidenceDocument]) -> dict[str, Any]:
+        accepted = []
+        rejected = []
+        for document in documents:
+            record = self.financial_statement_normalizer.normalize(document)
+            if record is None:
+                continue
+            if record.validation_status == "passed":
+                self.repository.save_financial_statement(record)
+                accepted.append(record.statement_id)
+            else:
+                rejected.append({"evidence_id": record.evidence_id, "issues": record.validation_issues})
+        return {"accepted_count": len(accepted), "accepted_statement_ids": accepted, "rejected": rejected}
 
     def _source_by_id(self, source_id: str) -> ResearchSourceConfig:
         for source in self.sources:
@@ -332,7 +386,22 @@ class ResearchOrchestrator:
             "document_count": len(documents),
             "source_status": [item.to_dict() for item in statuses],
             "top_evidence_ids": [doc.evidence_id for doc in documents[:10]],
+            "evidence_readiness": self._evidence_readiness(documents),
             "no_fabrication_policy": "external evidence is stored only when fetched or already present in local evidence DB",
+        }
+
+    def _evidence_readiness(self, documents: list[ExternalEvidenceDocument]) -> dict[str, Any]:
+        snapshots = [doc for doc in documents if doc.metadata.get("raw_source") == "page_snapshot"]
+        concrete = [doc for doc in documents if doc.url and doc not in snapshots]
+        by_type: dict[str, int] = {}
+        for doc in concrete:
+            by_type[doc.source_type] = by_type.get(doc.source_type, 0) + 1
+        return {
+            "status": "ready" if concrete else "source_reachable_only" if snapshots else "no_evidence",
+            "concrete_document_count": len(concrete),
+            "page_snapshot_count": len(snapshots),
+            "concrete_documents_by_type": by_type,
+            "warning": "入口页快照只证明来源可访问，不能当作具体新闻、公告或财报。" if snapshots else "",
         }
 
     def _crawl_id(self, scenario_id: str, as_of_date: str) -> str:

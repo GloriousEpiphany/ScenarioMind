@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from io import BytesIO
 
 import requests
 
@@ -52,10 +53,32 @@ class ArticleContentReader:
         try:
             response = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
             response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            if "pdf" in content_type or url.lower().endswith(".pdf"):
+                return self._read_pdf(response.content)
             text = response.text
-            return {"success": True, "error": "", "content": text[:12000], "reader": "direct_http"}
+            return {"success": True, "error": "", "content": text[:120000], "reader": "direct_http"}
         except Exception as exc:
             return {"success": False, "error": str(exc), "content": "", "reader": "direct_http"}
+
+    def _read_pdf(self, content: bytes) -> dict:
+        try:
+            from pypdf import PdfReader
+        except Exception as exc:
+            return {"success": False, "error": f"pdf_reader_unavailable: {exc}", "content": "", "reader": "pypdf"}
+        try:
+            reader = PdfReader(BytesIO(content))
+            pages = []
+            for page in reader.pages[:200]:
+                pages.append(page.extract_text() or "")
+                if sum(len(value) for value in pages) >= 200000:
+                    break
+            text = "\n".join(pages)[:200000]
+            if not text.strip():
+                return {"success": False, "error": "pdf_contains_no_extractable_text", "content": "", "reader": "pypdf"}
+            return {"success": True, "error": "", "content": text, "reader": "pypdf", "page_count": len(reader.pages)}
+        except Exception as exc:
+            return {"success": False, "error": f"pdf_parse_failed: {exc}", "content": "", "reader": "pypdf"}
 
     def _throttle(self) -> None:
         elapsed = time.time() - self._last_request_time
