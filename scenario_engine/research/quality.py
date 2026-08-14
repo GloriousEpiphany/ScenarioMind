@@ -118,13 +118,19 @@ def infer_entities(text: str, symbols_to_names: dict[str, str]) -> tuple[list[st
 
 def freshness_score(published_at: str, as_of_date: str | None = None) -> float:
     if not published_at:
-        return 0.45
+        raise ValueError("published_at or a verified first_seen_at is required")
     try:
         pub = datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
         ref = datetime.fromisoformat(as_of_date) if as_of_date else datetime.now(pub.tzinfo)
-        days = abs((ref.date() - pub.date()).days)
-    except Exception:
-        return 0.45
+        if pub.tzinfo is not None and ref.tzinfo is None:
+            ref = ref.replace(tzinfo=pub.tzinfo)
+        if pub.tzinfo is None and ref.tzinfo is not None:
+            pub = pub.replace(tzinfo=ref.tzinfo)
+        days = (ref.date() - pub.date()).days
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid evidence timestamp: {published_at!r}") from exc
+    if days < 0:
+        return 0.0
     if days <= 1:
         return 1.0
     if days <= 7:

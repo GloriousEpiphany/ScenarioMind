@@ -8,14 +8,98 @@ pipeline.
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any
 
-from scenario_engine import ScenarioEngine
+from scenario_engine import (
+    RiskPolicy,
+    ScenarioEngine,
+    ScenarioMission,
+)
 
 
-class ScenarioTools:
+class _LegacyScenarioTools:
     def __init__(self, db_path: str | None = None, persist: bool = True):
         self.engine = ScenarioEngine(db_path=db_path, persist=persist)
+
+    def deployment_readiness(
+        self,
+        *,
+        objective: str,
+        portfolio_ref: str,
+        as_of: str,
+        max_drawdown: float,
+        max_single_weight: float,
+        max_industry_weight: float,
+        min_cash_weight: float,
+        max_turnover: float,
+        transaction_cost_rate: float,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        mission = self._mission(
+            objective=objective, portfolio_ref=portfolio_ref, as_of=as_of,
+            max_drawdown=max_drawdown, max_single_weight=max_single_weight,
+            max_industry_weight=max_industry_weight, min_cash_weight=min_cash_weight,
+            max_turnover=max_turnover, transaction_cost_rate=transaction_cost_rate,
+            mission_id=mission_id,
+        )
+        return self.engine.deployment_readiness(mission).as_dict()
+
+    def execute_mission(
+        self,
+        *,
+        objective: str,
+        portfolio_ref: str,
+        as_of: str,
+        max_drawdown: float,
+        max_single_weight: float,
+        max_industry_weight: float,
+        min_cash_weight: float,
+        max_turnover: float,
+        transaction_cost_rate: float,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        mission = self._mission(
+            objective=objective, portfolio_ref=portfolio_ref, as_of=as_of,
+            max_drawdown=max_drawdown, max_single_weight=max_single_weight,
+            max_industry_weight=max_industry_weight, min_cash_weight=min_cash_weight,
+            max_turnover=max_turnover, transaction_cost_rate=transaction_cost_rate,
+            mission_id=mission_id,
+        )
+        return self.engine.execute(mission).as_dict()
+
+    @staticmethod
+    def _mission(
+        *,
+        objective: str,
+        portfolio_ref: str,
+        as_of: str,
+        max_drawdown: float,
+        max_single_weight: float,
+        max_industry_weight: float,
+        min_cash_weight: float,
+        max_turnover: float,
+        transaction_cost_rate: float,
+        mission_id: str | None,
+    ) -> ScenarioMission:
+        try:
+            cutoff = datetime.fromisoformat(as_of)
+        except ValueError as exc:
+            raise ValueError("as_of must be an ISO-8601 datetime with timezone") from exc
+        return ScenarioMission(
+            objective=objective,
+            portfolio_ref=portfolio_ref,
+            as_of=cutoff,
+            risk_policy=RiskPolicy(
+                max_drawdown=max_drawdown,
+                max_single_weight=max_single_weight,
+                max_industry_weight=max_industry_weight,
+                min_cash_weight=min_cash_weight,
+                max_turnover=max_turnover,
+                transaction_cost_rate=transaction_cost_rate,
+            ),
+            mission_id=mission_id,
+        )
 
     def parse_scenario(self, user_query: str, as_of_date: str) -> dict[str, Any]:
         spec = self.engine.parser.parse(user_query, as_of_date)
@@ -133,6 +217,7 @@ class ScenarioTools:
         limit: int = 50,
         threshold: float = 0.4,
         source_types: list[str] | None = None,
+        known_at: str | None = None,
     ) -> dict[str, Any]:
         return self.engine.research_orchestrator.search_evidence(
             query,
@@ -140,6 +225,7 @@ class ScenarioTools:
             limit=limit,
             threshold=threshold,
             source_types=source_types,
+            known_at=known_at,
         )
 
     def classify_scenario_evidence(
@@ -153,7 +239,11 @@ class ScenarioTools:
         spec = self.engine.parser.parse(user_query, as_of_date)
         portfolio = self.engine.portfolio_builder.from_weights(symbols, weights, as_of_date)
         plan = self.engine.research_orchestrator.planner.build_plan(spec, portfolio)
-        documents = self.engine.research_orchestrator.repository.top_relevant(plan.queries, limit=limit)
+        documents = self.engine.research_orchestrator.repository.top_relevant(
+            plan.queries,
+            limit=limit,
+            known_at=as_of_date,
+        )
         classified, audit = self.engine.research_orchestrator.classifier.classify(documents, plan)
         saved = self.engine.research_orchestrator.repository.save_documents(classified)
         return {"audit": audit, "documents": [item.to_dict() for item in saved]}
@@ -601,6 +691,113 @@ class ScenarioTools:
 
     def stop_event_monitoring(self, user_id: str | None = None, role: str | None = None) -> dict[str, Any]:
         return self.engine.stop_event_monitoring(user_id=user_id, role=role)
+
+    def close(self) -> None:
+        self.engine.close()
+
+
+class LegacyScenarioTools(_LegacyScenarioTools):
+    """Explicit V2 quarantine for migration-only callers."""
+
+    def __init__(self, db_path: str | None = None, persist: bool = True):
+        from scenario_engine import LegacyScenarioEngine
+
+        self.engine = LegacyScenarioEngine(db_path=db_path, persist=persist)
+
+
+class ScenarioTools:
+    """Strict V3-only tools exposed to production agent callers.
+
+    Legacy helper methods are intentionally absent.  Callers cannot reach the
+    heuristic parser, V2 research proxies, or the deprecated ``engine.run``
+    orchestration path through this class.
+    """
+
+    def __init__(self, db_path: str | None = None, persist: bool = True):
+        self.engine = ScenarioEngine(db_path=db_path, persist=persist)
+
+    def deployment_readiness(
+        self,
+        *,
+        objective: str,
+        portfolio_ref: str,
+        as_of: str,
+        max_drawdown: float,
+        max_single_weight: float,
+        max_industry_weight: float,
+        min_cash_weight: float,
+        max_turnover: float,
+        transaction_cost_rate: float,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        mission = self._mission(
+            objective=objective,
+            portfolio_ref=portfolio_ref,
+            as_of=as_of,
+            max_drawdown=max_drawdown,
+            max_single_weight=max_single_weight,
+            max_industry_weight=max_industry_weight,
+            min_cash_weight=min_cash_weight,
+            max_turnover=max_turnover,
+            transaction_cost_rate=transaction_cost_rate,
+            mission_id=mission_id,
+        )
+        return self.engine.deployment_readiness(mission).as_dict()
+
+    def execute_mission(
+        self,
+        *,
+        objective: str,
+        portfolio_ref: str,
+        as_of: str,
+        max_drawdown: float,
+        max_single_weight: float,
+        max_industry_weight: float,
+        min_cash_weight: float,
+        max_turnover: float,
+        transaction_cost_rate: float,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        mission = self._mission(
+            objective=objective,
+            portfolio_ref=portfolio_ref,
+            as_of=as_of,
+            max_drawdown=max_drawdown,
+            max_single_weight=max_single_weight,
+            max_industry_weight=max_industry_weight,
+            min_cash_weight=min_cash_weight,
+            max_turnover=max_turnover,
+            transaction_cost_rate=transaction_cost_rate,
+            mission_id=mission_id,
+        )
+        return self.engine.execute(mission).as_dict()
+
+    @staticmethod
+    def _mission(
+        *,
+        objective: str,
+        portfolio_ref: str,
+        as_of: str,
+        max_drawdown: float,
+        max_single_weight: float,
+        max_industry_weight: float,
+        min_cash_weight: float,
+        max_turnover: float,
+        transaction_cost_rate: float,
+        mission_id: str | None,
+    ) -> ScenarioMission:
+        return _LegacyScenarioTools._mission(
+            objective=objective,
+            portfolio_ref=portfolio_ref,
+            as_of=as_of,
+            max_drawdown=max_drawdown,
+            max_single_weight=max_single_weight,
+            max_industry_weight=max_industry_weight,
+            min_cash_weight=min_cash_weight,
+            max_turnover=max_turnover,
+            transaction_cost_rate=transaction_cost_rate,
+            mission_id=mission_id,
+        )
 
     def close(self) -> None:
         self.engine.close()

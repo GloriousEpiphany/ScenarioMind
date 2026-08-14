@@ -10,14 +10,14 @@ from typing import Any
 from .llm import ALLOWED_DIRECTIONS, ALLOWED_HORIZONS, LLMCallResult
 from .schemas import Assumption, ScenarioSpec, ShockSpec
 from .templates import DEFAULT_MISSING, SCENARIO_TEMPLATES
+from .errors import AdapterFailure
 
 
 class ScenarioParser:
     """Parse natural-language scenarios into ScenarioSpec.
 
-    Rules remain the fallback and normalization layer. When an LLM client is
-    supplied, it is constrained to structured scenario parsing and cannot own
-    numeric impact generation.
+    Rules are the configured local parser. When an LLM client is supplied, its
+    failure is explicit and never replaced by a different parser mid-run.
     """
 
     def __init__(self, llm_client: Any | None = None):
@@ -43,6 +43,7 @@ class ScenarioParser:
             self.last_llm_metadata = metadata or {"provider": "custom_llm_client"}
         except Exception as exc:
             self.last_llm_error = str(exc)
+            raise AdapterFailure("configured LLM scenario parser failed") from exc
         return spec
 
     def _parse_rules(self, user_query: str, as_of_date: str, horizon: str | None = None) -> ScenarioSpec:
@@ -59,8 +60,6 @@ class ScenarioParser:
         affected = list(matched_template["affected_entities"]) if matched_template else []
         missing = list(matched_template["missing"]) if matched_template else list(DEFAULT_MISSING)
         shocks = self._extract_shocks(query)
-        if matched_template and not shocks:
-            shocks = self._template_default_shocks(matched_template)
         extracted_horizon = self._extract_horizon(query)
         parsed_horizon = horizon or extracted_horizon or "1m"
         parsed_horizons = [parsed_horizon] if (horizon or extracted_horizon) else ["1w", "1m", "3m"]
@@ -72,7 +71,7 @@ class ScenarioParser:
                 Assumption(
                     key="historical_template",
                     value=matched_template["name"],
-                    source="template_default",
+                    source="historical_template_match",
                     confidence=0.65,
                     needs_user_confirmation=True,
                 )
@@ -300,35 +299,6 @@ class ScenarioParser:
             )
 
         return self._deduplicate_shocks(shocks)
-
-    def _template_default_shocks(self, template: dict) -> list[ShockSpec]:
-        factor_by_name = {
-            "中美贸易摩擦升级": "tariff",
-            "疫情冲击": "risk_appetite",
-            "地产政策放松": "real_estate_policy",
-            "海外市场大跌": "risk_appetite",
-            "央行降息": "interest_rate",
-            "央行加息或流动性收紧": "interest_rate",
-            "人民币汇率贬值": "cny_fx",
-            "油价上涨": "oil_price",
-            "白酒行业监管": "industry_regulation",
-            "新能源补贴退坡": "subsidy_policy",
-        }
-        factor = factor_by_name.get(template["name"])
-        if not factor:
-            return []
-        direction = "down" if template["name"] in {"央行降息", "地产政策放松"} else "up"
-        return [
-            ShockSpec(
-                shock_id=f"shock_template_{factor}",
-                factor=factor,
-                direction=direction,
-                magnitude=None,
-                unit="qualitative",
-                timing="unknown",
-                source="template_default",
-            )
-        ]
 
     def _deduplicate_shocks(self, shocks: list[ShockSpec]) -> list[ShockSpec]:
         seen = set()

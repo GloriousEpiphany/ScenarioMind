@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .schemas import Evidence, PortfolioImpact, ScenarioReport, ScenarioSpec, TransmissionPath
+from .errors import ContractViolation
 
 
 class ReportComposer:
@@ -33,7 +34,6 @@ class ReportComposer:
             audit=audit,
             markdown="",
         )
-        report.markdown = self._to_markdown(report)
         return report
 
     def _summary(self, total_impact: dict) -> str:
@@ -79,7 +79,9 @@ class ReportComposer:
         return recs
 
     def _to_markdown(self, report: ScenarioReport) -> str:
-        decision = report.audit.get("investor_decision") or self._fallback_decision(report)
+        decision = report.audit.get("investor_decision")
+        if decision is None:
+            raise ContractViolation("investor_decision must be validated before report rendering")
         lines = [
             f"# {report.title}",
             "",
@@ -486,50 +488,3 @@ class ReportComposer:
             date = value.replace("only local data on or before ", "")
             return f"只使用 {date} 当天及以前可审计的数据。"
         return self._clean_user_text(value)
-
-    def _fallback_decision(self, report: ScenarioReport) -> dict:
-        total = report.portfolio_total_impact
-        base_range = total.get("base_range")
-        quantified = [item for item in report.portfolio_impacts if item.expected_contribution_range is not None]
-        if base_range is None:
-            return {
-                "bottom_line": "这次情景证据不足，不能把结果当成可执行投资结论。",
-                "risk_level": "不可判定",
-                "plain_summary": report.executive_summary,
-                "main_risks": list(report.uncertainty[:3]),
-                "possible_actions": ["补充事件幅度、发生时间和真实持仓后重新推演。"],
-                "watch_points": ["缺失信息是否补齐", "本地数据是否覆盖你的持仓"],
-                "confidence_note": "可量化证据不足，因此结论偏保守。",
-            }
-        downside = base_range[0]
-        if downside <= -0.10:
-            risk_level = "高"
-        elif downside <= -0.03:
-            risk_level = "中"
-        else:
-            risk_level = "低"
-        worst = min(quantified, key=lambda item: item.expected_contribution_range[0]) if quantified else None
-        best = max(quantified, key=lambda item: item.expected_contribution_range[1]) if quantified else None
-        main_risks = []
-        if worst:
-            main_risks.append(f"最大拖累可能来自 {worst.symbol} {worst.name}，组合贡献下沿约 {worst.expected_contribution_range[0]:.2%}。")
-            main_risks.extend(worst.key_drivers[:2])
-        main_risks.extend(report.uncertainty[:2])
-        actions = ["不要把压力测试区间当成收益预测；先按自己的亏损阈值判断是否需要降风险。"]
-        if worst:
-            actions.append(f"优先复核 {worst.symbol} 的仓位是否过重，以及是否有更低相关性的替代方案。")
-        if best and best.symbol != (worst.symbol if worst else None):
-            actions.append(f"{best.symbol} 在修复路径中相对更有弹性，但这只代表情景下的相对表现，不是买入理由。")
-        return {
-            "bottom_line": f"这次情景的主要问题是下行压力约 {base_range[0]:.2%} 至 {base_range[1]:.2%}，风险等级为{risk_level}。",
-            "risk_level": risk_level,
-            "plain_summary": report.executive_summary,
-            "main_risks": sorted(set(main_risks)),
-            "possible_actions": actions,
-            "watch_points": [
-                "事件是否达到你输入的冲击幅度",
-                "最大风险持仓的下沿贡献是否超过你的承受范围",
-                "未量化持仓是否占比过高",
-            ],
-            "confidence_note": f"系统覆盖了约 {total.get('quantified_position_weight', 0):.1%} 的持仓，未覆盖部分不应被忽略。",
-        }

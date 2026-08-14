@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, time, timezone
 from difflib import SequenceMatcher
+from zoneinfo import ZoneInfo
 
 from scenario_engine.data_provider import ScenarioDataProvider
+from scenario_engine.errors import ContractViolation
 
 from .models import ExternalEvidenceDocument, ResearchSourceConfig, SourceFetchStatus
 from .quality import make_evidence_id, now_iso
@@ -342,14 +344,18 @@ class ResearchRepository:
         limit: int = 50,
         threshold: float = 0.4,
         source_types: list[str] | None = None,
+        known_at: str | datetime | None = None,
     ) -> list[ExternalEvidenceDocument]:
         query_value = str(query or "").strip()
         if not query_value:
             return []
+        cutoff = self._known_at_cutoff(known_at)
         rows = self._load_candidate_rows(source_types)
         results = []
         for row in rows:
             doc = self._row_to_document(row)
+            if not self._visible_at(doc, cutoff):
+                continue
             haystack = " ".join([doc.title, doc.summary, doc.content_markdown, " ".join(doc.entities), " ".join(doc.event_tags)])
             if mode == "keyword":
                 matched = query_value.lower() in haystack.lower()
@@ -370,20 +376,37 @@ class ResearchRepository:
         results.sort(key=lambda item: (item.metadata.get("search_score", 0), item.evidence_score), reverse=True)
         return results[:limit]
 
-    def top_relevant(self, keywords: list[str], limit: int = 30) -> list[ExternalEvidenceDocument]:
+    def top_relevant(
+        self,
+        keywords: list[str],
+        limit: int = 30,
+        *,
+        known_at: str | datetime | None = None,
+        source_types: list[str] | None = None,
+    ) -> list[ExternalEvidenceDocument]:
         docs = []
         seen = set()
+        cutoff = self._known_at_cutoff(known_at)
         for keyword in keywords:
-            matches = self.search(keyword, mode="keyword", limit=limit)
+            matches = self.search(keyword, mode="keyword", limit=limit, source_types=source_types, known_at=cutoff)
             if not matches:
-                matches = self.search(keyword, mode="fuzzy", limit=limit, threshold=0.22)
+                matches = self.search(
+                    keyword,
+                    mode="fuzzy",
+                    limit=limit,
+                    threshold=0.22,
+                    source_types=source_types,
+                    known_at=cutoff,
+                )
             for doc in matches:
                 if doc.evidence_id not in seen:
                     seen.add(doc.evidence_id)
                     docs.append(doc)
         if len(docs) < limit:
-            for row in self._load_candidate_rows():
+            for row in self._load_candidate_rows(source_types):
                 doc = self._row_to_document(row)
+                if not self._visible_at(doc, cutoff):
+                    continue
                 if doc.evidence_id in seen:
                     continue
                 if doc.evidence_score < 0.5 and doc.relevance_score < 0.5:
@@ -394,6 +417,39 @@ class ResearchRepository:
                     break
         docs.sort(key=lambda item: item.evidence_score, reverse=True)
         return docs[:limit]
+
+    @staticmethod
+    def _known_at_cutoff(value: str | datetime | None) -> datetime:
+        if value is None:
+            return datetime.now(timezone.utc)
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            raw = str(value).strip()
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ContractViolation(f"known_at is not a valid ISO timestamp: {value!r}") from exc
+            if len(raw) == 10:
+                parsed = datetime.combine(parsed.date(), time.max)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        return parsed
+
+    @staticmethod
+    def _visible_at(document: ExternalEvidenceDocument, cutoff: datetime) -> bool:
+        timestamp = document.published_at or document.first_seen_at
+        if not timestamp:
+            raise ContractViolation(f"evidence {document.evidence_id} has neither published_at nor first_seen_at")
+        try:
+            observed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ContractViolation(
+                f"evidence {document.evidence_id} has invalid availability timestamp {timestamp!r}"
+            ) from exc
+        if observed.tzinfo is None or observed.utcoffset() is None:
+            observed = observed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        return observed <= cutoff
 
     def _load_candidate_rows(self, source_types: list[str] | None = None) -> list:
         conn = self.data_provider.db.connect()

@@ -45,6 +45,9 @@ venv.bak/
 # Test, coverage, lint, type-checker caches
 # ------------------------------------------------------------------------------
 .pytest_cache/
+.deepeval/
+.benchmarks/
+.testmondata
 .tox/
 .nox/
 .coverage
@@ -134,6 +137,8 @@ temp/
 # ------------------------------------------------------------------------------
 .idea/
 .vscode/
+.agents/
+.codex/
 *.swp
 *.swo
 *~
@@ -158,5 +163,6 @@ Desktop.ini
 # ------------------------------------------------------------------------------
 exports/
 reports/
+# Optional third-party reference checkouts. StockM1 must never import these.
 MiroFish/
 TrendRadar/

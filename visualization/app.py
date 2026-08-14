@@ -2,18 +2,11 @@
 股票数据可视化主应用
 使用Streamlit构建交互式界面
 """
-import warnings
-warnings.filterwarnings('ignore')
-
 import streamlit as st
 import pandas as pd
 import sys
 import os
 from datetime import datetime, timedelta
-
-# 禁用Streamlit的弃用警告
-import logging
-logging.getLogger('streamlit').setLevel(logging.ERROR)
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

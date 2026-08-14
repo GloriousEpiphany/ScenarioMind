@@ -1,6 +1,7 @@
 """
 命令行界面模块
 """
+import json
 import os
 
 import click
@@ -11,6 +12,7 @@ from rich.table import Table
 import config
 from src.stock_app.database import Database
 from src.stock_app.data_downloader import DataDownloader
+from src.stock_app.tencent_v3_ingestion import TencentV3PriceIngestor
 from src.stock_app.trading_engine import TradingEngine
 
 
@@ -31,6 +33,13 @@ def cli():
 @click.option('--retries', default=3, type=int, show_default=True, help='单只股票失败后的重试次数')
 @click.option('--retry-delay', default=2.0, type=float, show_default=True, help='首次重试等待秒数，后续指数退避')
 @click.option('--timeout', default=15.0, type=float, show_default=True, help='单次网络请求超时秒数')
+@click.option(
+    '--source',
+    type=click.Choice(('tencent_http', 'eastmoney_http'), case_sensitive=False),
+    default='tencent_http',
+    show_default=True,
+    help='显式选择唯一行情源；不会自动换源',
+)
 @click.option('--full-refresh', is_flag=True, help='忽略数据库已有日期，强制按开始日期全量重拉')
 @click.option('--refresh-stock-list', is_flag=True, help='联网刷新股票列表；默认优先使用本地缓存，避免列表接口卡住')
 def download_stocks(
@@ -41,6 +50,7 @@ def download_stocks(
     retries,
     retry_delay,
     timeout,
+    source,
     full_refresh,
     refresh_stock_list
 ):
@@ -81,6 +91,7 @@ def download_stocks(
         retries=retries,
         retry_delay=retry_delay,
         timeout=timeout,
+        source_id=source,
         incremental=not full_refresh,
         latest_date_getter=db.get_latest_stock_date,
         save_callback=db.save_stock_daily_data
@@ -100,6 +111,96 @@ def download_stocks(
         os.remove(failed_path)
     
     db.close()
+
+
+@cli.command('ingest-v3-prices')
+@click.option('--symbol', 'symbols', multiple=True, help='只入库指定股票，可重复传入')
+@click.option('--start-date', default=config.DEFAULT_START_DATE, show_default=True, help='开始日期 (YYYYMMDD)')
+@click.option('--end-date', required=True, help='已收盘的结束日期 (YYYYMMDD)')
+@click.option('--limit', default=None, type=click.IntRange(min=1), help='限制股票数量')
+@click.option('--interval', default=1.0, type=click.FloatRange(min=0), show_default=True, help='每只股票请求后的等待秒数')
+@click.option('--retries', default=3, type=click.IntRange(min=0), show_default=True, help='单只股票失败后的重试次数')
+@click.option('--retry-delay', default=2.0, type=click.FloatRange(min=0), show_default=True, help='首次重试等待秒数')
+@click.option('--timeout', default=15.0, type=click.FloatRange(min=0.1), show_default=True, help='单次网络请求超时秒数')
+@click.option('--full-refresh', is_flag=True, help='忽略已入库的 V3 腾讯工件日期')
+def ingest_v3_prices(
+    symbols,
+    start_date,
+    end_date,
+    limit,
+    interval,
+    retries,
+    retry_delay,
+    timeout,
+    full_refresh,
+):
+    """通过腾讯源发布不可变的 V3 点时日行情工件。"""
+    db = Database()
+    try:
+        stock_list = db.get_stock_list_for_download()
+        if stock_list.empty:
+            raise click.ClickException("stock_info 为空；必须先导入带来源的股票列表快照")
+        if symbols:
+            requested = {str(symbol).strip() for symbol in symbols}
+            available = set(stock_list["code"].astype(str))
+            missing = sorted(requested.difference(available))
+            if missing:
+                raise click.ClickException(f"stock_info 不包含指定股票: {missing}")
+            stock_list = stock_list[stock_list["code"].astype(str).isin(requested)].reset_index(drop=True)
+
+        ingestor = TencentV3PriceIngestor(db.connect())
+        published = []
+
+        def publish(symbol, dataframe):
+            published.append(ingestor.ingest_dataframe(symbol, dataframe))
+
+        console.print("[bold cyan]开始从腾讯源入库严格 V3 日行情...[/bold cyan]")
+        result = DataDownloader().download_all_stocks(
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            stock_list=stock_list,
+            interval=interval,
+            retries=retries,
+            retry_delay=retry_delay,
+            timeout=timeout,
+            incremental=not full_refresh,
+            source_id="tencent_http",
+            latest_date_getter=ingestor.latest_date,
+            save_callback=publish,
+        )
+        artifact_count = sum(item.artifact_count for item in published)
+        result_color = "yellow" if result["coverage_gaps"] else "green"
+        console.print(
+            f"[{result_color}]V3 腾讯行情入库完成：{artifact_count} 条不可变工件，"
+            f"成功 {result['success']} 只，跳过 {result['skipped']} 只，"
+            f"无新交易记录 {len(result['no_new_data_symbols'])} 只，"
+            f"无历史覆盖失败 {result['failed']} 只。[/{result_color}]"
+        )
+        audit_path = os.path.join(config.DATA_DIR, "v3_tencent_ingestion_audit.json")
+        audit_payload = {
+            "source_id": "tencent_http",
+            "start_date": start_date,
+            "end_date": end_date,
+            "success": result["success"],
+            "failed": result["failed"],
+            "skipped": result["skipped"],
+            "no_new_data_symbols": result["no_new_data_symbols"],
+            "coverage_gaps": result["coverage_gaps"],
+        }
+        temporary_audit_path = audit_path + ".tmp"
+        with open(temporary_audit_path, "w", encoding="utf-8") as handle:
+            json.dump(audit_payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary_audit_path, audit_path)
+        console.print(f"[cyan]入库审计已写入: {audit_path}[/cyan]")
+        if result["failed"]:
+            raise click.ClickException(
+                f"腾讯源对 {result['failed']} 只股票在请求区间内没有任何可入库记录；"
+                f"已处理其他标的，详情见 {audit_path}"
+            )
+    finally:
+        db.close()
 
 
 @cli.command()

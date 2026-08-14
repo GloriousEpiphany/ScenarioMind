@@ -9,6 +9,7 @@ from typing import Optional
 import pandas as pd
 
 from src.stock_app.database import Database
+from .errors import DataUnavailable
 
 
 class ScenarioDataProvider:
@@ -21,8 +22,10 @@ class ScenarioDataProvider:
         cursor.execute("SELECT symbol, name, market FROM stock_info WHERE symbol = ?", (symbol,))
         row = cursor.fetchone()
         if not row:
-            return {"symbol": symbol, "name": symbol, "market": ""}
-        return {"symbol": row[0], "name": row[1] or row[0], "market": row[2] or ""}
+            raise DataUnavailable(f"stock master data unavailable for {symbol}")
+        if not str(row[1] or "").strip() or not str(row[2] or "").strip():
+            raise DataUnavailable(f"stock master data is incomplete for {symbol}")
+        return {"symbol": row[0], "name": row[1], "market": row[2]}
 
     def get_stock_history(self, symbol: str, end_date: str, lookback_days: int = 252) -> pd.DataFrame:
         start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=lookback_days * 2)).strftime("%Y-%m-%d")
@@ -42,12 +45,12 @@ class ScenarioDataProvider:
         return df
 
     def get_index_history(self, end_date: str, lookback_days: int = 252) -> pd.DataFrame:
-        for symbol in ["000300", "000001", "399001"]:
-            df = self._get_index_history(symbol, end_date, lookback_days)
-            if not df.empty:
-                df["index_symbol"] = symbol
-                return df
-        return pd.DataFrame()
+        symbol = "000300"
+        df = self._get_index_history(symbol, end_date, lookback_days)
+        if df.empty:
+            raise DataUnavailable("configured market benchmark 000300 is unavailable; benchmark substitution is forbidden")
+        df["index_symbol"] = symbol
+        return df
 
     def get_asset_history(self, table_name: str, symbol: str, end_date: str, lookback_days: int = 252) -> pd.DataFrame:
         if table_name == "stock_daily":
@@ -194,7 +197,12 @@ class ScenarioDataProvider:
             returns = history["close"].pct_change().dropna()
             latest = float(history["close"].iloc[-1])
             previous = float(history["close"].iloc[-21]) if len(history) >= 21 else float(history["close"].iloc[0])
-            amount = history["amount"].tail(20).fillna(0) if "amount" in history else history["volume"].tail(20).fillna(0)
+            if "amount" not in history or history["amount"].tail(20).isna().any():
+                continue
+            amount = history["amount"].tail(20)
+            volatility = returns.tail(60).std()
+            if pd.isna(volatility):
+                continue
             info = self.get_stock_info(symbol)
             rows.append(
                 {
@@ -204,8 +212,8 @@ class ScenarioDataProvider:
                     "history_days": len(history),
                     "latest_close": latest,
                     "momentum_20d": 0.0 if previous <= 0 else latest / previous - 1.0,
-                    "volatility_60d": float(returns.tail(60).std() or 0.0),
-                    "average_amount_20d": float(amount.mean() or 0.0),
+                    "volatility_60d": float(volatility),
+                    "average_amount_20d": float(amount.mean()),
                 }
             )
         return rows

@@ -61,6 +61,11 @@ class Database:
                 volume REAL,
                 amount REAL,
                 pct_change REAL,
+                source_id TEXT,
+                adjustment TEXT,
+                known_at TEXT,
+                schema_version TEXT,
+                license_tag TEXT,
                 UNIQUE(symbol, date)
             )
         ''')
@@ -76,6 +81,11 @@ class Database:
                 high REAL,
                 low REAL,
                 volume REAL,
+                source_id TEXT,
+                adjustment TEXT,
+                known_at TEXT,
+                schema_version TEXT,
+                license_tag TEXT,
                 UNIQUE(symbol, date)
             )
         ''')
@@ -134,8 +144,31 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_index_daily_symbol ON index_daily(symbol)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_index_daily_date ON index_daily(date)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_account ON transactions(account_id)')
+        self._ensure_columns(
+            cursor,
+            "stock_daily",
+            {
+                "source_id": "TEXT", "adjustment": "TEXT", "known_at": "TEXT",
+                "schema_version": "TEXT", "license_tag": "TEXT",
+            },
+        )
+        self._ensure_columns(
+            cursor,
+            "index_daily",
+            {
+                "source_id": "TEXT", "adjustment": "TEXT", "known_at": "TEXT",
+                "schema_version": "TEXT", "license_tag": "TEXT",
+            },
+        )
         
         conn.commit()
+
+    @staticmethod
+    def _ensure_columns(cursor, table_name: str, columns: dict[str, str]) -> None:
+        existing = {row[1] for row in cursor.execute(f"PRAGMA table_info({table_name})").fetchall()}
+        for name, column_type in columns.items():
+            if name not in existing:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {column_type}")
     
     def save_stock_info(self, stock_list: pd.DataFrame):
         """保存股票基本信息"""
@@ -149,70 +182,148 @@ class Database:
         
         conn.commit()
     
-    def save_stock_daily_data(self, symbol: str, df: pd.DataFrame):
-        """保存股票日线数据"""
+    def save_stock_daily_data(self, symbol: str, df: pd.DataFrame, *, lineage: dict | None = None):
+        """原子保存单一来源的股票日线数据。"""
         if df.empty:
-            return
-        
+            raise ValueError("cannot save an empty stock_daily batch")
+        metadata = dict(lineage or df.attrs)
+        self._validate_lineage(metadata)
+        required = {"date", "open", "close", "high", "low", "volume", "amount", "pct_change"}
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(f"stock_daily batch missing columns: {sorted(missing)}")
         conn = self.connect()
-        
-        for _, row in df.iterrows():
-            try:
-                conn.execute('''
-                    INSERT OR REPLACE INTO stock_daily 
-                    (symbol, date, open, close, high, low, volume, amount, pct_change)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        try:
+            conn.execute("BEGIN")
+            for _, row in df.iterrows():
+                values = self._strict_price_values(row, required)
+                cursor = conn.execute('''
+                    INSERT INTO stock_daily
+                    (symbol, date, open, close, high, low, volume, amount, pct_change,
+                     source_id, adjustment, known_at, schema_version, license_tag)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, date) DO NOTHING
                 ''', (
                     symbol,
-                    row.get('date', ''),
-                    float(row.get('open', 0)),
-                    float(row.get('close', 0)),
-                    float(row.get('high', 0)),
-                    float(row.get('low', 0)),
-                    float(row.get('volume', 0)),
-                    float(row.get('amount', 0)),
-                    float(row.get('pct_change', 0))
+                    values['date'], values['open'], values['close'], values['high'], values['low'],
+                    values['volume'], values['amount'], values['pct_change'],
+                    metadata['source_id'], metadata['adjustment'], metadata['known_at'],
+                    metadata['schema_version'], metadata['license_tag'],
                 ))
-            except Exception as e:
-                print(f"保存数据失败 {symbol} {row.get('date')}: {e}")
-                continue
-        
-        conn.commit()
+                if cursor.rowcount == 0:
+                    existing = conn.execute(
+                        """
+                        SELECT open, close, high, low, volume, amount, pct_change,
+                               source_id, adjustment, known_at, schema_version, license_tag
+                        FROM stock_daily WHERE symbol = ? AND date = ?
+                        """,
+                        (symbol, values['date']),
+                    ).fetchone()
+                    expected = (
+                        values['open'], values['close'], values['high'], values['low'],
+                        values['volume'], values['amount'], values['pct_change'],
+                        metadata['source_id'], metadata['adjustment'], metadata['known_at'],
+                        metadata['schema_version'], metadata['license_tag'],
+                    )
+                    self._assert_immutable_price_row("stock_daily", symbol, values['date'], existing, expected)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     
-    def save_index_daily_data(self, symbol: str, df: pd.DataFrame):
+    def save_index_daily_data(self, symbol: str, df: pd.DataFrame, *, lineage: dict | None = None):
         """
         保存指数日线数据
         注意：为避免与股票代码冲突，指数代码会自动添加99前缀
         例如：000001 -> 99000001, 399001 -> 99399001
         """
         if df.empty:
-            return
-        
+            raise ValueError("cannot save an empty index_daily batch")
+        metadata = dict(lineage or df.attrs)
+        self._validate_lineage(metadata)
+        required = {"date", "open", "close", "high", "low", "volume"}
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(f"index_daily batch missing columns: {sorted(missing)}")
         conn = self.connect()
         
         # 添加99前缀避免与股票代码冲突
         index_symbol = f"99{symbol}"
         
-        for _, row in df.iterrows():
-            try:
-                conn.execute('''
-                    INSERT OR REPLACE INTO index_daily 
-                    (symbol, date, open, close, high, low, volume)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+        try:
+            conn.execute("BEGIN")
+            for _, row in df.iterrows():
+                values = self._strict_price_values(row, required)
+                cursor = conn.execute('''
+                    INSERT INTO index_daily
+                    (symbol, date, open, close, high, low, volume,
+                     source_id, adjustment, known_at, schema_version, license_tag)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, date) DO NOTHING
                 ''', (
-                    index_symbol,  # 使用添加前缀后的代码
-                    row.get('date', ''),
-                    float(row.get('open', 0)),
-                    float(row.get('close', 0)),
-                    float(row.get('high', 0)),
-                    float(row.get('low', 0)),
-                    float(row.get('volume', 0))
+                    index_symbol,
+                    values['date'], values['open'], values['close'], values['high'], values['low'], values['volume'],
+                    metadata['source_id'], metadata['adjustment'], metadata['known_at'],
+                    metadata['schema_version'], metadata['license_tag'],
                 ))
-            except Exception as e:
-                print(f"保存指数数据失败 {index_symbol} {row.get('date')}: {e}")
-                continue
-        
-        conn.commit()
+                if cursor.rowcount == 0:
+                    existing = conn.execute(
+                        """
+                        SELECT open, close, high, low, volume,
+                               source_id, adjustment, known_at, schema_version, license_tag
+                        FROM index_daily WHERE symbol = ? AND date = ?
+                        """,
+                        (index_symbol, values['date']),
+                    ).fetchone()
+                    expected = (
+                        values['open'], values['close'], values['high'], values['low'], values['volume'],
+                        metadata['source_id'], metadata['adjustment'], metadata['known_at'],
+                        metadata['schema_version'], metadata['license_tag'],
+                    )
+                    self._assert_immutable_price_row("index_daily", index_symbol, values['date'], existing, expected)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    @staticmethod
+    def _validate_lineage(metadata: dict) -> None:
+        required = {"source_id", "adjustment", "known_at", "schema_version", "license_tag"}
+        missing = [key for key in required if not str(metadata.get(key, "")).strip()]
+        if missing:
+            raise ValueError(f"price batch lineage missing fields: {sorted(missing)}")
+        parsed = datetime.fromisoformat(str(metadata["known_at"]).replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("price batch known_at must include timezone")
+
+    @staticmethod
+    def _assert_immutable_price_row(table: str, symbol: str, date: str, existing, expected) -> None:
+        if existing is None:
+            raise RuntimeError(f"{table} conflict was reported but the existing row is missing")
+        if tuple(existing) != tuple(expected):
+            raise ValueError(
+                f"immutable {table} conflict for {symbol}/{date}; store a versioned market_artifact revision instead"
+            )
+
+    @staticmethod
+    def _strict_price_values(row, required: set[str]) -> dict:
+        values = {"date": str(row["date"]).strip()}
+        datetime.strptime(values["date"][:10], "%Y-%m-%d")
+        for name in required.difference({"date"}):
+            value = row[name]
+            if pd.isna(value):
+                if name in {"pct_change", "amount"}:
+                    values[name] = None
+                    continue
+                raise ValueError(f"price row {values['date']} has missing {name}")
+            values[name] = float(value)
+        if values["close"] <= 0 or values["open"] <= 0 or values["high"] <= 0 or values["low"] <= 0:
+            raise ValueError(f"price row {values['date']} contains non-positive OHLC")
+        if values["volume"] < 0 or (
+            "amount" in values and values["amount"] is not None and values["amount"] < 0
+        ):
+            raise ValueError(f"price row {values['date']} contains negative volume/amount")
+        return values
     
     def get_stock_data(self, 
                        symbol: str, 

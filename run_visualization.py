@@ -1,43 +1,74 @@
-"""
-启动可视化界面的快捷脚本
-"""
+"""Validated launcher for the StockM1 Streamlit application."""
+
+from __future__ import annotations
+
+from importlib import import_module
 import os
-import sys
+from pathlib import Path
 import subprocess
-import warnings
+import sys
 
-# 禁用所有警告
-warnings.filterwarnings('ignore')
-os.environ['PYTHONWARNINGS'] = 'ignore'
 
-if __name__ == '__main__':
-    # 确保在项目根目录
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(script_dir)
-    
-    # 启动Streamlit应用
-    app_path = os.path.join('visualization', 'app.py')
-    
-    print("=" * 60)
-    print("🚀 正在启动股票数据可视化系统...")
-    print("=" * 60)
-    print("\n📌 使用说明:")
-    print("  1. 浏览器会自动打开可视化界面")
-    print("  2. 如果没有自动打开，请访问: http://localhost:8501")
-    print("  3. 按 Ctrl+C 可以停止服务器\n")
-    print("=" * 60)
-    
-    # 运行streamlit
-    try:
-        subprocess.run([
-            sys.executable, '-m', 'streamlit', 'run', app_path,
-            '--server.port=8501',
-            '--server.address=localhost',
-            '--browser.gatherUsageStats=false'
-        ])
-    except KeyboardInterrupt:
-        print("\n\n✅ 已停止可视化服务器")
-    except Exception as e:
-        print(f"\n❌ 启动失败: {e}")
-        print("\n💡 请确保已安装依赖:")
-        print("   pip install -r requirements.txt")
+REQUIRED_IMPORTS = (
+    "numpy",
+    "pandas",
+    "scipy",
+    "sklearn",
+    "streamlit",
+    "plotly",
+)
+
+
+def validate_runtime() -> None:
+    if not ((3, 11) <= sys.version_info[:2] <= (3, 13)):
+        raise RuntimeError(
+            f"StockM1 requires Python 3.11-3.13; current interpreter is "
+            f"{sys.executable} ({sys.version.split()[0]})."
+        )
+    missing = []
+    import_errors = []
+    for module_name in REQUIRED_IMPORTS:
+        try:
+            import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name or str(exc.name).startswith(f"{module_name}."):
+                missing.append(module_name)
+            else:
+                import_errors.append(f"{module_name}: missing transitive dependency {exc.name}")
+        except Exception as exc:
+            import_errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
+    if missing or import_errors:
+        details = []
+        if missing:
+            details.append(f"missing modules={sorted(missing)}")
+        details.extend(import_errors)
+        raise RuntimeError(
+            "StockM1 runtime validation failed for "
+            f"{sys.executable}: {'; '.join(details)}. "
+            "Select the PyCharm SDK named 'stock' or install the exact requirements.txt lock "
+            "into the chosen interpreter."
+        )
+
+
+def main() -> None:
+    validate_runtime()
+    project_root = Path(__file__).resolve().parent
+    os.chdir(project_root)
+    app_path = project_root / "visualization" / "app.py"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            str(app_path),
+            "--server.port=8501",
+            "--server.address=localhost",
+            "--browser.gatherUsageStats=false",
+        ],
+        check=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

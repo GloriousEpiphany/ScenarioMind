@@ -357,9 +357,6 @@ StockM1/
 │   ├── run_mvp.py              # MVP启动脚本
 │   └── README.md               # AI系统文档
 │
-├── hand_tools/                 # 手动工具脚本
-│   └── download_indices.py    # 指数数据下载
-│
 ├── Docs/                       # 项目文档
 │   ├── 10年A股数据导入说明.md
 │   ├── 性能优化说明.md

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict
-from datetime import datetime
 from typing import Any
 
 from scenario_engine.schemas import Evidence, PortfolioSnapshot, ScenarioSpec
+from scenario_engine.errors import ContractViolation
 
 from .ai_filter import ScenarioEvidenceClassifier
 from .article_reader import ArticleContentReader
@@ -69,65 +69,6 @@ class ResearchPlannerAgent:
                 seen.add(clean)
                 result.append(clean)
         return result
-
-
-class CollectorAgent:
-    agent_name = "CollectorAgent"
-    source_type = ""
-
-    def __init__(self, fetcher):
-        self.fetcher = fetcher
-
-    def collect(self, source: ResearchSourceConfig, plan: ResearchPlan):
-        return self.fetcher.fetch(source)
-
-
-class PolicyCollectorAgent(CollectorAgent):
-    agent_name = "PolicyCollectorAgent"
-    source_type = "policy"
-
-    def collect(self, source: ResearchSourceConfig, plan: ResearchPlan):
-        return self.fetcher.fetch(source, keywords=plan.queries)
-
-
-class AnnouncementCollectorAgent(CollectorAgent):
-    agent_name = "AnnouncementCollectorAgent"
-    source_type = "announcement"
-
-    def __init__(self, page_fetcher, cninfo_fetcher):
-        super().__init__(page_fetcher)
-        self.cninfo_fetcher = cninfo_fetcher
-
-    def collect(self, source: ResearchSourceConfig, plan: ResearchPlan):
-        if source.metadata.get("connector") == "cninfo_announcements":
-            return self.cninfo_fetcher.fetch(source, list((plan.audit.get("symbols") or {}).keys()), plan.audit.get("as_of_date") or datetime.now().strftime("%Y-%m-%d"))
-        return self.fetcher.fetch(source, keywords=plan.queries)
-
-
-class RSSCollectorAgent(CollectorAgent):
-    agent_name = "RSSCollectorAgent"
-    source_type = "rss"
-
-
-class HotlistCollectorAgent(CollectorAgent):
-    agent_name = "HotlistCollectorAgent"
-    source_type = "hotlist"
-
-
-class NewsCollectorAgent(CollectorAgent):
-    agent_name = "NewsCollectorAgent"
-    source_type = "news"
-
-    def collect(self, source: ResearchSourceConfig, plan: ResearchPlan):
-        return self.fetcher.fetch(source, keywords=plan.queries)
-
-
-class MCPCollectorAgent(CollectorAgent):
-    agent_name = "MCPCollectorAgent"
-    source_type = "mcp"
-
-    def collect(self, source: ResearchSourceConfig, plan: ResearchPlan):
-        return self.fetcher.fetch(source, keywords=plan.queries)
 
 
 class ArticleReaderAgent:
@@ -215,16 +156,19 @@ class ResearchOrchestrator:
         self.financial_statement_normalizer = FinancialStatementNormalizer()
         self.article_reader = ArticleContentReader()
         self.article_reader_agent = ArticleReaderAgent(self.article_reader)
-        self.collector_agents = {
-            "policy": PolicyCollectorAgent(self.page_fetcher),
-            "announcement": AnnouncementCollectorAgent(self.page_fetcher, self.cninfo_fetcher),
-            "earnings": AnnouncementCollectorAgent(self.page_fetcher, self.cninfo_fetcher),
-            "rss": RSSCollectorAgent(self.rss_fetcher),
-            "hotlist": HotlistCollectorAgent(self.hotlist_fetcher),
-            "news": NewsCollectorAgent(self.page_fetcher),
-            "macro": PolicyCollectorAgent(self.page_fetcher),
-            "mcp": MCPCollectorAgent(self.mcp_fetcher),
+        self.source_adapters = {
+            "policy": ("PageSnapshotAdapter", self._fetch_keyword_page),
+            "announcement": ("AnnouncementEvidenceAdapter", self._fetch_announcement),
+            "earnings": ("AnnouncementEvidenceAdapter", self._fetch_announcement),
+            "rss": ("RSSAdapter", self._fetch_rss),
+            "hotlist": ("HotlistAdapter", self._fetch_hotlist),
+            "news": ("PageSnapshotAdapter", self._fetch_keyword_page),
+            "macro": ("PageSnapshotAdapter", self._fetch_keyword_page),
+            "mcp": ("MCPEvidenceAdapter", self._fetch_mcp),
         }
+        unknown_source_types = sorted({source.source_type for source in self.sources}.difference(self.source_adapters))
+        if unknown_source_types:
+            raise ContractViolation(f"no EvidenceSource Adapter for source types: {unknown_source_types}")
 
     def collect(
         self,
@@ -260,10 +204,10 @@ class ResearchOrchestrator:
                 status = SourceFetchStatus(source.source_id, source.source_type, "skipped", 0, "network collection disabled")
                 statuses.append(status)
                 self.repository.save_source_status(crawl_id, status)
-                agent = self.collector_agents.get(source.source_type)
+                adapter_name, _ = self.source_adapters[source.source_type]
                 agent_traces.append(
                     {
-                        "agent": agent.agent_name if agent else "UnsupportedCollector",
+                        "adapter": adapter_name,
                         "status": "skipped",
                         "output": status.to_dict(),
                     }
@@ -272,10 +216,10 @@ class ResearchOrchestrator:
             result = self._fetch_source(source, plan)
             statuses.append(result.status)
             self.repository.save_source_status(crawl_id, result.status)
-            agent = self.collector_agents.get(source.source_type)
+            adapter_name, _ = self.source_adapters[source.source_type]
             agent_traces.append(
                 {
-                    "agent": agent.agent_name if agent else "UnsupportedCollector",
+                    "adapter": adapter_name,
                     "status": result.status.status,
                     "output": result.status.to_dict(),
                 }
@@ -290,7 +234,12 @@ class ResearchOrchestrator:
             classified = self._read_article_bodies(classified, article_budget or plan.article_reading_budget, agent_traces)
         saved = self.repository.save_documents(classified)
         financial_statement_audit = self._normalize_financial_statements(saved)
-        stored = self.repository.top_relevant(plan.queries, limit=30)
+        stored = self.repository.top_relevant(
+            plan.queries,
+            limit=30,
+            known_at=as_of_date or spec.as_of_date,
+            source_types=sorted(selected_types),
+        )
         merged = self._merge_documents(saved, stored)
         success_count = sum(1 for status in statuses if status.status == "success")
         failed_count = sum(1 for status in statuses if status.status == "failed")
@@ -311,8 +260,16 @@ class ResearchOrchestrator:
         limit: int = 50,
         threshold: float = 0.4,
         source_types: list[str] | None = None,
+        known_at: str | None = None,
     ) -> dict[str, Any]:
-        results = self.repository.search(query, mode=search_mode, limit=limit, threshold=threshold, source_types=source_types)
+        results = self.repository.search(
+            query,
+            mode=search_mode,
+            limit=limit,
+            threshold=threshold,
+            source_types=source_types,
+            known_at=known_at,
+        )
         return {
             "success": True,
             "summary": {"query": query, "search_mode": search_mode, "returned": len(results), "source_types": source_types or "all"},
@@ -320,10 +277,35 @@ class ResearchOrchestrator:
         }
 
     def _fetch_source(self, source: ResearchSourceConfig, plan: ResearchPlan):
-        agent = self.collector_agents.get(source.source_type)
-        if agent is not None:
-            return agent.collect(source, plan)
-        return type("FetchResult", (), {"documents": [], "status": SourceFetchStatus(source.source_id, source.source_type, "skipped", 0, "unsupported source_type")})()
+        try:
+            _, fetch = self.source_adapters[source.source_type]
+        except KeyError as exc:
+            raise ContractViolation(f"no EvidenceSource Adapter for source_type={source.source_type!r}") from exc
+        return fetch(source, plan)
+
+    def _fetch_keyword_page(self, source: ResearchSourceConfig, plan: ResearchPlan):
+        return self.page_fetcher.fetch(source, keywords=plan.queries)
+
+    def _fetch_announcement(self, source: ResearchSourceConfig, plan: ResearchPlan):
+        if source.metadata.get("connector") == "cninfo_announcements":
+            as_of_date = plan.audit.get("as_of_date")
+            if not as_of_date:
+                raise ContractViolation("CNINFO announcement Adapter requires an explicit as_of_date")
+            return self.cninfo_fetcher.fetch(
+                source,
+                list((plan.audit.get("symbols") or {}).keys()),
+                str(as_of_date),
+            )
+        return self.page_fetcher.fetch(source, keywords=plan.queries)
+
+    def _fetch_rss(self, source: ResearchSourceConfig, plan: ResearchPlan):
+        return self.rss_fetcher.fetch(source)
+
+    def _fetch_hotlist(self, source: ResearchSourceConfig, plan: ResearchPlan):
+        return self.hotlist_fetcher.fetch(source)
+
+    def _fetch_mcp(self, source: ResearchSourceConfig, plan: ResearchPlan):
+        return self.mcp_fetcher.fetch(source, keywords=plan.queries)
 
     def _read_article_bodies(
         self,
@@ -353,7 +335,7 @@ class ResearchOrchestrator:
         for source in self.sources:
             if source.source_id == source_id:
                 return source
-        return ResearchSourceConfig(source_id=source_id, source_name=source_id, source_type="unknown", source_quality_score=0.5)
+        raise ContractViolation(f"evidence references unregistered source_id={source_id!r}")
 
     def _merge_documents(
         self,

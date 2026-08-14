@@ -17,6 +17,55 @@ from src.stock_app.portfolio import Portfolio
 
 
 class V2DataAggregationTestCase(unittest.TestCase):
+    def test_legacy_price_rows_are_idempotent_but_cannot_be_overwritten(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        db = Database(os.path.join(tmpdir.name, "stock.db"))
+        lineage = {
+            "source_id": "test_fixture", "adjustment": "none",
+            "known_at": "2024-01-02T18:00:00+08:00",
+            "schema_version": "fixture-v1", "license_tag": "test_only",
+        }
+        row = {
+            "date": "2024-01-02", "open": 100.0, "close": 100.0,
+            "high": 101.0, "low": 99.0, "volume": 1000.0,
+            "amount": 100000.0, "pct_change": 0.0,
+        }
+        try:
+            db.save_stock_daily_data("600519", pd.DataFrame([row]), lineage=lineage)
+            db.save_stock_daily_data("600519", pd.DataFrame([row]), lineage=lineage)
+            with self.assertRaises(ValueError):
+                db.save_stock_daily_data(
+                    "600519", pd.DataFrame([{**row, "close": 101.0}]), lineage=lineage
+                )
+        finally:
+            db.close()
+            tmpdir.cleanup()
+
+    def test_legacy_tencent_row_preserves_unavailable_amount_as_sql_null(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        db = Database(os.path.join(tmpdir.name, "stock.db"))
+        lineage = {
+            "source_id": "tencent_http", "adjustment": "none",
+            "known_at": "2026-08-11T09:00:00+08:00",
+            "schema_version": "tencent-six-field-v1",
+            "license_tag": "public_web_research_verify_commercial_terms",
+        }
+        row = {
+            "date": "2026-08-10", "open": 11.18, "close": 11.29,
+            "high": 11.38, "low": 11.16, "volume": 889060.0,
+            "amount": None, "pct_change": None,
+        }
+        try:
+            db.save_stock_daily_data("000001", pd.DataFrame([row]), lineage=lineage)
+            saved = db.connect().execute(
+                "SELECT amount, pct_change FROM stock_daily WHERE symbol = ? AND date = ?",
+                ("000001", "2026-08-10"),
+            ).fetchone()
+            self.assertEqual(saved, (None, None))
+        finally:
+            db.close()
+            tmpdir.cleanup()
+
     def test_empty_sources_are_explicit_and_do_not_fabricate_content(self):
         context = DataAggregator(
             data_sources=[NewsProvider(), EarningsProvider(), EconomicProvider()]
@@ -104,6 +153,13 @@ class V2DataAggregationTestCase(unittest.TestCase):
                         }
                     ]
                 ),
+                lineage={
+                    "source_id": "test_fixture",
+                    "adjustment": "none",
+                    "known_at": "2024-01-02T18:00:00+08:00",
+                    "schema_version": "fixture-v1",
+                    "license_tag": "test_only",
+                },
             )
 
             class RecordingAgent:

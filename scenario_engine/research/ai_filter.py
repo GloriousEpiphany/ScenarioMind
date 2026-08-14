@@ -8,13 +8,14 @@ from typing import Any
 
 from .models import ExternalEvidenceDocument, ResearchPlan
 from .quality import keyword_overlap_score
+from scenario_engine.errors import AdapterFailure
 
 
 class ScenarioEvidenceClassifier:
     """Classify evidence against scenario tags.
 
-    Uses an optional OpenAI-compatible LLM client when available. The fallback
-    is deterministic keyword overlap and does not claim AI usage.
+    The configured implementation is authoritative for a run.  A failed LLM
+    classification is never replaced by a different algorithm.
     """
 
     def __init__(self, llm_client: Any | None = None):
@@ -24,9 +25,7 @@ class ScenarioEvidenceClassifier:
         if not documents:
             return [], {"status": "skipped", "reason": "no_documents"}
         if self.llm_client is not None and hasattr(self.llm_client, "client"):
-            llm_docs, audit = self._classify_with_llm(documents, plan)
-            if audit.get("status") == "used":
-                return llm_docs, audit
+            return self._classify_with_llm(documents, plan)
         return self._classify_deterministic(documents, plan)
 
     def _classify_deterministic(
@@ -60,7 +59,7 @@ class ScenarioEvidenceClassifier:
                     },
                 }
             updated.append(doc)
-        return updated, {"status": "fallback", "method": "deterministic_keyword_overlap", "processed": len(updated)}
+        return updated, {"status": "used", "method": "deterministic_keyword_overlap", "processed": len(updated)}
 
     def _classify_with_llm(
         self,
@@ -120,4 +119,4 @@ class ScenarioEvidenceClassifier:
                 applied += 1
             return list(by_id.values()), {"status": "used", "method": "llm", "processed": len(documents), "applied": applied}
         except Exception as exc:
-            return documents, {"status": "failed", "error": str(exc), "fallback": "deterministic_keyword_overlap"}
+            raise AdapterFailure("LLM evidence classification failed; no alternate classifier was substituted") from exc

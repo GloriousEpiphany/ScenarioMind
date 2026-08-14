@@ -8,7 +8,7 @@ import zipfile
 import pandas as pd
 
 from scenario_engine import (
-    ScenarioEngine,
+    LegacyScenarioEngine as ScenarioEngine,
     get_golden_scenarios,
     get_scenario_report_schema,
     get_scenario_spec_schema,
@@ -22,7 +22,7 @@ from scenario_engine.templates import SCENARIO_TEMPLATES
 from scenario_engine.news_connectors import GdeltDocNewsConnector
 from scenario_engine.research.models import ExternalEvidenceDocument
 from scenario_engine.schemas import ScenarioMemoryRecord
-from Agents_Experience.core.scenario_tools import ScenarioTools
+from Agents_Experience.core.scenario_tools import LegacyScenarioTools as ScenarioTools
 from src.stock_app.database import Database
 
 
@@ -108,9 +108,16 @@ class ScenarioEngineTestCase(unittest.TestCase):
             stock_a.append(self._stock_row(date_str, price_a, i))
             stock_b.append(self._stock_row(date_str, price_b, i))
 
-        self.db.save_index_daily_data("000300", pd.DataFrame(index_rows))
-        self.db.save_stock_daily_data("000001", pd.DataFrame(stock_a))
-        self.db.save_stock_daily_data("600519", pd.DataFrame(stock_b))
+        self.lineage = {
+            "source_id": "test_fixture",
+            "adjustment": "none",
+            "known_at": "2017-01-01T00:00:00+08:00",
+            "schema_version": "fixture-v1",
+            "license_tag": "test_only",
+        }
+        self.db.save_index_daily_data("000300", pd.DataFrame(index_rows), lineage=self.lineage)
+        self.db.save_stock_daily_data("000001", pd.DataFrame(stock_a), lineage=self.lineage)
+        self.db.save_stock_daily_data("600519", pd.DataFrame(stock_b), lineage=self.lineage)
 
     def _stock_row(self, date_str, price, idx):
         return {
@@ -439,7 +446,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
             self._stock_row("2021-01-04", 9999.0, 9999),
             self._stock_row("2021-01-05", 1.0, 10000),
         ])
-        self.db.save_stock_daily_data("000001", future)
+        self.db.save_stock_daily_data("000001", future, lineage=self.lineage)
 
         engine = ScenarioEngine(self.db_path, persist=False)
         try:
@@ -1927,6 +1934,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 source_name="测试政策源",
                 title="央行 降息 LPR 银行 净息差",
                 url="https://example.com/local-rate-cut",
+                published_at="2020-03-19T10:00:00+08:00",
                 summary="本地已保存证据，用于验证不开启网络时不会伪造但会检索本地证据。",
                 event_tags=["政策信号"],
                 related_symbols=["000001"],
@@ -1964,6 +1972,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 source_name="测试政策源",
                 title="央行 降息 LPR 银行 净息差 平安银行",
                 url="https://example.com/bank-margin-risk",
+                published_at="2020-03-19T10:00:00+08:00",
                 summary="降息可能压缩银行净息差，平安银行需要复核资产质量和息差压力。",
                 event_tags=["bank_margin", "反向风险"],
                 related_symbols=["000001"],
@@ -2012,6 +2021,7 @@ class ScenarioEngineTestCase(unittest.TestCase):
                 source_name="测试政策源",
                 title="央行 降息 宽信用 银行股 平安银行",
                 url="https://example.com/policy-support",
+                published_at="2020-03-19T10:00:00+08:00",
                 summary="宽信用和政策信号可能支持银行股估值修复。",
                 event_tags=["政策信号", "credit"],
                 related_symbols=["000001"],
@@ -2266,41 +2276,38 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertEqual(forecast_count, 1)
         self.assertEqual(external_generated_count, 0)
 
-    def test_frontend_exposes_sandbox_with_plain_language(self):
+    def test_frontend_submits_strict_mission_and_projects_persisted_progress(self):
         with open("visualization/scenario_page.py", encoding="utf-8") as fh:
             source = fh.read()
-        self.assertIn("解释市场可能怎么反应", source)
-        self.assertIn("_render_financial_sandbox", source)
-        self.assertIn("谁会影响这件事", source)
-        self.assertIn("哪些情况会改变判断", source)
-        self.assertIn("_plain_agent_name", source)
-        self.assertIn("查找新闻/公告/财报证据", source)
-        self.assertIn("财报/业绩", source)
-        self.assertIn("组合可能涨跌", source)
-        self.assertIn("生成后续可能事件树", source)
-        self.assertIn("_render_recursive_forecast", source)
-        self.assertIn("假设，不是真实证据", source)
-        self.assertIn("智能助手（Agent）自动推演入口", source)
-        self.assertIn("Agent 自动生成候选", source)
-        self.assertIn("_build_agent_family_plan", source)
-        self.assertIn("事件预测只是其中一环", source)
-        self.assertIn("自动推理进行中", source)
-        self.assertIn("研究协调：", source)
-        self.assertIn("证据检索：", source)
-        self.assertIn("报告生成：", source)
-        self.assertIn("_effective_analysis_date", source)
-        self.assertIn("_render_action_plan", source)
-        self.assertIn("自动调仓候选", source)
-        self.assertIn("选股/换股观察清单", source)
-        self.assertIn("先检查情景假设（可选）", source)
+        self.assertIn("ScenarioMission(", source)
+        self.assertIn("engine.deployment_readiness(mission)", source)
+        self.assertIn("if readiness.ready:", source)
+        self.assertIn('st.session_state.pop("scenario_mission_job", None)', source)
+        self.assertIn("MissionExecutionQueue", source)
+        self.assertIn("queue.claim(", source)
+        self.assertIn("engine.execute(mission)", source)
+        self.assertIn("queue.complete(", source)
+        self.assertIn("portfolio_ref=\"current\"", source)
+        self.assertIn("RunLedger(connection).progress(run_id)", source)
+        self.assertIn("@st.fragment(run_every=\"1s\")", source)
+        self.assertIn("render_agent_progress(view_model", source)
         self.assertIn("一键开始完整推演", source)
-        self.assertIn("外部页面标题编码异常", source)
-        self.assertIn("快捷情景", source)
-        self.assertNotIn("选择一个常见情景，或直接输入你的问题", source)
-        self.assertNotIn("LLM 解析情景", source)
-        self.assertNotIn("解析情景\", use_container_width=True", source)
+        self.assertNotIn("engine.run(", source)
+        self.assertNotIn("_effective_analysis_date", source)
+        self.assertNotIn("_build_agent_family_plan", source)
+        self.assertNotIn("default_rows", source)
+        self.assertNotIn("progress.progress(", source)
+        with open("visualization/components/agent_progress.py", encoding="utf-8") as fh:
+            progress_source = fh.read()
+        self.assertIn("ScenarioProgressViewModel", progress_source)
+        self.assertIn("prefers-reduced-motion", progress_source)
         self.assertNotIn("确认解析并开始推演", source)
         self.assertNotIn("\"RSS\"", source)
+
+    def test_frontend_module_exports_callable_scenario_page(self):
+        from visualization import scenario_page
+
+        self.assertTrue(callable(scenario_page.show_scenario_page))
 
 
 if __name__ == "__main__":

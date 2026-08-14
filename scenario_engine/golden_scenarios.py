@@ -43,14 +43,14 @@ GOLDEN_SCENARIOS = [
         "template_name": "中美贸易摩擦升级",
         "query": "如果半导体出口限制升级，我的持仓会怎样？",
         "expected_event_type": "policy",
-        "expected_factors": ["tariff"],
+        "expected_factors": [],
         "default_horizons": ["1w", "1m", "3m"],
     },
     {
         "template_name": "地产政策放松",
         "query": "如果地产政策放松，我的持仓会怎样？",
         "expected_event_type": "policy",
-        "expected_factors": ["real_estate_policy"],
+        "expected_factors": [],
         "default_horizons": ["1w", "1m", "3m"],
     },
     {
@@ -71,14 +71,14 @@ GOLDEN_SCENARIOS = [
         "template_name": "白酒行业监管",
         "query": "如果白酒监管升级，我的持仓会怎样？",
         "expected_event_type": "industry",
-        "expected_factors": ["industry_regulation"],
+        "expected_factors": [],
         "default_horizons": ["1w", "1m", "3m"],
     },
     {
         "template_name": "新能源补贴退坡",
         "query": "如果新能源补贴退坡，我的持仓会怎样？",
         "expected_event_type": "policy",
-        "expected_factors": ["subsidy_policy"],
+        "expected_factors": [],
         "default_horizons": ["1w", "1m", "3m"],
     },
 ]
