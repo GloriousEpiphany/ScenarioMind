@@ -35,6 +35,7 @@ class ScenarioLLMClient:
         model: str,
         temperature: float = 0.0,
         max_tokens: int = 1200,
+        timeout_seconds: float = 90.0,
         client: Any | None = None,
     ):
         if not api_key:
@@ -44,12 +45,15 @@ class ScenarioLLMClient:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        if timeout_seconds <= 0:
+            raise ValueError("LLM timeout_seconds must be positive")
+        self.timeout_seconds = float(timeout_seconds)
         if client is None:
             try:
                 from openai import OpenAI
             except ImportError as exc:
                 raise RuntimeError("openai package is required for ScenarioLLMClient") from exc
-            client = OpenAI(base_url=api_base, api_key=api_key)
+            client = OpenAI(base_url=api_base, api_key=api_key, timeout=self.timeout_seconds)
         self.client = client
 
     @classmethod
@@ -61,18 +65,23 @@ class ScenarioLLMClient:
         - SCENARIO_LLM_API_KEY or QWEN_API_KEY or OPENAI_API_KEY
         - SCENARIO_LLM_MODEL or QWEN_MODEL or OPENAI_MODEL
 
-        For Streamlit/local use, Agents_Experience/.env is loaded when
+        For local use, the project-root .env is loaded first and the legacy
+        Agents_Experience/.env is loaded as a non-overriding fallback when
         python-dotenv is available. The engine still requires explicit
         use_llm=True or STOCKM1_SCENARIO_LLM_ENABLED=1 before calling this.
         """
         try:
             from dotenv import load_dotenv
 
-            env_path = Path(__file__).resolve().parents[1] / "Agents_Experience" / ".env"
-            if env_path.exists():
-                load_dotenv(env_path)
-            else:
-                load_dotenv()
+            project_root = Path(__file__).resolve().parents[1]
+            root_env = project_root / ".env"
+            legacy_env = project_root / "Agents_Experience" / ".env"
+            if root_env.exists():
+                load_dotenv(root_env, override=False)
+            if legacy_env.exists():
+                load_dotenv(legacy_env, override=False)
+            if not root_env.exists() and not legacy_env.exists():
+                load_dotenv(override=False)
         except Exception:
             pass
 
@@ -86,7 +95,13 @@ class ScenarioLLMClient:
             or "https://api.openai.com/v1"
         )
         model = os.getenv("SCENARIO_LLM_MODEL") or os.getenv("QWEN_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-        return cls(api_base=api_base, api_key=api_key, model=model)
+        timeout_seconds = float(os.getenv("SCENARIO_LLM_TIMEOUT_SECONDS") or 90.0)
+        return cls(
+            api_base=api_base,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
 
     def parse_scenario(self, user_query: str, as_of_date: str, horizon: str | None = None) -> LLMCallResult:
         messages = [

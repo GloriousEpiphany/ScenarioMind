@@ -1,0 +1,7 @@
+# 2026-08-17 在项目 PyCharm `stock` 解释器中完成过真实连通性探测的版本。
+-r requirements.txt
+openai==2.13.0
+akshare==1.17.95
+
+# TuShare Pro 与 RQData 是部署/许可相关能力，不在公共依赖中冒充已验证能力。
+# 有真实账户后分别安装 tushare / rqdatac，并运行 `scenario-doctor --live` 验证。

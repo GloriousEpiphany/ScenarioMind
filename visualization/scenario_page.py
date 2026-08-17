@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, time, timedelta, timezone
+import hashlib
+import json
 import sqlite3
 import threading
 from typing import Any, Mapping
@@ -17,6 +19,31 @@ import config
 from scenario_engine import RiskPolicy, ScenarioEngine, ScenarioMission
 from scenario_engine.errors import ScenarioEngineError
 from scenario_engine.ledger import MissionExecutionQueue, RunLedger
+from scenario_engine.llm import ScenarioLLMClient
+from src.stock_app.holdings_import import (
+    HoldingsImportError,
+    editor_frame,
+    holdings_template_csv,
+    import_holdings_account,
+    read_holdings_csv,
+    validate_holdings_frame,
+)
+from src.stock_app.scenario_data_prep import (
+    latest_likely_closed_trading_date,
+    prepare_v3_equity_prices,
+)
+from src.stock_app.scenario_local_features import (
+    confirm_sellable_quantity,
+    prepare_local_scenario_features,
+)
+from src.stock_app.scenario_calibration import calibrate_event_analog_model
+from src.stock_app.scenario_historical_events import (
+    historical_event_template_csv,
+    import_historical_events,
+    read_historical_event_csv,
+)
+from src.stock_app.scenario_public_data import prepare_public_scenario_data
+from src.stock_app.scenario_runtime import configured_runtime_capabilities
 from src.stock_app.v3_portfolio import (
     CurrentPortfolioSnapshotModule,
     automatically_selected_account_id,
@@ -46,15 +73,52 @@ def show_scenario_page() -> None:
         "缺数据、缺权限、未校准或约束不可行都会明确失败。"
     )
 
+    st.subheader("1. 准备当前持仓")
     portfolio_ready = _render_current_portfolio_module(config.DATABASE_PATH)
 
+    st.subheader("2. 描述真实任务并验证大模型")
+    as_of_date = st.date_input(
+        "信息截止日",
+        value=date.today(),
+        max_value=date.today(),
+        help="今天按当前时刻检查；历史日期按当日收盘后检查，且只能使用当时已知的数据。",
+        key="scenario_as_of_date",
+    )
+    objective = st.text_area(
+        "任务目标",
+        placeholder="例如：评估已确认降息事件及其信用弱化分支对当前组合的多周期损失分布",
+        height=96,
+        key="scenario_objective",
+    )
+    _render_llm_parser(objective, as_of_date)
+
+    st.subheader("3. 按缺口准备数据")
+    preflight = None
+    if portfolio_ready and objective.strip():
+        try:
+            preflight = _deployment_readiness(
+                config.DATABASE_PATH,
+                ScenarioMission(
+                    objective=objective.strip(),
+                    portfolio_ref="current",
+                    as_of=_mission_cutoff(as_of_date),
+                    risk_policy=RiskPolicy(max_drawdown=0.08, max_single_weight=0.20),
+                    mission_id="readiness-preview",
+                ),
+            )
+            if "scenario_deployment_readiness" in st.session_state:
+                st.session_state["scenario_deployment_readiness"] = preflight
+            _render_data_preparation(preflight, config.DATABASE_PATH, as_of_date)
+        except (ScenarioEngineError, ValueError) as exc:
+            st.error(f"无法完成推演前检查：{exc}")
+    elif portfolio_ready:
+        st.info("先输入本次真实任务目标；系统不会再用假任务替你预建事实事件或校准模型。")
+        st.session_state.pop("scenario_deployment_readiness", None)
+    else:
+        st.info("先导入或选择一份持仓，并补齐估值行情、发布 current 快照；随后会自动检查其余数据。")
+
+    st.subheader("4. 设置风险约束并开始推演")
     with st.form("scenario_mission_form"):
-        objective = st.text_area(
-            "任务目标",
-            placeholder="例如：评估已确认降息事件及其信用弱化分支对当前组合的多周期损失分布",
-            height=96,
-        )
-        as_of_date = st.date_input("信息截止日", value=date.today())
         cols = st.columns(3)
         max_drawdown = cols[0].number_input("最大可承受回撤", 0.01, 1.0, 0.08, 0.01)
         max_single_weight = cols[1].number_input("单股权重上限", 0.01, 1.0, 0.20, 0.01)
@@ -147,7 +211,13 @@ def _render_current_portfolio_module(db_path: str) -> bool:
     with st.expander("当前持仓智能识别与 V3 快照", expanded=True):
         notice = st.session_state.pop("scenario_portfolio_notice", None)
         if notice:
-            st.success(str(notice))
+            level, message = notice if isinstance(notice, tuple) else ("success", str(notice))
+            getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(message)
+
+        imported_account_id = st.session_state.pop("scenario_imported_account_id", None)
+        if imported_account_id is not None:
+            st.session_state["scenario_portfolio_source"] = "使用系统账户"
+            st.session_state["scenario_current_account_id"] = int(imported_account_id)
 
         connection = sqlite3.connect(db_path, timeout=30.0)
         try:
@@ -155,6 +225,24 @@ def _render_current_portfolio_module(db_path: str) -> bool:
             now = datetime.now(timezone.utc)
             snapshot = module.current_snapshot(known_at=now)
             accounts = module.discover_accounts()
+
+            source_options = ("使用系统账户", "导入现有持仓")
+            default_source = "使用系统账户" if accounts or snapshot is not None else "导入现有持仓"
+            if "scenario_portfolio_source" not in st.session_state:
+                st.session_state["scenario_portfolio_source"] = default_source
+            source = st.radio(
+                "持仓来源",
+                source_options,
+                horizontal=True,
+                key="scenario_portfolio_source",
+                help="已有模拟/交易账户可直接复用；券商导出文件或手头持仓可在本页导入。",
+            )
+            if source == "导入现有持仓":
+                _render_holdings_importer(connection, accounts)
+                if snapshot is not None:
+                    st.caption("导入并确认新账户前，原 current 快照不会被改写。")
+                return False
+
             if not accounts:
                 if snapshot is not None:
                     st.warning(
@@ -163,19 +251,7 @@ def _render_current_portfolio_module(db_path: str) -> bool:
                     )
                     _render_published_snapshot(snapshot)
                     return True
-                st.error(
-                    "数据库中没有账户，因此没有可自动识别的当前持仓；"
-                    "这与股票行情是否已入库无关。"
-                )
-                st.code(
-                    "python main.py create-account 我的组合 --capital 1000000\n"
-                    "python main.py load-account 我的组合",
-                    language="powershell",
-                )
-                st.caption(
-                    "在交易模式中录入真实数量后返回本页。Agent CSV 日志含估算价格，"
-                    "不会被冒充为当前账户持仓。"
-                )
+                st.error("数据库中没有账户。请切换到“导入现有持仓”直接录入，或先创建交易账户。")
                 return False
 
             automatic_id = automatically_selected_account_id(accounts)
@@ -259,11 +335,13 @@ def _render_current_portfolio_module(db_path: str) -> bool:
                     "以下当前持仓缺少截止此刻可见的 V3 日行情："
                     + "、".join(preview.missing_price_symbols)
                 )
-                st.code(
-                    f"python main.py ingest-v3-prices {symbols} "
-                    "--start-date <YYYYMMDD> --end-date <已收盘交易日YYYYMMDD>",
-                    language="powershell",
-                )
+                _render_price_preparation_action(db_path, preview.missing_price_symbols)
+                if st.checkbox("显示命令行备选", key="scenario_show_price_cli"):
+                    st.code(
+                        f"python main.py ingest-v3-prices {symbols} "
+                        "--start-date <YYYYMMDD> --end-date <已收盘交易日YYYYMMDD>",
+                        language="powershell",
+                    )
 
             synchronized = module.snapshot_matches(preview, snapshot)
             if synchronized:
@@ -299,6 +377,156 @@ def _render_current_portfolio_module(db_path: str) -> bool:
             return False
         finally:
             connection.close()
+
+
+def _render_holdings_importer(connection: sqlite3.Connection, accounts) -> None:
+    st.markdown("上传券商 CSV/TSV，或直接在表格中粘贴持仓；系统会识别常见中英文字段和证券代码格式。")
+    top = st.columns([2, 1])
+    uploaded = top[0].file_uploader(
+        "券商持仓文件（可选）",
+        type=("csv", "txt", "tsv"),
+        key="scenario_holdings_file",
+        help="支持 UTF-8、GB18030、GBK；最大 5 MB。不会把市值或可用数量误当成持仓数量。",
+    )
+    top[1].download_button(
+        "下载 CSV 模板",
+        data=holdings_template_csv(),
+        file_name="StockM1_持仓导入模板.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="scenario_holdings_template",
+    )
+
+    initial = editor_frame()
+    parse_error: str | None = None
+    editor_key = "scenario_holdings_editor:manual"
+    if uploaded is not None:
+        payload = uploaded.getvalue()
+        editor_key = "scenario_holdings_editor:" + hashlib.sha256(payload).hexdigest()[:12]
+        try:
+            initial = editor_frame(read_holdings_csv(payload))
+            st.success(f"已识别 {len(initial)} 行；保存前可直接在下表修正。")
+        except HoldingsImportError as exc:
+            parse_error = str(exc)
+            st.error(parse_error)
+
+    edited = st.data_editor(
+        initial,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key=editor_key,
+        column_config={
+            "证券代码": st.column_config.TextColumn("证券代码", help="如 000001、SZ000001、600000.SH"),
+            "证券名称": st.column_config.TextColumn("证券名称（可选）"),
+            "持仓数量": st.column_config.NumberColumn("持仓数量", min_value=1, step=1),
+            "成本价": st.column_config.NumberColumn("成本价", min_value=0.0001, format="%.4f"),
+        },
+    )
+    fields = st.columns(3)
+    account_name = fields[0].text_input(
+        "账户名称",
+        value=f"导入持仓-{date.today().isoformat()}",
+        key="scenario_import_account_name",
+    )
+    cash = fields[1].number_input(
+        "可用现金（元）", min_value=0.0, value=0.0, step=1000.0, key="scenario_import_cash"
+    )
+    state_date = fields[2].date_input(
+        "持仓数据日期", value=date.today(), max_value=date.today(), key="scenario_import_state_date"
+    )
+    existing_names = {item.name for item in accounts}
+    same_name = account_name.strip() in existing_names
+    replace_existing = st.checkbox(
+        "覆盖同名账户的全部原持仓",
+        value=False,
+        disabled=not same_name,
+        key="scenario_replace_account",
+        help="只有账户名称与已有账户完全相同时才需要；覆盖会在同一事务内完成。",
+    )
+    if same_name and not replace_existing:
+        st.warning("该账户名称已存在。可改用新名称，或明确勾选覆盖。")
+    if st.button(
+        "保存并使用这份持仓",
+        type="primary",
+        use_container_width=True,
+        disabled=parse_error is not None or (same_name and not replace_existing),
+        key="scenario_import_holdings",
+    ):
+        try:
+            holdings = validate_holdings_frame(edited)
+            result = import_holdings_account(
+                connection,
+                account_name=account_name,
+                cash=float(cash),
+                state_date=state_date,
+                holdings=holdings,
+                replace_existing=bool(replace_existing),
+            )
+            action = "更新" if result.replaced_existing else "创建"
+            st.session_state["scenario_portfolio_notice"] = (
+                "success",
+                f"已{action}账户“{result.account_name}”：{result.position_count} 只持仓，"
+                f"成本合计 ¥{result.cost_basis:,.2f}，现金 ¥{result.cash:,.2f}。请核对行情后发布快照。",
+            )
+            st.session_state["scenario_imported_account_id"] = result.account_id
+            st.rerun()
+        except (HoldingsImportError, sqlite3.Error) as exc:
+            st.error(f"持仓导入失败：{exc}")
+
+
+def _render_price_preparation_action(db_path: str, symbols: tuple[str, ...]) -> None:
+    with st.container(border=True):
+        st.markdown("**一键获取缺失的严格 V3 行情**")
+        end_default = latest_likely_closed_trading_date()
+        dates = st.columns(2)
+        start_date = dates[0].date_input(
+            "行情开始日",
+            value=end_default - timedelta(days=730),
+            max_value=end_default,
+            key="scenario_price_start_date",
+        )
+        end_date = dates[1].date_input(
+            "已收盘结束日",
+            value=end_default,
+            max_value=end_default,
+            key="scenario_price_end_date",
+        )
+        st.caption("使用腾讯单一来源；每条记录带来源、known_at、schema 和内容哈希，不会改写 legacy 行情表。")
+        if st.button(
+            f"获取 {len(symbols)} 只证券的 V3 行情",
+            use_container_width=True,
+            key="scenario_prepare_prices",
+        ):
+            bar = st.progress(0.0, text="准备连接行情源…")
+
+            def update(done: int, total: int, symbol: str) -> None:
+                bar.progress(done / total if total else 0.0, text=f"处理 {symbol}（{done}/{total}）")
+
+            try:
+                result = prepare_v3_equity_prices(
+                    db_path,
+                    symbols,
+                    start_date=start_date,
+                    end_date=end_date,
+                    progress=update,
+                )
+                if result.failures:
+                    details = "；".join(f"{item.symbol}: {item.message}" for item in result.failures)
+                    st.session_state["scenario_portfolio_notice"] = (
+                        "warning",
+                        f"已为 {len(result.succeeded_symbols)} 只证券写入 {result.artifact_count} 条 V3 行情；"
+                        f"{len(result.failures)} 只失败：{details}",
+                    )
+                else:
+                    st.session_state["scenario_portfolio_notice"] = (
+                        "success",
+                        f"行情准备完成：{len(result.succeeded_symbols)} 只证券，"
+                        f"共写入 {result.artifact_count} 条严格 V3 工件。",
+                    )
+                st.rerun()
+            except (ValueError, sqlite3.Error) as exc:
+                st.error(f"行情准备失败：{exc}")
 
 
 def _render_published_snapshot(snapshot) -> None:
@@ -540,6 +768,536 @@ def _mission_cutoff(selected_date: date, *, now: datetime | None = None) -> date
     return datetime.combine(selected_date, time.max, tzinfo=SHANGHAI)
 
 
+def _render_llm_parser(objective: str, as_of_date: date) -> None:
+    capabilities = {
+        item.capability_id: item for item in configured_runtime_capabilities()
+    }
+    llm = capabilities["scenario_llm"]
+    with st.container(border=True):
+        cols = st.columns([2, 1])
+        cols[0].markdown("**情景解析大模型**")
+        cols[0].caption(
+            f"主机：{llm.source_host or '未配置'} · 模型：{llm.model or '未配置'} · "
+            f"本地状态：{llm.status}"
+        )
+        can_call = bool(objective.strip()) and llm.configured and llm.dependency_available
+        if cols[1].button(
+            "实测解析",
+            use_container_width=True,
+            disabled=not can_call,
+            key="scenario_parse_with_llm",
+            help="会发起一次真实 API 请求并产生少量用量；只做结构化，不生成收益数字。",
+        ):
+            try:
+                client = ScenarioLLMClient.from_environment()
+                if client is None:
+                    raise RuntimeError("环境配置没有创建出 ScenarioLLMClient")
+                result = client.parse_scenario(
+                    objective.strip(),
+                    as_of_date.isoformat(),
+                    horizon=None,
+                )
+                st.session_state["scenario_llm_parse"] = {
+                    "parsed": result.parsed,
+                    "metadata": {
+                        "provider": result.metadata.get("provider"),
+                        "model": result.metadata.get("model"),
+                        "api_host": llm.source_host,
+                        "usage": result.metadata.get("usage"),
+                    },
+                }
+                st.session_state.pop("scenario_llm_error", None)
+            except Exception as exc:
+                st.session_state["scenario_llm_error"] = f"{type(exc).__name__}: {exc}"
+                st.session_state.pop("scenario_llm_parse", None)
+        if not llm.configured:
+            st.warning("API base、key、model 未完整配置。复制根目录 `.env.example` 为 `.env` 后填写。")
+        elif not llm.dependency_available:
+            st.error("当前解释器缺少 openai SDK；安装 requirements-scenario-public.txt。")
+        else:
+            st.info("“已配置”不等于“可调用”；只有点击实测并成功返回 JSON 后，本次会话才显示解析结果。")
+        error = st.session_state.get("scenario_llm_error")
+        if error:
+            st.error(f"大模型真实调用失败：{error}")
+        parsed = st.session_state.get("scenario_llm_parse")
+        if parsed:
+            st.success(
+                f"真实调用通过：{parsed['metadata'].get('model')}；"
+                "以下只作为任务结构化输入，不进入数值模型边界。"
+            )
+            st.json(parsed)
+
+
+def _render_data_preparation(readiness, db_path: str, as_of_date: date) -> None:
+    """Render a pre-submit checklist with a concrete acquisition path per gap."""
+    preparation_notice = st.session_state.pop("scenario_preparation_notice", None)
+    if preparation_notice:
+        level = preparation_notice.get("level", "info")
+        getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(
+            preparation_notice.get("message", "数据准备已执行")
+        )
+        rows = preparation_notice.get("items") or []
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    context = _current_portfolio_context(db_path)
+    if context is not None:
+        _render_sellable_quantity_confirmation(db_path, context, as_of_date)
+        _render_preparation_actions(db_path, context)
+
+    if readiness.ready:
+        st.success(
+            f"推演数据已就绪：截至 {readiness.mission_as_of.astimezone(SHANGHAI).isoformat()}，"
+            f"{len(readiness.available_datasets)} 个数据集、事件账本和校准模型均通过检查。"
+        )
+        return
+
+    issues = tuple(readiness.issues)
+    with st.expander(f"数据准备清单 · {len(issues)} 项待处理", expanded=True):
+        st.warning("系统尚未创建推演任务。下面每一项都给出获取或实现路径；严格数据不会用默认值补造。")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "状态": "待处理",
+                        "准备项": _readiness_label(item.code),
+                        "发现的问题": item.summary,
+                        "建议方式": _readiness_guidance(item.code),
+                    }
+                    for item in issues
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        issue_codes = {item.code for item in issues}
+        if issue_codes.intersection(
+            {
+                "artifact_store_empty",
+                "required_datasets_missing",
+                "required_domains_missing",
+                "required_routes_missing",
+                "portfolio_artifact_coverage_gap",
+            }
+        ):
+            st.info(
+                "页面上方可直接补持仓估值行情、公共财务/行业/新闻/情绪/资金流，以及由本地真实行情"
+                "派生的市场状态、因子与交易约束。历史事件研究/相似状态样本必须有真实公告日期和"
+                "成熟的 1/5/20/60 日后验；没有 TuShare/RQData 权限或自有数据时仍会阻断。"
+            )
+        if issue_codes.intersection({"observed_event_missing", "hypothesis_event_missing"}):
+            st.info(
+                "事实事件必须来自可核验公告、政策或新闻工件，再登记 ObservedEvent；"
+                "HypothesisEvent 只能在事实边界内生成，不能把模型猜测冒充已发生事件。"
+            )
+        if issue_codes.intersection({"active_calibrated_model_missing", "active_model_event_contract_mismatch"}):
+            st.info(
+                "数值结果要求已登记的 active 模型，同时满足训练截止日、样本外校准、"
+                "分位覆盖误差与 CVaR 闸门；未通过时系统只会阻断，不会输出伪精度。"
+            )
+
+        payload = json.dumps(readiness.as_dict(), ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        st.download_button(
+            "下载本次数据准备审计 JSON",
+            data=payload,
+            file_name=f"scenario_readiness_{readiness.mission_as_of.date().isoformat()}.json",
+            mime="application/json",
+            use_container_width=True,
+            key="scenario_readiness_download",
+        )
+        if st.checkbox("显示技术审计详情", key="scenario_show_readiness_audit"):
+            st.json(readiness.as_dict())
+
+
+def _current_portfolio_context(db_path: str) -> dict[str, Any] | None:
+    connection = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        row = connection.execute(
+            """
+            SELECT payload_json, known_at
+            FROM market_artifacts
+            WHERE domain = 'portfolio' AND dataset = 'portfolio_snapshot'
+              AND entity_id = 'current'
+            ORDER BY known_at DESC LIMIT 1
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return None
+    payload = json.loads(row[0])
+    positions = payload.get("positions")
+    if not isinstance(positions, list) or not positions:
+        return None
+    payload["snapshot_known_at"] = row[1]
+    return payload
+
+
+def _render_sellable_quantity_confirmation(
+    db_path: str,
+    context: Mapping[str, Any],
+    as_of_date: date,
+) -> None:
+    account_id = context.get("source_account_id")
+    if not isinstance(account_id, int):
+        return
+    positions = context.get("positions") or []
+    account_state_date = date.fromisoformat(str(context.get("account_state_date")))
+    if account_state_date < as_of_date:
+        st.caption("该持仓状态早于任务日；T+1 可卖数量可由跨日状态确定为当前持仓数量。")
+        return
+    with st.expander("确认当日可卖数量（T+1 必需）", expanded=True):
+        st.warning("当日导入的总持仓不等于可卖持仓。系统不会默认全部可卖，请按券商页面填写。")
+        connection = sqlite3.connect(db_path, timeout=30.0)
+        try:
+            table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scenario_position_operational_state'"
+            ).fetchone() is not None
+            existing = {}
+            if table_exists:
+                existing = {
+                    str(row[0]): int(row[1])
+                    for row in connection.execute(
+                        """
+                        SELECT symbol, sellable_quantity
+                        FROM scenario_position_operational_state
+                        WHERE account_id = ? AND as_of_date = ?
+                        """,
+                        (account_id, as_of_date.isoformat()),
+                    ).fetchall()
+                }
+        finally:
+            connection.close()
+        rows = []
+        for item in positions:
+            symbol = str(item["symbol"])
+            quantity = int(item["quantity"])
+            rows.append({
+                "证券代码": symbol,
+                "持仓数量": quantity,
+                "可卖数量": existing.get(symbol, 0),
+            })
+        edited = st.data_editor(
+            pd.DataFrame(rows),
+            hide_index=True,
+            use_container_width=True,
+            disabled=("证券代码", "持仓数量"),
+            key=f"scenario_sellable_editor:{account_id}:{as_of_date.isoformat()}",
+            column_config={
+                "可卖数量": st.column_config.NumberColumn("可卖数量", min_value=0, step=1),
+            },
+        )
+        if st.button("保存可卖数量确认", use_container_width=True, key="scenario_confirm_sellable"):
+            try:
+                for _, item in edited.iterrows():
+                    quantity = int(item["持仓数量"])
+                    sellable = int(item["可卖数量"])
+                    confirm_sellable_quantity(
+                        db_path,
+                        account_id=account_id,
+                        symbol=str(item["证券代码"]),
+                        as_of_date=as_of_date,
+                        sellable_quantity=sellable,
+                        position_quantity=quantity,
+                    )
+                st.session_state["scenario_preparation_notice"] = {
+                    "level": "success",
+                    "message": "已保存当日可卖数量；这是一条用户确认事实，不是系统推测。",
+                }
+                st.rerun()
+            except (ValueError, sqlite3.Error) as exc:
+                st.error(f"可卖数量保存失败：{exc}")
+
+
+def _render_preparation_actions(db_path: str, context: Mapping[str, Any]) -> None:
+    symbols = tuple(str(item["symbol"]) for item in context.get("positions", ()))
+    if not symbols:
+        return
+    capabilities = configured_runtime_capabilities()
+    with st.expander("数据源与 API 配置实况", expanded=False):
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "能力": item.capability_id,
+                    "已配置": item.configured,
+                    "依赖可导入": item.dependency_available,
+                    "本次真实探测": item.live_verified,
+                    "状态": item.status,
+                    "详情": item.detail,
+                }
+                for item in capabilities
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "配置模板：项目根目录 `.env.example`；公共已验证依赖："
+            "`requirements-scenario-public.txt`。未执行 live canary 的能力不会显示为可用。"
+        )
+    st.markdown("**按组件执行，不使用静默换源**")
+    ack = st.checkbox(
+        "我确认公共网页数据仅用于研究，并自行核对 AKShare 及其上游站点条款",
+        key="scenario_public_usage_ack",
+    )
+    cols = st.columns(3)
+    if cols[0].button(
+        "获取财务/行业/新闻/情绪",
+        use_container_width=True,
+        disabled=not ack,
+        key="scenario_prepare_public_core",
+    ):
+        try:
+            with st.spinner("逐标的请求已验证公共端点；各组件独立记录成功或失败…"):
+                result = prepare_public_scenario_data(
+                    db_path,
+                    symbols,
+                    include_money_flow=False,
+                )
+            _store_public_preparation_result(result)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"公共数据准备未启动或整体失败：{type(exc).__name__}: {exc}")
+    if cols[1].button(
+        "获取资金流（慢速）",
+        use_container_width=True,
+        disabled=not ack,
+        key="scenario_prepare_money_flow",
+        help="实测全市场资金流表可能需要 1-2 分钟；失败不会影响其他组件。",
+    ):
+        try:
+            with st.spinner("读取同花顺个股资金流全表并精确匹配当前持仓…"):
+                result = prepare_public_scenario_data(
+                    db_path,
+                    symbols,
+                    include_financials=False,
+                    include_industry=False,
+                    include_news=False,
+                    include_money_flow=True,
+                )
+            _store_public_preparation_result(result)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"资金流准备未启动或整体失败：{type(exc).__name__}: {exc}")
+    if cols[2].button(
+        "生成本地量化特征/约束",
+        use_container_width=True,
+        key="scenario_prepare_local_features",
+    ):
+        try:
+            with st.spinner("从已记录 V3 工件计算市场状态、OLS 因子、残差和交易约束…"):
+                result = prepare_local_scenario_features(db_path, symbols)
+            rows = [
+                {
+                    "证券": item.symbol or "全市场",
+                    "组件": item.component,
+                    "状态": item.status,
+                    "工件数": item.artifact_count,
+                    "详情": item.detail,
+                }
+                for item in result.items
+            ]
+            st.session_state["scenario_preparation_notice"] = {
+                "level": "success" if result.complete else "warning",
+                "message": (
+                    f"本地派生完成：写入 {result.artifact_count} 条真实计算工件。"
+                    if result.complete
+                    else "本地派生部分失败；失败项未写入默认值，详见下表。"
+                ),
+                "items": rows,
+            }
+            st.rerun()
+        except Exception as exc:
+            st.error(f"本地派生未启动或整体失败：{type(exc).__name__}: {exc}")
+    _render_historical_event_and_calibration(db_path, symbols)
+
+
+def _render_historical_event_and_calibration(db_path: str, symbols: tuple[str, ...]) -> None:
+    with st.expander("历史事件样本与真实校准", expanded=False):
+        st.caption(
+            "公共近期新闻不足以生成 60 日后验。可导入自有公告/事件原文元数据；"
+            "系统只从本地 V3 行情计算收益，不接受手填收益率。"
+        )
+        top = st.columns([2, 1])
+        uploaded = top[0].file_uploader(
+            "历史事件 CSV",
+            type=("csv",),
+            key="scenario_historical_event_file",
+        )
+        top[1].download_button(
+            "下载事件模板",
+            data=historical_event_template_csv(),
+            file_name="StockM1_历史事件模板.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="scenario_historical_event_template",
+        )
+        frame = None
+        if uploaded is not None:
+            try:
+                frame = read_historical_event_csv(uploaded.getvalue())
+                st.dataframe(
+                    frame.drop(columns=["document_text"], errors="ignore").head(20),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(f"已验证 {len(frame)} 行；原文不在预览表展开，导入时会计算 SHA-256。")
+            except Exception as exc:
+                st.error(f"历史事件文件无效：{type(exc).__name__}: {exc}")
+        if st.button(
+            "导入并计算成熟后验",
+            use_container_width=True,
+            disabled=frame is None,
+            key="scenario_import_historical_events",
+        ):
+            result = import_historical_events(
+                db_path,
+                frame,
+                portfolio_symbols=symbols,
+            )
+            rows = [
+                {
+                    "事件 ID": item.event_id,
+                    "状态": item.status,
+                    "工件数": item.artifact_count,
+                    "详情": item.detail,
+                }
+                for item in result.items
+            ]
+            st.session_state["scenario_preparation_notice"] = {
+                "level": "success" if result.complete else "warning",
+                "message": (
+                    f"历史事件导入完成：{result.completed_samples} 个成熟样本。"
+                    if result.complete
+                    else "历史事件部分失败；未成熟事件没有生成后验收益。"
+                ),
+                "items": rows,
+            }
+            st.rerun()
+
+        event_types = _historical_event_type_counts(db_path)
+        if event_types:
+            options = tuple(event_types)
+            event_type = st.selectbox(
+                "待校准事件类型",
+                options,
+                format_func=lambda item: f"{item}（{event_types[item]} 个成熟样本）",
+                key="scenario_calibration_event_type",
+            )
+        else:
+            event_type = None
+            st.info("尚无成熟 event_study_observation，不能校准。")
+        min_samples = st.number_input(
+            "最小训练事件数",
+            min_value=5,
+            value=20,
+            step=1,
+            key="scenario_calibration_min_samples",
+        )
+        if st.button(
+            "运行时间留出校准并尝试激活",
+            use_container_width=True,
+            disabled=event_type is None,
+            key="scenario_calibrate_model",
+        ):
+            try:
+                result = calibrate_event_analog_model(
+                    db_path,
+                    event_type=str(event_type),
+                    portfolio_symbols=symbols,
+                    min_samples=int(min_samples),
+                )
+                st.session_state["scenario_preparation_notice"] = {
+                    "level": "success" if result.active else "warning",
+                    "message": result.detail,
+                    "items": [{
+                        "模型": f"{result.model_id}/{result.version}",
+                        "状态": result.status,
+                        "训练事件": result.training_event_count,
+                        "留出事件": result.validation_event_count,
+                        "覆盖率": result.metrics["coverage"],
+                        "分位覆盖误差": result.metrics["quantile_coverage_error"],
+                        "下尾超限率": result.metrics["cvar_exceedance_rate"],
+                    }],
+                }
+                st.rerun()
+            except Exception as exc:
+                st.error(f"模型校准未完成：{type(exc).__name__}: {exc}")
+
+
+def _historical_event_type_counts(db_path: str) -> dict[str, int]:
+    connection = sqlite3.connect(db_path, timeout=30.0)
+    try:
+        rows = connection.execute(
+            """
+            SELECT json_extract(payload_json, '$.event_type'),
+                   COUNT(DISTINCT json_extract(payload_json, '$.historical_event_id'))
+            FROM market_artifacts
+            WHERE domain = 'event' AND dataset = 'event_study_observation'
+            GROUP BY json_extract(payload_json, '$.event_type')
+            ORDER BY 1
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+    return {str(event_type): int(count) for event_type, count in rows if event_type}
+
+
+def _store_public_preparation_result(result) -> None:
+    rows = [
+        {
+            "证券": item.symbol,
+            "组件": item.component,
+            "状态": item.status,
+            "工件数": item.artifact_count,
+            "详情": item.detail,
+        }
+        for item in result.items
+    ]
+    st.session_state["scenario_preparation_notice"] = {
+        "level": "success" if result.complete else "warning",
+        "message": (
+            f"公共数据准备完成：写入 {result.artifact_count} 条严格工件。"
+            if result.complete
+            else "公共数据只有部分组件完成；失败项未填默认值，详见下表。"
+        ),
+        "items": rows,
+    }
+
+
+def _readiness_label(code: str) -> str:
+    labels = {
+        "artifact_store_empty": "点时工件库",
+        "required_datasets_missing": "必需数据集",
+        "required_domains_missing": "数据域能力",
+        "required_routes_missing": "数据源路由",
+        "portfolio_snapshot_unavailable": "当前持仓快照",
+        "portfolio_artifact_coverage_gap": "逐标的数据覆盖",
+        "observed_event_missing": "可核验事实事件",
+        "hypothesis_event_missing": "结构化情景分支",
+        "active_calibrated_model_missing": "已校准量化模型",
+        "active_model_event_contract_mismatch": "模型与当前事件契约",
+    }
+    return labels.get(code, code)
+
+
+def _readiness_guidance(code: str) -> str:
+    if code == "portfolio_snapshot_unavailable":
+        return "在步骤 1 导入/选择真实持仓，补齐估值行情并发布 current 快照"
+    if code in {"artifact_store_empty", "portfolio_artifact_coverage_gap"}:
+        return "行情用页面内一键获取；其他缺口按严格 PIT Adapter 入库"
+    if code in {"required_datasets_missing", "required_domains_missing", "required_routes_missing"}:
+        return "先用页面逐项准备；历史事件样本缺口须配置有许可的 TuShare/RQData 或导入自有可审计数据"
+    if code == "observed_event_missing":
+        return "从公告、政策或新闻原文生成事实工件并登记 ObservedEvent"
+    if code == "hypothesis_event_missing":
+        return "在事实事件就绪后生成带触发、失效条件和数据需求的假设分支"
+    if code == "active_calibrated_model_missing":
+        return "取得成熟历史事件样本后做样本外覆盖率/CVaR 校准；只有通过闸门才登记 active"
+    if code == "active_model_event_contract_mismatch":
+        return "按当前根事件的 event_type 与 state 字段重新准备历史事件样本并校准"
+    return "按阻断详情完成数据或能力配置后重新检查"
+
+
 def _render_readiness(readiness) -> None:
     st.error("严格 V3 部署未就绪，任务未创建。以下项目必须先完成；系统没有使用旧行情或默认值继续运行。")
     st.dataframe(
@@ -564,7 +1322,15 @@ def _render_readiness(readiness) -> None:
             f"状态：{legacy.get('disposition')}。该表未进入本次推演。"
         )
     issue_codes = {item.code for item in readiness.issues}
-    if issue_codes.intersection({"artifact_store_empty", "required_datasets_missing", "required_routes_missing"}):
+    if issue_codes.intersection(
+        {
+            "artifact_store_empty",
+            "required_datasets_missing",
+            "required_domains_missing",
+            "required_routes_missing",
+            "portfolio_artifact_coverage_gap",
+        }
+    ):
         st.info(
             "腾讯日行情可通过下列严格入库命令写入 `market_artifacts`。"
             "请把标的替换为真实组合持仓，并显式指定一个已收盘日。"

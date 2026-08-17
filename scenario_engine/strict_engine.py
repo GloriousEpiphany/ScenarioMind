@@ -9,6 +9,7 @@ rule/proxy/fallback stack that V3 explicitly quarantines.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from typing import Sequence
 
 from src.stock_app.database import Database
@@ -21,6 +22,7 @@ from .data import (
     RoutingPolicy,
     RoutingRule,
     StructuredDataRouter,
+    canonical_payload_hash,
 )
 from .errors import ContractViolation, DataUnavailable, ScenarioEngineError
 from .events import BranchPlanner, EventLedger
@@ -113,7 +115,19 @@ class ScenarioEngine:
                 context={"required_table": "market_artifacts"},
             ))
 
-        plan = MissionController.plan("readiness")
+        active_model_policy = None
+        active_model_error = None
+        try:
+            active_model_policy = self.model_registry.active_as_of(mission.as_of)
+        except ScenarioEngineError as exc:
+            active_model_error = exc
+        plan = MissionController.plan(
+            "readiness",
+            adapter_ids=(
+                tuple(active_model_policy.adapter_weights)
+                if active_model_policy is not None else None
+            ),
+        )
         required_exact = {
             (domain, dataset)
             for domain, domain_datasets in plan.required_datasets.items()
@@ -177,6 +191,8 @@ class ScenarioEngine:
                 dataset_set,
                 routing_policy=routing_policy,
                 available_capabilities=available_capabilities,
+                plan=plan,
+                model_policy=active_model_policy,
             )
             if coverage_gaps:
                 issues.append(ReadinessIssue(
@@ -188,6 +204,7 @@ class ScenarioEngine:
                 ))
 
         observed = self.event_ledger.observed_as_of(mission.as_of)
+        observed = tuple(item for item in observed if not bool(item.payload.get("training_only")))
         if portfolio is not None:
             observed = tuple(item for item in observed if set(item.entity_ids).intersection(portfolio.symbols))
         if not observed:
@@ -197,6 +214,45 @@ class ScenarioEngine:
                 summary="任务截止时点没有与组合相关的 ObservedEvent。",
                 required_action="从可核验事实工件登记 ObservedEvent、证据哈希和结构化 state_changes。",
             ))
+        elif active_model_policy is not None and portfolio is not None:
+            root = MissionController._select_root_event(mission, portfolio, observed)
+            metadata_row = self.market_artifact_repository.connection.execute(
+                """
+                SELECT feature_schema_json FROM model_versions
+                WHERE model_id = ? AND version = ?
+                """,
+                (active_model_policy.model_id, active_model_policy.version),
+            ).fetchone()
+            feature_schema = json.loads(metadata_row[0]) if metadata_row is not None else {}
+            calibrated_event_type = feature_schema.get("event_type")
+            calibrated_state_keys = set(feature_schema.get("state_keys") or ())
+            root_state = root.payload.get("state_changes")
+            root_state_keys = {
+                str(item.get("key")) for item in root_state
+                if isinstance(item, dict) and item.get("key")
+            } if isinstance(root_state, list) else set()
+            mismatch = (
+                calibrated_event_type
+                and (
+                    calibrated_event_type != root.event_type
+                    or (calibrated_state_keys and calibrated_state_keys != root_state_keys)
+                )
+            )
+            if mismatch:
+                issues.append(ReadinessIssue(
+                    code="active_model_event_contract_mismatch",
+                    component="model_registry",
+                    summary=(
+                        f"active 模型按 {calibrated_event_type}/{sorted(calibrated_state_keys)} 校准，"
+                        f"当前根事件为 {root.event_type}/{sorted(root_state_keys)}。"
+                    ),
+                    required_action="为当前事件类型和 state 字段导入成熟样本并重新做样本外校准。",
+                    context={
+                        "model_id": active_model_policy.model_id,
+                        "model_version": active_model_policy.version,
+                        "root_event_id": root.event_id,
+                    },
+                ))
         if not self.event_ledger.hypotheses_as_of(mission.as_of):
             issues.append(ReadinessIssue(
                 code="hypothesis_event_missing",
@@ -205,9 +261,10 @@ class ScenarioEngine:
                 required_action="基于已登记事件和缺口生成带触发、失效、所需数据与状态变化的分支假设。",
             ))
 
-        try:
-            self.model_registry.active_as_of(mission.as_of)
-        except ScenarioEngineError as exc:
+        if active_model_policy is None:
+            exc = active_model_error or DataUnavailable(
+                "no active calibrated model version exists at mission known_at"
+            )
             issues.append(ReadinessIssue(
                 code="active_calibrated_model_missing",
                 component="model_registry",
@@ -233,18 +290,29 @@ class ScenarioEngine:
             raise TypeError("execute() requires a ScenarioMission")
         self.deployment_readiness(mission).require_ready()
         _, adapters, routing_policy, _ = self._structured_data_runtime()
+        model_policy = self.model_registry.active_as_of(mission.as_of)
+        quant_adapter_by_id = {
+            "event_study": EventStudyAdapter(),
+            "factor_shock": FactorShockAdapter(),
+            "analog_state": AnalogStateAdapter(),
+        }
+        try:
+            quant_adapters = tuple(
+                quant_adapter_by_id[adapter_id]
+                for adapter_id in model_policy.adapter_weights
+            )
+        except KeyError as exc:
+            raise ContractViolation(f"active model declares unsupported Adapter {exc.args[0]!r}") from exc
         controller = MissionController(
             snapshot_module=PointInTimeMarketSnapshot(
                 StructuredDataRouter(adapters, routing_policy, self.market_artifact_repository)
             ),
             event_ledger=self.event_ledger,
-            impact_model=EventConditionedImpactModel(
-                (EventStudyAdapter(), FactorShockAdapter(), AnalogStateAdapter())
-            ),
+            impact_model=EventConditionedImpactModel(quant_adapters),
             portfolio_policy=PortfolioPolicy(),
             portfolio_resolver=SQLitePointInTimePortfolioResolver(self.market_artifact_repository),
             run_ledger=self.run_ledger,
-            model_policy=self.model_registry.active_as_of(mission.as_of),
+            model_policy=model_policy,
             capability_providers=adapters,
             constraint_builder=StrictConstraintBuilder(),
             branch_planner=BranchPlanner(),
@@ -331,8 +399,9 @@ class ScenarioEngine:
         *,
         routing_policy: RoutingPolicy,
         available_capabilities: set[tuple[str, str, str]],
+        plan,
+        model_policy,
     ) -> list[dict[str, str]]:
-        plan = MissionController.plan("readiness")
         gaps: list[dict[str, str]] = []
         for symbol in symbols:
             for domain in sorted(plan.required_domains):
@@ -351,9 +420,56 @@ class ScenarioEngine:
                         for source_id in rule.source_ids
                     ):
                         continue
+                    if (
+                        domain == "event"
+                        and dataset in {"event_study_observation", "analog_state_observation"}
+                        and self._has_event_sample_coverage(
+                            dataset,
+                            symbol,
+                            as_of,
+                            min_samples=(model_policy.min_samples if model_policy is not None else 1),
+                        )
+                    ):
+                        continue
                     if not self._has_visible_artifact(domain, dataset, symbol, as_of):
                         gaps.append({"symbol": symbol, "domain": domain, "dataset": dataset})
         return gaps
+
+    def _has_event_sample_coverage(
+        self,
+        dataset: str,
+        symbol: str,
+        as_of: datetime,
+        *,
+        min_samples: int,
+    ) -> bool:
+        lookback = MissionController.plan("readiness").lookback_days["event"]
+        rows = self.market_artifact_repository.connection.execute(
+            """
+            SELECT payload_json
+            FROM market_artifacts
+            WHERE domain = 'event' AND dataset = ?
+              AND event_time >= ? AND event_time <= ? AND known_at <= ?
+              AND (published_at IS NULL OR published_at <= ?)
+            """,
+            (
+                dataset,
+                (as_of - timedelta(days=lookback)).isoformat(),
+                as_of.isoformat(),
+                as_of.isoformat(),
+                as_of.isoformat(),
+            ),
+        ).fetchall()
+        covered = set()
+        for row in rows:
+            payload = json.loads(row[0])
+            returns = payload.get("returns")
+            by_symbol = returns.get(symbol) if isinstance(returns, dict) else None
+            if not isinstance(by_symbol, dict) or any(str(horizon) not in by_symbol for horizon in (1, 5, 20, 60)):
+                continue
+            identity = payload.get("historical_event_id") or canonical_payload_hash(payload)
+            covered.add(str(identity))
+        return len(covered) >= min_samples
 
     def _has_visible_artifact(
         self,

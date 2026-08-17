@@ -26,18 +26,34 @@ class FundamentalAndIndustryExposure:
         provenance = []
         missing_symbols = []
         for symbol in symbols:
-            artifacts = [
+            all_artifacts = [
                 *snapshot.select(domain="fundamental", entity_id=symbol),
                 *snapshot.select(domain="industry", entity_id=symbol),
                 *snapshot.select(domain="flow", entity_id=symbol),
             ]
-            if any("disputed" in item.quality_flags or "conflicted" in item.quality_flags for item in artifacts):
+            if any("disputed" in item.quality_flags or "conflicted" in item.quality_flags for item in all_artifacts):
                 raise DataConflict(f"fundamental or industry artifacts are disputed for {symbol}")
-            if not artifacts:
+            if not all_artifacts:
                 missing_symbols.append(symbol)
                 continue
+            artifacts = []
+            by_dataset: dict[tuple[str, str], list] = {}
+            for artifact in all_artifacts:
+                by_dataset.setdefault((artifact.domain, artifact.dataset), []).append(artifact)
+            for key, candidates in by_dataset.items():
+                latest_stamp = max((item.event_time, item.known_at) for item in candidates)
+                latest = [
+                    item for item in candidates
+                    if (item.event_time, item.known_at) == latest_stamp
+                ]
+                payload_hashes = {item.payload_hash for item in latest}
+                if len(payload_hashes) != 1:
+                    raise DataConflict(
+                        f"unreconciled latest {key[0]}/{key[1]} artifacts for {symbol}"
+                    )
+                artifacts.append(latest[0])
             merged: dict[str, Any] = {}
-            for artifact in sorted(artifacts, key=lambda item: item.known_at):
+            for artifact in sorted(artifacts, key=lambda item: (item.domain, item.dataset)):
                 overlap = set(merged).intersection(artifact.payload)
                 disagreements = [key for key in overlap if merged[key] != artifact.payload[key]]
                 if disagreements:

@@ -132,7 +132,7 @@ class MissionController:
 
     def execute(self, mission: ScenarioMission) -> MissionResult:
         run_id = mission.mission_id or self._run_id(mission)
-        plan = self._plan(run_id)
+        plan = self.plan(run_id, adapter_ids=tuple(self.model_policy.adapter_weights))
         self.run_ledger.create_mission(run_id, mission)
         try:
             self._progress(run_id, "capability", "data_steward", "running", 0, 1, "capability_probe")
@@ -342,30 +342,55 @@ class MissionController:
         return "mission_" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:20]
 
     @staticmethod
-    def plan(run_id):
+    def plan(run_id, adapter_ids=None):
+        selected = set(adapter_ids or ("event_study", "factor_shock", "analog_state"))
+        supported = {"event_study", "factor_shock", "analog_state"}
+        unknown = selected.difference(supported)
+        if unknown:
+            raise ContractViolation(f"unsupported quantitative adapter ids: {sorted(unknown)}")
+        if not selected:
+            raise ContractViolation("mission plan requires at least one quantitative adapter")
         datasets = {
             "price": ("equity_price",),
-            "event": ("observed_event_source", "event_study_observation", "analog_state_observation"),
+            "event": tuple(
+                dataset
+                for dataset, adapter_id in (
+                    ("observed_event_source", None),
+                    ("event_study_observation", "event_study"),
+                    ("analog_state_observation", "analog_state"),
+                )
+                if adapter_id is None or adapter_id in selected
+            ),
             "fundamental": ("pit_financials",),
             "industry": ("industry_membership",),
             "flow": ("money_flow",),
             "sentiment": ("event_text_features",),
             "market_regime": ("market_regime",),
-            "quant": ("factor_exposure", "factor_residuals"),
             "portfolio_constraint": ("asset_constraint",),
         }
+        if "factor_shock" in selected:
+            datasets["quant"] = ("factor_exposure", "factor_residuals")
         domains = frozenset(datasets)
         return MissionPlan(
             run_id=run_id, required_domains=domains, required_datasets=datasets,
-            lookback_days={domain: (3650 if domain in {"event", "quant"} else 730) for domain in domains},
+            lookback_days={
+                domain: (
+                    36500 if domain == "industry"
+                    else 3650 if domain in {"event", "quant"}
+                    else 730
+                )
+                for domain in domains
+            },
             max_branch_depth=2, max_branches_per_node=3, max_total_branch_runs=7,
         )
 
-    _plan = plan
-
     @staticmethod
     def _select_root_event(mission, portfolio, events: tuple[ObservedEvent, ...]):
-        candidates = [item for item in events if set(item.entity_ids).intersection(portfolio.symbols)]
+        candidates = [
+            item for item in events
+            if not bool(item.payload.get("training_only"))
+            and set(item.entity_ids).intersection(portfolio.symbols)
+        ]
         if not candidates:
             raise DataUnavailable("no observed event relevant to the portfolio exists at known_at")
         terms = set(mission.objective.lower().split())

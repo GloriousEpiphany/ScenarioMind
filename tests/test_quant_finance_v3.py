@@ -4,6 +4,7 @@ from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 import json
 import sqlite3
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -55,6 +56,7 @@ from scenario_engine.ledger import (
     RunLedger,
 )
 from scenario_engine.mission import (
+    MissionController,
     RiskPolicy,
     SQLitePointInTimePortfolioResolver,
     ScenarioMission,
@@ -226,6 +228,33 @@ def test_strict_engine_facade_rejects_quarantined_v2_run(tmp_path):
             engine.run("legacy proxy scenario", "2020-03-20", symbols=["000001"])
     finally:
         engine.close()
+
+
+def test_mission_plan_keeps_current_industry_membership_beyond_price_lookback():
+    plan = MissionController.plan("industry-slow-dimension")
+    assert plan.lookback_days["industry"] == 36500
+    assert plan.lookback_days["price"] == 730
+
+
+def test_training_only_observed_events_cannot_be_selected_as_current_root():
+    training = ObservedEvent(
+        event_id="training", event_type="financing", stage=EventStage.ANNOUNCED,
+        entity_ids=("000001",), event_time=ts(10), known_at=ts(20),
+        source_artifact_ids=("training-source",), source_document_hash="a" * 64,
+        dedupe_key="training-only", payload={"training_only": True, "state_changes": [{"key": "x", "value": 1}]},
+    )
+    current = ObservedEvent(
+        event_id="current", event_type="financing", stage=EventStage.ANNOUNCED,
+        entity_ids=("000001",), event_time=ts(19), known_at=ts(19),
+        source_artifact_ids=("current-source",), source_document_hash="b" * 64,
+        dedupe_key="current-root", payload={"state_changes": [{"key": "x", "value": 1}]},
+    )
+    selected = MissionController._select_root_event(
+        SimpleNamespace(objective="financing"),
+        SimpleNamespace(symbols=("000001",)),
+        (training, current),
+    )
+    assert selected.event_id == "current"
 
 
 def test_agent_strict_tools_do_not_expose_legacy_execution_surface(tmp_path):

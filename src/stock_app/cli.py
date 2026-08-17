@@ -14,6 +14,20 @@ from src.stock_app.database import Database
 from src.stock_app.data_downloader import DataDownloader
 from src.stock_app.tencent_v3_ingestion import TencentV3PriceIngestor
 from src.stock_app.trading_engine import TradingEngine
+from src.stock_app.scenario_local_features import (
+    confirm_sellable_quantity,
+    prepare_local_scenario_features,
+)
+from src.stock_app.scenario_calibration import calibrate_event_analog_model
+from src.stock_app.scenario_historical_events import (
+    import_historical_events,
+    read_historical_event_csv,
+)
+from src.stock_app.scenario_public_data import prepare_public_scenario_data
+from src.stock_app.scenario_runtime import (
+    configured_runtime_capabilities,
+    probe_llm_live,
+)
 
 
 console = Console()
@@ -23,6 +37,166 @@ console = Console()
 def cli():
     """A股模拟炒股系统"""
     pass
+
+
+@cli.command('scenario-doctor')
+@click.option('--live-llm', is_flag=True, help='实际发起一次结构化大模型请求；可能产生少量 API 用量')
+def scenario_doctor(live_llm):
+    """审计情景推演依赖、凭证和真实连通性，不输出任何密钥。"""
+    capabilities = list(configured_runtime_capabilities())
+    if live_llm:
+        live = probe_llm_live()
+        capabilities = [
+            live if item.capability_id == "scenario_llm" else item
+            for item in capabilities
+        ]
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("能力")
+    table.add_column("已配置")
+    table.add_column("依赖")
+    table.add_column("真实探测")
+    table.add_column("状态")
+    table.add_column("详情")
+    for item in capabilities:
+        table.add_row(
+            item.capability_id,
+            "是" if item.configured else "否",
+            "有" if item.dependency_available else "缺",
+            "通过" if item.live_verified else "未通过/未执行",
+            item.status,
+            item.detail,
+        )
+    console.print(table)
+    if any(item.status in {"live_probe_failed", "dependency_missing"} for item in capabilities):
+        raise click.ClickException("存在真实失败或缺失依赖；详见上表")
+
+
+@cli.command('prepare-scenario-public-data')
+@click.option('--symbol', 'symbols', multiple=True, required=True, help='A 股代码，可重复传入')
+@click.option('--include-money-flow', is_flag=True, help='拉取慢速个股资金流全表；实测可能需要约 1-2 分钟')
+@click.option(
+    '--ack-public-research-terms',
+    is_flag=True,
+    help='确认仅按研究用途使用公共网页数据并自行核对上游条款',
+)
+def prepare_scenario_public_data_command(symbols, include_money_flow, ack_public_research_terms):
+    """从逐项验证的 AKShare 公共端点写入严格 V3 工件。"""
+    if not ack_public_research_terms:
+        raise click.ClickException(
+            "必须显式传入 --ack-public-research-terms；程序不会替用户假定公共网页许可"
+        )
+    result = prepare_public_scenario_data(
+        config.DATABASE_PATH,
+        symbols,
+        include_money_flow=include_money_flow,
+    )
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("证券")
+    table.add_column("组件")
+    table.add_column("状态")
+    table.add_column("工件数", justify="right")
+    table.add_column("详情")
+    for item in result.items:
+        table.add_row(item.symbol, item.component, item.status, str(item.artifact_count), item.detail)
+    console.print(table)
+    console.print(f"共写入 {result.artifact_count} 条工件；完整成功={result.complete}")
+    if not result.complete:
+        raise click.ClickException("至少一个公共数据组件未完成；已成功组件保留，失败项未填默认值")
+
+
+@cli.command('derive-scenario-features')
+@click.option('--symbol', 'symbols', multiple=True, required=True, help='当前持仓代码，可重复传入')
+@click.option('--portfolio-ref', default='current', show_default=True)
+def derive_scenario_features_command(symbols, portfolio_ref):
+    """从本地真实 V3 工件派生市场状态、因子、残差和交易约束。"""
+    result = prepare_local_scenario_features(
+        config.DATABASE_PATH,
+        symbols,
+        portfolio_ref=portfolio_ref,
+    )
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("证券")
+    table.add_column("组件")
+    table.add_column("状态")
+    table.add_column("工件数", justify="right")
+    table.add_column("详情")
+    for item in result.items:
+        table.add_row(item.symbol or "全市场", item.component, item.status, str(item.artifact_count), item.detail)
+    console.print(table)
+    if not result.complete:
+        raise click.ClickException("至少一个本地派生组件未完成；失败项没有使用默认值")
+
+
+@cli.command('confirm-sellable')
+@click.option('--account-id', required=True, type=click.IntRange(min=1))
+@click.option('--symbol', required=True)
+@click.option('--as-of-date', required=True, type=click.DateTime(formats=['%Y-%m-%d']))
+@click.option('--position-quantity', required=True, type=click.IntRange(min=1))
+@click.option('--sellable-quantity', required=True, type=click.IntRange(min=0))
+def confirm_sellable_command(account_id, symbol, as_of_date, position_quantity, sellable_quantity):
+    """记录券商当日可卖数量；用于 T+1 交易约束，不能由系统猜测。"""
+    confirm_sellable_quantity(
+        config.DATABASE_PATH,
+        account_id=account_id,
+        symbol=symbol,
+        as_of_date=as_of_date.date(),
+        sellable_quantity=sellable_quantity,
+        position_quantity=position_quantity,
+    )
+    console.print(
+        f"[green]已确认账户 {account_id} / {symbol} / {as_of_date.date().isoformat()} "
+        f"可卖 {sellable_quantity}/{position_quantity} 股[/green]"
+    )
+
+
+@cli.command('import-scenario-events')
+@click.option('--file', 'file_path', required=True, type=click.Path(exists=True, dir_okay=False, readable=True))
+@click.option('--symbol', 'symbols', multiple=True, required=True, help='需要计算后验收益的组合证券，可重复传入')
+def import_scenario_events_command(file_path, symbols):
+    """导入自有可核验历史事件，并从 V3 行情计算成熟后验收益。"""
+    with open(file_path, 'rb') as handle:
+        frame = read_historical_event_csv(handle.read())
+    result = import_historical_events(
+        config.DATABASE_PATH,
+        frame,
+        portfolio_symbols=symbols,
+    )
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("事件 ID")
+    table.add_column("状态")
+    table.add_column("工件数", justify="right")
+    table.add_column("详情")
+    for item in result.items:
+        table.add_row(item.event_id, item.status, str(item.artifact_count), item.detail)
+    console.print(table)
+    if not result.complete:
+        raise click.ClickException("部分事件缺少证据字段或尚未成熟 60 个后续交易日；未生成默认收益")
+
+
+@cli.command('calibrate-scenario-model')
+@click.option('--event-type', required=True, help='与历史样本及当前事实事件一致的事件类型')
+@click.option('--symbol', 'symbols', multiple=True, required=True)
+@click.option('--min-samples', type=click.IntRange(min=5), default=None, help='训练事件最小样本数')
+def calibrate_scenario_model_command(event_type, symbols, min_samples):
+    """按时间留出样本校准事件/相似状态模型；未过闸门只登记 rejected。"""
+    result = calibrate_event_analog_model(
+        config.DATABASE_PATH,
+        event_type=event_type,
+        portfolio_symbols=symbols,
+        min_samples=min_samples,
+    )
+    console.print({
+        "model_id": result.model_id,
+        "version": result.version,
+        "event_type": result.event_type,
+        "status": result.status,
+        "training_event_count": result.training_event_count,
+        "validation_event_count": result.validation_event_count,
+        "metrics": result.metrics,
+        "detail": result.detail,
+    })
+    if not result.active:
+        raise click.ClickException("模型未通过样本外校准闸门，未登记 active")
 
 
 @cli.command()
