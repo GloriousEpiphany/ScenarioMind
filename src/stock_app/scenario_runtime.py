@@ -38,6 +38,19 @@ def _present(*names: str) -> bool:
     return all(bool(str(os.getenv(name) or "").strip()) for name in names)
 
 
+def _rqdata_credentials_configured() -> bool:
+    return (
+        _present("RQDATAC2_CONF")
+        or _present("RQDATAC_CONF")
+        or _present("RQDATA_USERNAME", "RQDATA_PASSWORD")
+    )
+
+
+def _rqdata_source_host() -> str:
+    uri = str(os.getenv("RQDATAC2_CONF") or os.getenv("RQDATAC_CONF") or "").strip()
+    return (urlparse(uri).hostname if uri else None) or "rqdatad-pro.ricequant.com"
+
+
 @dataclass(frozen=True)
 class RuntimeCapability:
     capability_id: str
@@ -132,21 +145,17 @@ def configured_runtime_capabilities() -> tuple[RuntimeCapability, ...]:
         ),
         RuntimeCapability(
             capability_id="rqdata",
-            configured=_enabled("STOCKM1_RQDATA_ENABLED") and (
-                _present("RQDATA_USERNAME", "RQDATA_PASSWORD") or _present("RQDATAC2_CONF")
-            ),
+            configured=_enabled("STOCKM1_RQDATA_ENABLED") and _rqdata_credentials_configured(),
             dependency_available=find_spec("rqdatac") is not None,
             live_verified=False,
             status=(
                 "not_configured"
-                if not (
-                    _enabled("STOCKM1_RQDATA_ENABLED")
-                    and (_present("RQDATA_USERNAME", "RQDATA_PASSWORD") or _present("RQDATAC2_CONF"))
-                )
+                if not (_enabled("STOCKM1_RQDATA_ENABLED") and _rqdata_credentials_configured())
                 else "dependency_missing" if find_spec("rqdatac") is None
                 else "configured_not_live_verified"
             ),
             detail="需要已购买的 RQData 权限；不同数据集必须分别探测",
+            source_host=_rqdata_source_host(),
         ),
     ]
     return tuple(capabilities)
@@ -190,10 +199,46 @@ def probe_llm_live(*, prompt: str = "只返回 JSON：{\"ok\": true}") -> Runtim
         )
 
 
+def probe_rqdata_live() -> RuntimeCapability:
+    """Initialize official rqdatac and probe only the daily equity-price dataset."""
+    load_scenario_environment()
+    local = next(item for item in configured_runtime_capabilities() if item.capability_id == "rqdata")
+    if not local.configured or not local.dependency_available:
+        return local
+    try:
+        from scenario_engine.data import AvailabilityStatus, RQDataAdapter
+
+        adapter = RQDataAdapter.from_environment()
+        manifest = next(
+            item for item in adapter.capabilities()
+            if (item.domain, item.dataset) == ("price", "equity_price")
+        )
+        return RuntimeCapability(
+            capability_id="rqdata",
+            configured=True,
+            dependency_available=True,
+            live_verified=manifest.status == AvailabilityStatus.AVAILABLE,
+            status=manifest.status.value,
+            detail=manifest.detail,
+            source_host=local.source_host,
+        )
+    except Exception as exc:
+        return RuntimeCapability(
+            capability_id="rqdata",
+            configured=True,
+            dependency_available=True,
+            live_verified=False,
+            status="live_probe_failed",
+            detail=f"{type(exc).__name__}: RQData capability probe failed",
+            source_host=local.source_host,
+        )
+
+
 __all__ = [
     "PROJECT_ROOT",
     "RuntimeCapability",
     "configured_runtime_capabilities",
     "load_scenario_environment",
     "probe_llm_live",
+    "probe_rqdata_live",
 ]

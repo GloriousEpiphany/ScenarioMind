@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 ALLOWED_HORIZONS = {"1d", "1w", "1m", "3m", "6m", "1y"}
@@ -36,6 +37,7 @@ class ScenarioLLMClient:
         temperature: float = 0.0,
         max_tokens: int = 1200,
         timeout_seconds: float = 90.0,
+        max_empty_retries: int = 1,
         client: Any | None = None,
     ):
         if not api_key:
@@ -48,6 +50,9 @@ class ScenarioLLMClient:
         if timeout_seconds <= 0:
             raise ValueError("LLM timeout_seconds must be positive")
         self.timeout_seconds = float(timeout_seconds)
+        if not isinstance(max_empty_retries, int) or max_empty_retries < 0:
+            raise ValueError("LLM max_empty_retries must be a non-negative integer")
+        self.max_empty_retries = max_empty_retries
         if client is None:
             try:
                 from openai import OpenAI
@@ -96,11 +101,13 @@ class ScenarioLLMClient:
         )
         model = os.getenv("SCENARIO_LLM_MODEL") or os.getenv("QWEN_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         timeout_seconds = float(os.getenv("SCENARIO_LLM_TIMEOUT_SECONDS") or 90.0)
+        max_empty_retries = int(os.getenv("SCENARIO_LLM_EMPTY_RESPONSE_RETRIES") or 1)
         return cls(
             api_base=api_base,
             api_key=api_key,
             model=model,
             timeout_seconds=timeout_seconds,
+            max_empty_retries=max_empty_retries,
         )
 
     def parse_scenario(self, user_query: str, as_of_date: str, horizon: str | None = None) -> LLMCallResult:
@@ -111,7 +118,10 @@ class ScenarioLLMClient:
                     "你是 StockM1 情景推演引擎的 Scenario Parser Agent。"
                     "只把用户假设解析成机器可读 JSON，不输出投资建议，不预测收益，"
                     "不编造概率、价格目标或涨跌幅。用户没有明确给出的数量必须写 null，"
-                    "缺失内容放入 missing_information。"
+                    "缺失内容放入 missing_information。只返回一个 JSON 对象。"
+                    "示例 JSON：{\"event_type\":\"policy\",\"event_name\":\"示例事件\","
+                    "\"region\":\"CN\",\"horizon\":\"1w\",\"affected_entities\":[],"
+                    "\"shocks\":[],\"missing_information\":[],\"confidence\":0.5}。"
                 ),
             },
             {
@@ -139,15 +149,11 @@ class ScenarioLLMClient:
                 ),
             },
         ]
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
+        payload, content = self._create_json_completion(
+            messages,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
-            response_format={"type": "json_object"},
         )
-        payload = response.model_dump() if hasattr(response, "model_dump") else response
-        content = payload["choices"][0]["message"].get("content", "")
         parsed = _loads_json_object(content)
         usage = payload.get("usage") or {}
         return LLMCallResult(
@@ -173,7 +179,11 @@ class ScenarioLLMClient:
                     "你是 StockM1 情景推演实验室的 Investor Report Agent。"
                     "你的任务是把已经审计过的结构化压力测试结果，改写成普通投资者能看懂的中文结论。"
                     "不得新增任何报告中没有的数字、收益区间、概率、目标价或确定性买卖指令。"
-                    "必须返回 JSON。"
+                    "必须只返回 JSON 对象。示例 JSON："
+                    "{\"bottom_line\":\"示例结论\",\"risk_level\":\"不可判定\","
+                    "\"plain_summary\":\"示例摘要\",\"main_risks\":[],"
+                    "\"possible_actions\":[],\"watch_points\":[],"
+                    "\"confidence_note\":\"仅基于输入报告\"}。"
                 ),
             },
             {
@@ -201,15 +211,11 @@ class ScenarioLLMClient:
                 ),
             },
         ]
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
+        payload, content = self._create_json_completion(
+            messages,
             temperature=min(self.temperature, 0.2),
             max_tokens=max(self.max_tokens, 1600),
-            response_format={"type": "json_object"},
         )
-        payload = response.model_dump() if hasattr(response, "model_dump") else response
-        content = payload["choices"][0]["message"].get("content", "")
         parsed = _loads_json_object(content)
         return LLMCallResult(
             parsed=parsed,
@@ -220,6 +226,61 @@ class ScenarioLLMClient:
                 "usage": payload.get("usage") or {},
             },
         )
+
+    def _create_json_completion(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[dict[str, Any], str]:
+        """Call one structured completion, retrying only provider-confirmed empty content."""
+        request_messages = list(messages)
+        last_payload: dict[str, Any] = {}
+        for attempt in range(self.max_empty_retries + 1):
+            kwargs: dict[str, Any] = {
+                "model": self.model,
+                "messages": request_messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+            }
+            if self._is_deepseek:
+                # DeepSeek V4 defaults to thinking mode. Its output budget includes
+                # reasoning tokens, which can leave message.content empty before a
+                # small structured JSON answer is emitted.
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            response = self.client.chat.completions.create(**kwargs)
+            last_payload = _completion_payload(response)
+            content = _completion_content(last_payload)
+            if content.strip():
+                try:
+                    _loads_json_object(content)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raise ScenarioLLMUnavailable(
+                        f"LLM returned invalid JSON content (length={len(content)})"
+                    ) from exc
+                return last_payload, content
+            if attempt < self.max_empty_retries:
+                request_messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": "上次返回为空。请再次严格返回一个完整、非空的 JSON 对象。",
+                    },
+                ]
+        finish_reason = _finish_reason(last_payload)
+        reasoning_tokens = _reasoning_tokens(last_payload)
+        raise ScenarioLLMUnavailable(
+            "LLM returned empty message.content "
+            f"after {self.max_empty_retries + 1} attempt(s); "
+            f"finish_reason={finish_reason!r}, reasoning_tokens={reasoning_tokens!r}"
+        )
+
+    @property
+    def _is_deepseek(self) -> bool:
+        hostname = (urlparse(self.api_base).hostname or "").casefold()
+        return hostname == "deepseek.com" or hostname.endswith(".deepseek.com")
 
 
 class ScenarioLLMUnavailable(Exception):
@@ -240,3 +301,44 @@ def _loads_json_object(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("LLM scenario parser must return a JSON object")
     return data
+
+
+def _completion_payload(response: Any) -> dict[str, Any]:
+    payload = response.model_dump() if hasattr(response, "model_dump") else response
+    if not isinstance(payload, dict):
+        raise ScenarioLLMUnavailable("LLM response is not an object")
+    return payload
+
+
+def _completion_content(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ScenarioLLMUnavailable("LLM response has no choices[0]")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise ScenarioLLMUnavailable("LLM response has no choices[0].message")
+    content = message.get("content")
+    if content is None:
+        return ""
+    if not isinstance(content, str):
+        raise ScenarioLLMUnavailable("LLM message.content is not a string")
+    return content
+
+
+def _finish_reason(payload: dict[str, Any]) -> str | None:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        value = choices[0].get("finish_reason")
+        return str(value) if value is not None else None
+    return None
+
+
+def _reasoning_tokens(payload: dict[str, Any]) -> int | None:
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("completion_tokens_details")
+    if not isinstance(details, dict):
+        return None
+    value = details.get("reasoning_tokens")
+    return int(value) if isinstance(value, int) else None
