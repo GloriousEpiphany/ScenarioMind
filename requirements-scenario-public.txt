@@ -3,5 +3,6 @@
 openai==2.13.0
 akshare==1.17.95
 
-# TuShare Pro 与 RQData 是部署/许可相关能力，不在公共依赖中冒充已验证能力。
-# 有真实账户后分别安装 tushare / rqdatac，并运行 `scenario-doctor --live` 验证。
+# SDK 随情景数据依赖自动安装；token/积分仍必须由 TuShare 账户真实授权。
+tushare==1.4.29
+# 安装后运行 `scenario-doctor --live-tushare` 验证 daily 权限。

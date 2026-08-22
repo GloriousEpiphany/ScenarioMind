@@ -26,7 +26,7 @@ V3 不应继续堆更多带 `Agent` 后缀的类。最优先的升级顺序是�
 4. 让 Agent 驱动数据查询、缺口补全、模型选择、分支预算、失败降级和审查，但把所有数值计算留在确定性量化 Module 中。
 5. 最终用多分支损失矩阵和组合约束自动生成防守、均衡、进取/观察方案，并自动送回同一引擎复测。
 
-数据源不再绑定单一平台。专业部署的推荐组合是：**RQData 负责 PIT 行情、财务、行业/风险模型和已授权的新闻舆情，TuShare Pro 补充公告、政策、新闻、资金流与结构化公司事件，AKShare 延续当前项目已有的低成本广覆盖和故障兜底**。三者不做平权轮询，由 `RoutingPolicy` 按数据域、历史时点、权限、质量和预算自动选源；CNINFO、交易所、央行等官方原文仍是事实核验链。
+数据源不再绑定单一平台。专业部署的推荐组合是：**TuShare Pro 负责历史行情、财务、行业、资金流与结构化公司事件，AKShare 延续当前项目已有的低成本广覆盖和故障兜底**。两者不做平权轮询，由 `RoutingPolicy` 按数据域、历史时点、权限、质量和预算自动选源；CNINFO、交易所、央行等官方原文仍是事实核验链。
 
 用户每次只需要提供持仓和研究目标。数据源选择、财报收集、情绪分析、行业分析、事件分支、模型运行、持仓方案比较、审计和报告均由 Agent 完成。部署时一次性配置数据凭证不算运行过程中的人工参与；真实下单仍不属于情景推演模块职责。
 
@@ -41,7 +41,6 @@ V3 不应继续堆更多带 `Agent` 后缀的类。最优先的升级顺序是�
 - [Introduction-to-Quantitative-Finance](https://github.com/Barca0412/Introduction-to-Quantitative-Finance)：该仓库本质上是量化金融资料索引和 AI + Finance 论文雷达，而不是一套可直接复制的生产架构。对本项目最有价值的启示是：完整投研必须同时覆盖数据、因子、回测、组合优化和风险模型，AI 应用于因子研究和自动化 R&D，而不是取代点时数据与样本外检验。
 - [AKShare 官方概览](https://akshare.akfamily.xyz/introduction.html)、[股票数据字典](https://akshare.akfamily.xyz/data/stock/stock.html) 与 [数据风险说明](https://akshare.akfamily.xyz/data_tips.html)：已确认股票行情、个股新闻、资金、行业、热度/关注等广覆盖能力；其数据来自公开网页源，官方同时提示学术研究用途和商业使用风险，且目标网页变化可能导致端点变化。
 - [TuShare 官方数据目录](https://tushare.pro/document/2)：已确认结构化行情、财务、披露日、行业、资金、公告、政策、新闻、研究报告和交易所互动问答等数据域。具体端点权限、积分、频率和历史深度必须运行时探测。
-- [RQData Python 文档](https://www.ricequant.com/doc/rqdata/python/index-rqdatac)、[A 股数据](https://www.ricequant.com/doc/rqdata/python/stock-mod)、[另类数据](https://www.ricequant.com/doc/rqdata/python/alternative-data) 与 [风险因子](https://www.ricequant.com/doc/rqdata/python/risk-factors-mod)：已确认 PIT 财务、行情、行业、因子/风险模型、一致预期和个股新闻舆情；部分能力需要额外包或单独商务授权，不能只凭基础账号推定可用。
 
 ### 1.2 不照搬外部资料的部分
 
@@ -187,7 +186,7 @@ ScenarioMission
 AutonomousScenarioMission Module
   |-- Data Steward Agent --------> PointInTimeMarketSnapshot Module
   |                                  |-- LocalSQLite Adapter
-  |                                  |-- RQData / TuShare / AKShare Adapter
+  |                                  |-- TuShare / AKShare Adapter
   |                                  |-- per-domain RoutingPolicy
   |                                  |-- CNINFO/Exchange/PBC/RSS/MCP Adapter
   |
@@ -244,8 +243,8 @@ class SnapshotRequest:
 
 **真实 Seam 与 Adapter**：
 
-- `StructuredData Seam`：`LocalSQLiteAdapter`、`RQDataAdapter`、`TuShareAdapter`、`AKShareAdapter`，以及只把腾讯已记录响应标准化入库的 `TencentV3PriceIngestor`。腾讯链路不伪称历史可见性，不从 `stock_daily` 反推 lineage，不自动换源，也不估算源端未提供的成交额。
-- `EvidenceSource Seam`：`CninfoAdapter`、`ExchangeAdapter`、`PbcPageAdapter`、`RssAdapter`、`McpEvidenceAdapter`，以及按许可启用的 `RQDataNewsAdapter`、`TuShareEvidenceAdapter`、`AKShareNewsDiscoveryAdapter`、`LicensedNewsAdapter`。
+- `StructuredData Seam`：`LocalSQLiteAdapter`、`TuShareAdapter`、`AKShareAdapter`，以及只把腾讯已记录响应标准化入库的 `TencentV3PriceIngestor`。腾讯链路不伪称历史可见性，不从 `stock_daily` 反推 lineage，不自动换源，也不估算源端未提供的成交额。
+- `EvidenceSource Seam`：`CninfoAdapter`、`ExchangeAdapter`、`PbcPageAdapter`、`RssAdapter`、`McpEvidenceAdapter`，以及按许可启用的 `TuShareEvidenceAdapter`、`AKShareNewsDiscoveryAdapter`、`LicensedNewsAdapter`。
 - 两个 Seam 不共用一个“万能 DataFrame Interface”：前者承载可计算时序/截面数据，后者承载正文、来源、发布时间、转载关系和更正记录。
 - 不为当前只有一种实现的 Repository 提前创建空泛 Interface；先深化 SQLite 实现。
 
@@ -492,48 +491,43 @@ min_w  λ1·CVaRα(w)
 
 ---
 
-## 6. AKShare、TuShare、RQData 的组合与按域路由
+## 6. AKShare、TuShare 的组合与按域路由
 
 ### 6.1 选型结论
 
-不建议三选一，也不建议让三个来源按固定全局顺序轮询。不同数据域对 PIT、稳定性、许可证、正文覆盖和成本的要求不同，最佳专业组合是：
+不建议二选一，也不建议让两个来源按固定全局顺序轮询。不同数据域对 PIT、稳定性、许可证、正文覆盖和成本的要求不同，最佳专业组合是：
 
-1. **RQData：专业量化与 PIT 主 Adapter。** 优先承担点时行情、财务、行业、因子风险模型、一致预期，以及取得授权后的个股新闻舆情。
-2. **TuShare Pro：结构化事件和横向补充 Adapter。** 优先补充财报披露、公告、政策、新闻/研报、交易所互动、资金流、申万行业和公司行为，并作为关键结构化数据的交叉核验来源。
-3. **AKShare：现有低成本广覆盖和 fallback Adapter。** 继续利用项目已安装的 AKShare、东方财富和腾讯链，补充行情、个股新闻、行业板块、资金、热度与关注度；不得把依赖网页结构的返回值当唯一审计事实。
-4. **官方 Evidence Adapter：最终事实核验。** CNINFO、上交所、深交所、央行及其他监管/统计来源继续承载公告、政策和原文证据，不被三个量化平台取代。
+1. **TuShare Pro：结构化数据主 Adapter。** 优先承担 A 股历史日线、财报披露、公告、政策、新闻/研报、交易所互动、资金流、申万行业和公司行为。
+2. **AKShare：现有低成本广覆盖和 fallback Adapter。** 继续利用项目已安装的 AKShare、东方财富和腾讯链，补充行情、个股新闻、行业板块、资金、热度与关注度；不得把依赖网页结构的返回值当唯一审计事实。
+3. **官方 Evidence Adapter：最终事实核验。** CNINFO、上交所、深交所、央行及其他监管/统计来源继续承载公告、政策和原文证据，不被量化数据平台取代。
 
-如果暂时没有 RQData 许可证，经济型 MVP 采用“TuShare Pro 主 + AKShare fallback + 官方 Evidence Adapter”，并由本项目的 `EventSentiment Module` 从文本计算情绪。代码 Interface 保持不变，购买 RQData 后只增加 Adapter 和路由策略，不改上层模型。
+部署采用“TuShare Pro 主 + AKShare/腾讯 fallback + 官方 Evidence Adapter”，并由本项目的 `EventSentiment Module` 从文本计算情绪。TuShare token 不可用时，行情只在任何写入前回退到腾讯，禁止同一批次静默混源。
 
 ### 6.2 已在官方文档核对的代表性能力
 
 | 来源 | 官方文档已确认的代表性端点 | 在 V3 中的角色 | 不能直接假定 |
 |---|---|---|---|
-| RQData | `get_price`、`get_pit_financials_ex`、`get_factor`、`get_industry`、`get_instrument_industry`、`get_capital_flow`、`get_securities_margin`、`get_announcement` | PIT 行情/财务、行业、资金、公告和量化特征主源 | 当前账号已含全部字段、全部历史和实时权限 |
-| RQData 风险/另类 | `get_factor_exposure`、`get_factor_return`、`get_specific_risk`、`get_factor_covariance`、`consensus.*`、`news.get_stock_news` | 风格/行业暴露、风险协方差、一致预期、新闻舆情特征 | 风险模型、新闻舆情或一致预期已购买；部分能力需要额外包或商务授权 |
 | TuShare Pro | `stock_basic`、`daily`、`daily_basic`、`income`、`balancesheet`、`cashflow`、`fina_indicator`、`disclosure_date` | 股票主数据、行情/估值、三大表、指标和披露日补充 | 积分、频率、VIP 端点和历史范围对当前 token 全部开放 |
 | TuShare Pro 事件/舆情 | `index_classify`、`index_member_all`、`sw_daily`、`moneyflow`、`news`、`major_news`、`anns_d`、`irm_qa_sh`、`irm_qa_sz`、`npr`、`research_report`、`monetary_policy` | 行业、资金、公告、新闻、政策、研报和互动问答 | 新闻来源完整、正文永久可取或供应商情绪可直接用于收益预测 |
 | AKShare | `stock_zh_a_hist`、`stock_news_em`、`stock_individual_fund_flow`、`stock_board_industry_summary_ths`、`stock_board_industry_index_ths`、`stock_hot_rank_em`、`stock_hot_search_baidu`、`stock_comment_em` | 行情/行业/资金补缺、个股新闻发现、热度和注意力特征 | 网页端点长期稳定、历史 PIT 完整、热榜等于情绪、商业再分发天然合规 |
 
-RQData 官方文档说明 `news.get_stock_news` 提供从 2017 年起的个股新闻情绪指标，正式数据日内每半小时更新，并要求单独安装 `rqdatac_news`。返回的新闻/公司正负权重和相关度只能作为 `EventSentiment Module` 的一个输入；系统仍需做实体对齐、转载去重、事件阶段、意外度、权威性、分歧和价格反应判断，不能直接把供应商标签映射成收益率。
-
 AKShare 的热榜、热搜、千股千评和用户关注指数统一归类为 `attention` 或 `crowding_proxy`，而不是 `tone`。个股新闻只作为 Event Scout 的发现入口；若不能保存来源 URI、原发布时间和正文哈希，就不能升级为强证据。
 
-三家平台都不能被默认视为“全网社交媒体舆情库”。论坛、短视频、社交平台、付费媒体和跨境新闻若没有合法、稳定、可回溯的全文来源，CapabilityManifest 必须返回 `coverage_gap`。专业部署可在 `EvidenceSource Seam` 增加合规商业新闻/社媒监听 Adapter；没有该许可时，报告只能称“已覆盖来源内的舆情”，不能称“全网舆情”。
+两个数据平台都不能被默认视为“全网社交媒体舆情库”。论坛、短视频、社交平台、付费媒体和跨境新闻若没有合法、稳定、可回溯的全文来源，CapabilityManifest 必须返回 `coverage_gap`。专业部署可在 `EvidenceSource Seam` 增加合规商业新闻/社媒监听 Adapter；没有该许可时，报告只能称“已覆盖来源内的舆情”，不能称“全网舆情”。
 
 ### 6.3 按数据域的默认 RoutingPolicy
 
 | 数据域 | 专业部署主 Adapter | 次 Adapter / 对账 | fallback 或原文核验 | 强制规则 |
 |---|---|---|---|---|
-| 证券主数据、交易日、上市退市、ST、停牌 | RQData | TuShare Pro | AKShare/本地快照 | 历史任务只能使用任务日期有效版本 |
-| 日/分钟行情和复权 | RQData | TuShare Pro | 当前东方财富/腾讯/AKShare 链 | 同一时间序列不得静默跨源拼接；复权、时区、停牌填充必须一致 |
-| PIT 财务与量化衍生指标 | RQData `get_pit_financials_ex` / `get_factor` | TuShare 三大表和财务指标 | CNINFO 原文 | 使用公告可得日；修订记录可重放；冲突时标记 `disputed` |
-| 财报预告、披露、公司行为 | TuShare Pro | RQData | CNINFO/交易所原文 | 事件日、公告日、入库日分列，原文优先于摘要 |
-| 行业、指数成分和风险模型 | RQData | TuShare 申万数据 | AKShare 当前板块快照 | 当前快照不得回填历史；行业分类体系和版本必须入库 |
-| 个股/行业资金、融资融券、龙虎榜、北向 | TuShare Pro | RQData | AKShare | 不同供应商字段定义分 dataset 保存，未对齐前不平均 |
-| 宏观、利率、汇率、商品、政策 | TuShare + 官方 Evidence Adapter | RQData | AKShare | 政策原文和发布日期来自官方来源，数值序列可跨源对账 |
-| 公告、新闻、研报、互动问答 | 官方 Evidence + TuShare | RQData 新闻/公告 | AKShare 新闻发现、RSS/GDELT/MCP | 必须有 `published_at`、`known_at`、来源、实体和去重簇 |
-| 新闻情绪、舆论和市场注意力 | RQData 新闻舆情（已授权时）+ 本地 EventSentiment | TuShare 文本语料 | AKShare 热榜/热搜/关注 | 供应商情绪是特征，不是结论；热度只表示 attention |
+| 证券主数据、交易日、上市退市、ST、停牌 | TuShare Pro | AKShare/本地快照 | 交易所原文 | 历史任务只能使用任务日期有效版本 |
+| A 股历史日线 | TuShare Pro `daily` | 腾讯/东方财富 | AKShare/本地工件 | 同一批次不得静默跨源拼接；单位、复权、时区必须一致 |
+| PIT 财务与量化衍生指标 | TuShare 三大表和财务指标 | CNINFO 原文 | 本地派生特征 | 使用公告可得日；修订记录可重放；冲突时标记 `disputed` |
+| 财报预告、披露、公司行为 | TuShare Pro | CNINFO/交易所原文 | AKShare | 事件日、公告日、入库日分列，原文优先于摘要 |
+| 行业、指数成分和风险特征 | TuShare 申万数据 | AKShare 当前板块快照 | 本地派生特征 | 当前快照不得回填历史；行业分类体系和版本必须入库 |
+| 个股/行业资金、融资融券、龙虎榜、北向 | TuShare Pro | AKShare | 本地工件 | 不同供应商字段定义分 dataset 保存，未对齐前不平均 |
+| 宏观、利率、汇率、商品、政策 | TuShare + 官方 Evidence Adapter | AKShare | 本地工件 | 政策原文和发布日期来自官方来源，数值序列可跨源对账 |
+| 公告、新闻、研报、互动问答 | 官方 Evidence + TuShare | AKShare 新闻发现 | RSS/GDELT/MCP | 必须有 `published_at`、`known_at`、来源、实体和去重簇 |
+| 新闻情绪、舆论和市场注意力 | 本地 EventSentiment + TuShare 文本语料 | AKShare 热榜/热搜/关注 | 合规商业新闻 Adapter | 供应商情绪是特征，不是结论；热度只表示 attention |
 
 `RoutingPolicy` 的选择键是：
 
@@ -589,7 +583,7 @@ probe_time / probe_result
 - 行情对账检查交易日、价格/成交量误差、复权因子和停牌填充；财务对账检查实体、期间、币种、单位、公告日和修订版本。
 - 双源关键字段差异超过数据域阈值时返回 `conflicted`，不能静默选择更“顺眼”的数值；Quant Modeler 禁用受影响特征或扩大模型不确定性。
 - 财报、行业归属和指数成分以版本化快照存储，不重复拉取。AKShare 等网页源必须保存 Adapter 版本、schema hash 和原始响应哈希，用于定位网页结构变化。
-- 当前 `requirements.txt` 的 `akshare>=1.12.0` 不足以保证可重放，应在部署 lock/constraints 中固定已通过契约测试的版本。TuShare 和 RQData 作为可选依赖延迟导入；未安装时 Adapter 返回 `dependency_missing`，不能令整个应用导入失败。
+- 当前 `requirements.txt` 的 `akshare>=1.12.0` 不足以保证可重放，应在部署 lock/constraints 中固定已通过契约测试的版本。TuShare 作为可选依赖延迟导入；未安装时 Adapter 返回 `dependency_missing`，不能令整个应用导入失败。
 - 分钟/Tick 数据只有当事件时效和组合风险值得时才自动申请。一个任务先生成 `DataBudget`；额度不足时优先保留持仓、行业基准和关键分支。
 - CI 使用三种 Adapter 的脱敏契约 fixture，禁止依赖公网；独立 canary 按实际许可证做最小真实查询，并输出账号实际能力报告。
 - 数据调用失败采用指数退避、速率限制和熔断；不无限重试，也不切换到来源不明的网页数字。
@@ -636,8 +630,8 @@ Audit Trace
 
 ```text
 Fundamental Analyst 请求银行净息差
--> RQData capability 显示该字段未授权
--> RoutingPolicy 查询 TuShare 等价数据集，但当前 token 同样无权限或字段口径不等价
+-> TuShare capability 显示该字段未授权或 token 积分不足
+-> RoutingPolicy 只能查询口径等价的公共/本地数据；不存在等价字段时保持阻断
 -> Data Steward 改查 CNINFO 最新已发布财报原文
 -> PDF 抽取失败
 -> 尝试结构化 OCR/表格抽取 Adapter
@@ -699,7 +693,7 @@ class ProgressProjector:
     def snapshot(self, run_id: str) -> ScenarioProgressViewModel: ...
 ```
 
-`safe_message_args` 只允许保存和展示“正在查询财报”“已完成 8/12 个持仓暴露”“TuShare 限频，切换 RQData”等操作状态，不展示模型隐藏推理、系统提示词、凭证、原始个人数据或内部 chain-of-thought。详细工具输入输出仍由权限受控的审计 trace 保存。
+`safe_message_args` 只允许保存和展示“正在查询财报”“已完成 8/12 个持仓暴露”“TuShare 限频，写入前回退腾讯”等操作状态，不展示模型隐藏推理、系统提示词、凭证、原始个人数据或内部 chain-of-thought。详细工具输入输出仍由权限受控的审计 trace 保存。
 
 总体进度使用 MissionPlan 中固定的阶段权重，不按耗时猜测：
 
@@ -873,7 +867,6 @@ scenario_engine/
     router.py
     normalizers.py
     local_sqlite_adapter.py
-    rqdata_adapter.py
     tushare_adapter.py
     akshare_adapter.py
     evidence_adapters.py
@@ -1024,8 +1017,8 @@ validation_results
 - 新建 `MarketArtifact`、`SnapshotRequest`、`MarketSnapshot`。
 - 给研究仓库所有检索增加 `known_at` 和 source type 过滤。
 - 修复未来文档新鲜度逻辑；历史页面快照默认不可用。
-- 建 `LocalSQLiteAdapter`、`RQDataAdapter`、`TuShareAdapter`、`AKShareAdapter` skeleton 及按域 `RoutingPolicy`；外部平台不可用时不阻塞本地测试。
-- 增加依赖 lock/constraints 和延迟导入；AKShare 升级、TuShare/RQData 安装状态都必须进入 CapabilityManifest。
+- 建 `LocalSQLiteAdapter`、`TuShareAdapter`、`AKShareAdapter` skeleton 及按域 `RoutingPolicy`；外部平台不可用时不阻塞本地测试。
+- 增加依赖 lock/constraints 和延迟导入；AKShare 升级、TuShare 安装状态都必须进入 CapabilityManifest。
 - 保留 `src/stock_app/data_downloader.py` 为兼容 Facade，先让其写入来源、复权、抓取时间和 schema hash，再逐步委托统一 Router。
 - 常规 UI 运行启用 run ledger。
 
@@ -1040,16 +1033,16 @@ validation_results
 
 **改动**：
 
-- RQData PIT 财务/因子与 TuShare 三大表、财务指标、披露日进行结构化对账，再以 CNINFO 原文核验。
-- RQData/TuShare 的点时行业、指数成分、行业估值、广度、资金和融资特征；AKShare 仅补当前缺口和注意力代理。
-- 接入已授权的 RQData 新闻舆情、TuShare 新闻/公告/政策语料和 AKShare 新闻/热榜，并统一做事件级去重、权威性、意外度、分歧、注意力与衰减。
+- TuShare 三大表、财务指标、披露日必须以 CNINFO 原文核验，并保留修订版本。
+- TuShare 的点时行业、指数成分、行业估值、广度、资金和融资特征；AKShare 仅补当前缺口和注意力代理。
+- 接入 TuShare 新闻/公告/政策语料和 AKShare 新闻/热榜，并统一做事件级去重、权威性、意外度、分歧、注意力与衰减。
 - 合并 `Agents_Experience` 的事实上下文。
 
 **验收**：
 
 - 平安银行样例能输出银行专属财务/估值/资金特征；无权限时明确降级。
 - 同一篇转载 10 次不能产生 10 倍情绪权重。
-- RQData 正负权重不得绕过本地 EventSentiment 校验；AKShare 热度不得写入 `tone` 字段。
+- 任何供应商情绪字段不得绕过本地 EventSentiment 校验；AKShare 热度不得写入 `tone` 字段。
 - 财报发布日前运行不能读取该财报。
 - `fundamental_coverage` 不再恒为 0；覆盖率必须按实际计算。
 
@@ -1128,7 +1121,7 @@ validation_results
 - 未来新闻、未来财报、未来行业成分、未来指数权重一律拒绝。
 - 发布日、报告期、抓取日三者错位测试。
 - 修订数据必须可重放旧版本。
-- RQData/TuShare 的认证、权限、额度和频率限制，以及 AKShare 的网页 schema 变化、空响应和网络失败，必须映射成不同状态。
+- TuShare 的认证、权限、额度和频率限制，以及 AKShare 的网页 schema 变化、空响应和网络失败，必须映射成不同状态。
 - `dependency_missing / auth_failed / permission_denied / quota_limited / rate_limited / network_unavailable / schema_changed / no_data` 不得互相伪装。
 - source type 选择不能被本地库 fallback 绕过。
 - 同一行情序列禁止未复权/前复权/后复权混合，也禁止在缺口处静默拼接另一来源。
@@ -1259,7 +1252,7 @@ validation_results
 │ ███████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
 │ 当前：Quant Modeler · 正在计算 12 只持仓的事件条件分布                 │
 │ 并行：Sentiment Analyst · 已处理 38/52 条去重新闻    心跳：刚刚          │
-│ 数据降级：TuShare 限频，资金流已切换 RQData              [展开时间线] │
+│ 数据降级：TuShare 限频，本批次写入前已切换腾讯            [展开时间线] │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1350,12 +1343,12 @@ Streamlit 落地方式：
 
 ### 审查三：接口真实性审查
 
-检查问题：是否写入不存在或无法确认的 AKShare、TuShare、RQData 端点、套餐能力或历史覆盖？
+检查问题：是否写入不存在或无法确认的 AKShare、TuShare 端点、套餐能力或历史覆盖？
 
 修订结果：
 
 - 只列三家官方文档中已确认的代表性端点，不把目录能力等同于当前账号权限。
-- 明确 RQData 新闻舆情需要 `rqdatac_news`，风险/另类数据可能需要额外授权；TuShare 的积分/VIP 权限运行时探测；AKShare 的网页源存在 schema 漂移和商业使用风险。
+- 明确 TuShare 的积分/VIP 权限必须运行时探测；AKShare 的网页源存在 schema 漂移和商业使用风险。
 - 增加运行时 CapabilityManifest、额度/许可探测、schema canary 和脱敏契约 fixture。
 - 用按域 RoutingPolicy 取代全局供应商优先级，并区分认证、权限、额度、限频、网络、schema 变化、空数据和冲突。
 
@@ -1407,13 +1400,13 @@ Streamlit 落地方式：
 
 修订结果：
 
-- 选择 RQData + TuShare Pro + AKShare 的分工组合，并用数据域路由取代全局主备顺序。
+- 选择 TuShare Pro + AKShare/腾讯的分工组合，并用数据域路由取代全局主备顺序。
 - 明确当前项目已经依赖 AKShare，第一步是补来源和 PIT lineage，不是重复接入。
-- 将 RQData 新闻舆情、TuShare 新闻/公告/政策语料和 AKShare 热度数据放入不同语义层；热度只作为注意力，供应商情绪只作为待校验特征。
+- 将 TuShare 新闻/公告/政策语料和 AKShare 热度数据放入不同语义层；热度只作为注意力，供应商情绪只作为待校验特征。
 - 保留 CNINFO、交易所、央行、RSS/GDELT/MCP 等 `EvidenceSource Seam`，避免三个量化平台成为单点事实源。
 - 增加许可证、缓存/再分发范围、schema 漂移、复权一致性和双源冲突检查。
 
-结论：通过。专业部署默认采用多源组合；经济型部署可以不购买 RQData，但不能降低 PIT、原文溯源和情绪去重标准。
+结论：通过。专业部署默认采用 TuShare 主源与公共数据兜底，但不能降低 PIT、原文溯源和情绪去重标准。
 
 ### 审查八：页面实时进度真实性与动效审查
 
@@ -1436,7 +1429,7 @@ Streamlit 落地方式：
 ### 必须立即做（P0）
 
 1. 修复外部证据 PIT 泄漏和 source type 泄漏。
-2. 建 `PointInTimeMarketSnapshot` Interface、RQData/TuShare/AKShare/本地 StructuredData Seam 和按域 RoutingPolicy。
+2. 建 `PointInTimeMarketSnapshot` Interface、TuShare/AKShare/本地 StructuredData Seam 和按域 RoutingPolicy。
 3. 建真实事件账本和真实事件回测。
 4. 把 `analogs + factors + shocks + simulator + adjuster + backtester` 深化为 `EventConditionedImpactModel`。
 5. 让分支通过结构化 `StateChange` 真正改变模型输入。

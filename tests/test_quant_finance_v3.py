@@ -21,11 +21,10 @@ from scenario_engine.data import (
     PointInTimeMarketSnapshot,
     RoutingPolicy,
     RoutingRule,
-    RQDataAdapter,
-    RQDATA_DAILY_PRICE,
     SnapshotRequest,
     StructuredDataRouter,
     TENCENT_DAILY_PRICE,
+    TuShareAdapter,
     TUSHARE_DAILY_PRICE,
     canonical_payload_hash,
     normalize_daily_price_rows,
@@ -342,8 +341,8 @@ def test_cross_source_artifacts_require_explicit_reconciliation():
     connection = sqlite3.connect(":memory:")
     repository = MarketArtifactRepository(connection)
     left = artifact(
-        "rq-price", "price", "equity_price", "000001", ts(19), ts(19),
-        {"close": 10.0}, adjustment="none", source_id="rqdata",
+        "vendor-price", "price", "equity_price", "000001", ts(19), ts(19),
+        {"close": 10.0}, adjustment="none", source_id="vendor_a",
     )
     right = artifact(
         "ts-price", "price", "equity_price", "000001", ts(19), ts(19),
@@ -474,11 +473,11 @@ def test_router_preflights_capability_before_transport():
 
 
 def test_optional_provider_capabilities_are_probed_per_dataset_not_globally():
-    class FixtureRQData(RQDataAdapter):
+    class FixtureTuShare(TuShareAdapter):
         dependency_name = ""
         credential_groups = ()
 
-    adapter = FixtureRQData(
+    adapter = FixtureTuShare(
         fetchers={("price", "equity_price"): lambda request: ()},
         probes={("price", "equity_price"): lambda: (AvailabilityStatus.AVAILABLE, "price canary passed")},
     )
@@ -487,8 +486,8 @@ def test_optional_provider_capabilities_are_probed_per_dataset_not_globally():
     assert capabilities[("price", "equity_price")].fields == (
         "open", "high", "low", "close", "volume", "amount"
     )
-    assert capabilities[("fundamental", "pit_financials")].status == AvailabilityStatus.INVALID_RESPONSE
-    assert "dataset-specific" in capabilities[("fundamental", "pit_financials")].detail
+    assert capabilities[("fundamental", "income")].status == AvailabilityStatus.INVALID_RESPONSE
+    assert "dataset-specific" in capabilities[("fundamental", "income")].detail
 
 
 def test_provider_daily_price_normalizers_enforce_one_canonical_unit_schema():
@@ -497,11 +496,6 @@ def test_provider_daily_price_normalizers_enforce_one_canonical_unit_schema():
         frequency="1d", adjustment="none",
     )
     provider_rows = (
-        (RQDATA_DAILY_PRICE, {
-            "order_book_id": "000001.XSHE", "date": "2020-03-19",
-            "open": 10, "high": 11, "low": 9, "close": 10.5,
-            "volume": 10_000, "total_turnover": 10_000,
-        }),
         (TUSHARE_DAILY_PRICE, {
             "ts_code": "000001.SZ", "trade_date": "20200319",
             "open": 10, "high": 11, "low": 9, "close": 10.5,
@@ -542,7 +536,7 @@ def test_provider_daily_price_normalizers_enforce_one_canonical_unit_schema():
     invalid = dict(provider_rows[0][1], high=9.5)
     with pytest.raises(ContractViolation, match="inconsistent OHLC"):
         normalize_daily_price_rows(
-            request, (invalid,), schema=RQDATA_DAILY_PRICE,
+            request, (invalid,), schema=TUSHARE_DAILY_PRICE,
             adapter_version="fixture-1", ingested_at=ts(20),
         )
 
@@ -550,11 +544,11 @@ def test_provider_daily_price_normalizers_enforce_one_canonical_unit_schema():
 def test_router_atomically_persists_external_artifacts_and_rejects_identity_collision():
     first = artifact(
         "provider-price", "price", "equity_price", "000001", ts(19), ts(19),
-        {"close": 10.0}, adjustment="none", source_id="rqdata",
+        {"close": 10.0}, adjustment="none", source_id="tushare",
     )
 
     class RecordedProvider:
-        source_id = "rqdata"
+        source_id = "tushare"
 
         def __init__(self, result):
             self.result = result
@@ -583,7 +577,7 @@ def test_router_atomically_persists_external_artifacts_and_rejects_identity_coll
     router = StructuredDataRouter(
         (provider,),
         RoutingPolicy((RoutingRule(
-            "price", "equity_price", ("rqdata",), frequency="1d", adjustment="none"
+            "price", "equity_price", ("tushare",), frequency="1d", adjustment="none"
         ),)),
         repository,
     )
@@ -597,7 +591,7 @@ def test_router_atomically_persists_external_artifacts_and_rejects_identity_coll
 
     provider.result = artifact(
         "provider-price", "price", "equity_price", "000001", ts(19), ts(19),
-        {"close": 11.0}, adjustment="none", source_id="rqdata",
+        {"close": 11.0}, adjustment="none", source_id="tushare",
     )
     with pytest.raises(DataConflict):
         router.fetch(request)
@@ -847,7 +841,7 @@ def test_run_ledger_persists_explicit_retry_and_terminal_failure_states():
         "retry-run",
         retry_at=ts(20, 1),
         reason_code="provider_rate_limited",
-        detail={"source_id": "rqdata"},
+        detail={"source_id": "tushare"},
     )
     assert job_id.startswith("retry_")
     assert connection.execute(

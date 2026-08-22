@@ -37,13 +37,6 @@ class DailyPriceRowSchema:
     source_metadata_field: str | None = None
 
 
-RQDATA_DAILY_PRICE = DailyPriceRowSchema(
-    source_id="rqdata", code_field="order_book_id", date_field="date",
-    open_field="open", high_field="high", low_field="low", close_field="close",
-    volume_field="volume", amount_field="total_turnover",
-    volume_multiplier=1.0, amount_multiplier=1.0, source_method="get_price",
-    license_tag="rqdata_contract", usage_scope="configured_by_deployment",
-)
 TUSHARE_DAILY_PRICE = DailyPriceRowSchema(
     source_id="tushare", code_field="ts_code", date_field="trade_date",
     open_field="open", high_field="high", low_field="low", close_field="close",

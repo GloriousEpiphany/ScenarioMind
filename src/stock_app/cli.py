@@ -27,7 +27,7 @@ from src.stock_app.scenario_public_data import prepare_public_scenario_data
 from src.stock_app.scenario_runtime import (
     configured_runtime_capabilities,
     probe_llm_live,
-    probe_rqdata_live,
+    probe_tushare_live,
 )
 
 
@@ -42,8 +42,8 @@ def cli():
 
 @cli.command('scenario-doctor')
 @click.option('--live-llm', is_flag=True, help='实际发起一次结构化大模型请求；可能产生少量 API 用量')
-@click.option('--live-rqdata', is_flag=True, help='实际初始化 RQData 并探测 A 股日行情权限')
-def scenario_doctor(live_llm, live_rqdata):
+@click.option('--live-tushare', is_flag=True, help='实际调用 TuShare daily 并探测 A 股日行情权限')
+def scenario_doctor(live_llm, live_tushare):
     """审计情景推演依赖、凭证和真实连通性，不输出任何密钥。"""
     capabilities = list(configured_runtime_capabilities())
     if live_llm:
@@ -52,10 +52,10 @@ def scenario_doctor(live_llm, live_rqdata):
             live if item.capability_id == "scenario_llm" else item
             for item in capabilities
         ]
-    if live_rqdata:
-        live = probe_rqdata_live()
+    if live_tushare:
+        live = probe_tushare_live()
         capabilities = [
-            live if item.capability_id == "rqdata" else item
+            live if item.capability_id == "tushare_pro" else item
             for item in capabilities
         ]
     table = Table(show_header=True, header_style="bold magenta")
@@ -80,7 +80,7 @@ def scenario_doctor(live_llm, live_rqdata):
         for item in capabilities
         if (
             (live_llm and item.capability_id == "scenario_llm" and not item.usable)
-            or (live_rqdata and item.capability_id == "rqdata" and not item.usable)
+            or (live_tushare and item.capability_id == "tushare_pro" and not item.usable)
         )
     }
     if requested_failures or any(item.status == "dependency_missing" for item in capabilities):

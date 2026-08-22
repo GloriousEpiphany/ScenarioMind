@@ -49,7 +49,6 @@ python main.py load-account 我的组合
 
 - `SCENARIO_LLM_API_BASE` / `SCENARIO_LLM_API_KEY` / `SCENARIO_LLM_MODEL`
 - `TUSHARE_TOKEN` 与 `STOCKM1_TUSHARE_ENABLED`
-- `RQDATA_USERNAME` / `RQDATA_PASSWORD` 或 `RQDATAC2_CONF`
 - 公共源启用、LLM 请求超时以及模型校准闸门
 
 当前公共链路实际验证的依赖锁在 `requirements-scenario-public.txt`；核心 `requirements.txt` 不假装包含付费数据权限。安装后先执行：
@@ -61,7 +60,7 @@ python main.py scenario-doctor --live-llm
 
 第一条只报告本地依赖和配置，不把“能读取 key”写成“API 可用”；第二条会产生一次少量模型用量，只有真实 `chat.completions` 返回非空 JSON 才标记通过。严格数值引擎仍使用 `use_llm=False`：页面单独调用 `ScenarioLLMClient` 做自然语言结构化，并展示实际主机、模型、用量和错误；大模型输出不进入收益率、概率、CVaR 或目标价生成边界。
 
-RQData、TuShare Pro 和 AKShare 均为延迟导入的可选 Adapter。不要把 SDK 加回核心 `requirements.txt`。每个生产环境应根据真实许可证、地域、字段权限和契约 fixture 生成自己的精确 lock 文件；未经逐数据集 canary 验证的 SDK 版本不得标记为 `available`。Adapter 构造器接收数据集专用 row fetcher、normalizer 和 probe，不能用一次账号探测把所有数据集整体标记可用。
+TuShare Pro 和 AKShare 均为延迟导入的可选 Adapter。不要把 SDK 加回核心 `requirements.txt`。每个生产环境应根据真实许可证、地域、字段权限和契约 fixture 生成自己的精确 lock 文件；未经逐数据集 canary 验证的 SDK 版本不得标记为 `available`。Adapter 构造器接收数据集专用 row fetcher、normalizer 和 probe，不能用一次账号探测把所有数据集整体标记可用。
 
 页面和 CLI 已提供逐组件公共采集。必须显式确认研究用途和上游条款；任何组件失败只报告该组件，不静默换源：
 
@@ -83,7 +82,7 @@ python main.py confirm-sellable --account-id 2 --symbol 002230 --as-of-date 2026
 
 市场状态使用等权 A 股收益、20 日趋势/波动、量能比、广度和 60 日市场相关性；因子暴露为实际日对数收益对等权市场收益的 OLS beta，残差样本为真实 1/5/20/60 日滚动残差和。每条工件保存计算窗口、样本量、公式和输入工件摘要。交易约束使用真实持仓数量、用户确认/跨日可卖数量、最新/昨收行情、上市日期、ST/停牌/涨跌停规则、20 日成交额代理和财务/行业工件。缺任一输入时只报告失败。
 
-这些公共入口不能凭空生成成熟的历史事件研究数据。`event_study_observation` 和 `analog_state_observation` 必须有真实公告/事件日期以及已经成熟的 1/5/20/60 日后验收益；只有取得有权限的 TuShare/RQData 或导入自有可审计事件数据后，才能做留出样本覆盖率和 CVaR 校准。`model_versions` 只有校准指标实际通过闸门时才能登记 `active`。近期新闻不足 60 日、GDELT 返回 429 或全市场业绩历史端点超时，都只能保持阻断，不能用报告期末、默认样本或手填漂亮指标代替。
+这些公共入口不能凭空生成成熟的历史事件研究数据。`event_study_observation` 和 `analog_state_observation` 必须有真实公告/事件日期以及已经成熟的 1/5/20/60 日后验收益；只有取得有权限的 TuShare 或导入自有可审计事件数据后，才能做留出样本覆盖率和 CVaR 校准。`model_versions` 只有校准指标实际通过闸门时才能登记 `active`。近期新闻不足 60 日、GDELT 返回 429 或全市场业绩历史端点超时，都只能保持阻断，不能用报告期末、默认样本或手填漂亮指标代替。
 
 页面“历史事件样本与真实校准”区域提供 CSV 模板、上传预览、成熟度检查和校准按钮；CLI 等价入口为：
 
@@ -96,7 +95,7 @@ python main.py calibrate-scenario-model --event-type financing --symbol 002230 -
 
 校准器按事件时间顺序保留末段事件做样本外验证，训练分布的 10%–90% 区间目标覆盖率为 80%，同时计算验证结果跌破训练 q10 的下尾超限率。指标和源工件摘要写入 `model_versions`；超过 `.env` 闸门时状态为 `rejected`，只有同时通过才是 `active`。任务计划会读取 active 模型的 `adapter_weights`：未登记模型时仍检查 event-study、factor、analog 全集；登记事件/相似状态模型后只要求它实际声明的量化数据，不再误报未使用的 factor 数据。
 
-四种日行情统一经过 `normalize_daily_price_rows`：RQData 的股/元保持原单位，TuShare 的手/千元转换成股/元，AKShare 和腾讯的成交量从手转换成股。腾讯 `appstock` 当前的 6 字段历史日线不提供成交额；除权除息日的第 7 项是公司行动对象，不是成交额。工件将 `amount` 保存为 `null` 并记录 `amount_not_provided_by_source`，公司行动原样收录到 `source_metadata`；禁止填 0 或估算。外部历史响应的 `known_at` 等于真实入库时刻，不会回填成历史交易日；因此今天第一次抓到的历史记录只能服务截止时点不早于本次入库的任务。
+三种日行情统一经过 `normalize_daily_price_rows`：TuShare 的手/千元转换成股/元，AKShare 和腾讯的成交量从手转换成股。腾讯 `appstock` 当前的 6 字段历史日线不提供成交额；除权除息日的第 7 项是公司行动对象，不是成交额。工件将 `amount` 保存为 `null` 并记录 `amount_not_provided_by_source`，公司行动原样收录到 `source_metadata`；禁止填 0 或估算。外部历史响应的 `known_at` 等于真实入库时刻，不会回填成历史交易日；因此今天第一次抓到的历史记录只能服务截止时点不早于本次入库的任务。
 
 腾讯行情的严格 V3 入库命令如下。`--end-date` 必须显式指定已收盘交易日；盘中当日日线会因 `event_time=15:00` 晚于真实入库时刻而失败，不会被悄然丢弃或作为收盘价使用。
 

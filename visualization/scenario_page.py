@@ -30,6 +30,7 @@ from src.stock_app.holdings_import import (
 )
 from src.stock_app.scenario_data_prep import (
     latest_likely_closed_trading_date,
+    prepare_scenario_data_automatically,
     prepare_v3_equity_prices,
 )
 from src.stock_app.scenario_local_features import (
@@ -43,7 +44,15 @@ from src.stock_app.scenario_historical_events import (
     read_historical_event_csv,
 )
 from src.stock_app.scenario_public_data import prepare_public_scenario_data
-from src.stock_app.scenario_runtime import configured_runtime_capabilities
+from src.stock_app.scenario_runtime import (
+    activate_runtime_credentials,
+    configured_runtime_capabilities,
+    credential_setup_catalog,
+    probe_llm_live,
+    probe_tushare_live,
+    runtime_credential_store_path,
+    save_runtime_credentials,
+)
 from src.stock_app.v3_portfolio import (
     CurrentPortfolioSnapshotModule,
     automatically_selected_account_id,
@@ -72,6 +81,8 @@ def show_scenario_page() -> None:
         "V3.1 严格路径｜只读取可审计的点时数据、已登记模型和当前账户持仓；"
         "缺数据、缺权限、未校准或约束不可行都会明确失败。"
     )
+
+    _render_runtime_setup()
 
     st.subheader("1. 准备当前持仓")
     portfolio_ready = _render_current_portfolio_module(config.DATABASE_PATH)
@@ -492,7 +503,10 @@ def _render_price_preparation_action(db_path: str, symbols: tuple[str, ...]) -> 
             max_value=end_default,
             key="scenario_price_end_date",
         )
-        st.caption("使用腾讯单一来源；每条记录带来源、known_at、schema 和内容哈希，不会改写 legacy 行情表。")
+        st.caption(
+            "已配置 TuShare 时优先使用官方 daily 历史日线；预检失败才在写入前回退腾讯。"
+            "每条记录带来源、known_at、schema 和内容哈希，不会改写 legacy 行情表。"
+        )
         if st.button(
             f"获取 {len(symbols)} 只证券的 V3 行情",
             use_container_width=True,
@@ -515,14 +529,15 @@ def _render_price_preparation_action(db_path: str, symbols: tuple[str, ...]) -> 
                     details = "；".join(f"{item.symbol}: {item.message}" for item in result.failures)
                     st.session_state["scenario_portfolio_notice"] = (
                         "warning",
-                        f"已为 {len(result.succeeded_symbols)} 只证券写入 {result.artifact_count} 条 V3 行情；"
+                        f"通过 {result.source_id} 为 {len(result.succeeded_symbols)} 只证券写入 "
+                        f"{result.artifact_count} 条 V3 行情；"
                         f"{len(result.failures)} 只失败：{details}",
                     )
                 else:
                     st.session_state["scenario_portfolio_notice"] = (
                         "success",
-                        f"行情准备完成：{len(result.succeeded_symbols)} 只证券，"
-                        f"共写入 {result.artifact_count} 条严格 V3 工件。",
+                        f"行情准备完成（{result.source_id}）：{len(result.succeeded_symbols)} 只证券，"
+                        f"共写入 {result.artifact_count} 条严格 V3 工件。{result.source_note}",
                     )
                 st.rerun()
             except (ValueError, sqlite3.Error) as exc:
@@ -811,7 +826,7 @@ def _render_llm_parser(objective: str, as_of_date: date) -> None:
                 st.session_state["scenario_llm_error"] = f"{type(exc).__name__}: {exc}"
                 st.session_state.pop("scenario_llm_parse", None)
         if not llm.configured:
-            st.warning("API base、key、model 未完整配置。复制根目录 `.env.example` 为 `.env` 后填写。")
+            st.warning("API base、key、model 未完整配置。请在页面顶部的“一次配置，自动复用”中完成。")
         elif not llm.dependency_available:
             st.error("当前解释器缺少 openai SDK；安装 requirements-scenario-public.txt。")
         else:
@@ -826,6 +841,101 @@ def _render_llm_parser(objective: str, as_of_date: date) -> None:
                 "以下只作为任务结构化输入，不进入数值模型边界。"
             )
             st.json(parsed)
+
+
+def _render_runtime_setup() -> None:
+    """Render one-time in-app credentials and official acquisition paths."""
+    guides = {item.provider_id: item for item in credential_setup_catalog()}
+    capabilities = {item.capability_id: item for item in configured_runtime_capabilities()}
+    notice = st.session_state.pop("scenario_runtime_setup_notice", None)
+    if notice:
+        level, message = notice
+        getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(message)
+    store_path = runtime_credential_store_path()
+    with st.expander("一次配置，自动复用", expanded=not store_path.exists()):
+        st.success("腾讯行情与 AKShare 公共数据无需 API Key，应用会在“自动准备全部数据”时直接获取。")
+        st.caption(
+            "付费账户无法由应用代你注册，但只需在这里录入一次：Windows 使用当前用户 DPAPI 加密，"
+            f"保存到 {store_path}，以后自动加载，不需要编辑 .env。"
+        )
+        tabs = st.tabs(("TuShare", "DeepSeek", "变量与获取路径"))
+        with tabs[1]:
+            guide = guides["deepseek"]
+            st.caption(
+                f"当前状态：{capabilities['scenario_llm'].status} · "
+                f"{capabilities['scenario_llm'].detail}"
+            )
+            st.info(guide.guidance)
+            links = st.columns(2)
+            links[0].link_button("创建 DeepSeek API Key", guide.acquisition_url, use_container_width=True)
+            links[1].link_button("查看官方 API 文档", guide.documentation_url, use_container_width=True)
+            with st.form("scenario_deepseek_setup"):
+                api_base = st.text_input(
+                    "API Base", value="https://api.deepseek.com", key="scenario_deepseek_base"
+                )
+                api_key = st.text_input("API Key", type="password", key="scenario_deepseek_key")
+                model = st.selectbox(
+                    "模型", ("deepseek-v4-pro", "deepseek-v4-flash"), key="scenario_deepseek_model"
+                )
+                llm_submit = st.form_submit_button("验证并安全保存 DeepSeek", use_container_width=True)
+            if llm_submit:
+                _validate_and_store_runtime_credentials(
+                    "deepseek",
+                    {
+                        "SCENARIO_LLM_API_BASE": api_base,
+                        "SCENARIO_LLM_API_KEY": api_key,
+                        "SCENARIO_LLM_MODEL": model,
+                    },
+                )
+        with tabs[0]:
+            guide = guides["tushare"]
+            st.caption(
+                f"当前状态：{capabilities['tushare_pro'].status} · "
+                f"{capabilities['tushare_pro'].detail}"
+            )
+            st.info(guide.guidance)
+            links = st.columns(2)
+            links[0].link_button("查看 Token 获取步骤", guide.acquisition_url, use_container_width=True)
+            links[1].link_button("查看官方调用文档", guide.documentation_url, use_container_width=True)
+            with st.form("scenario_tushare_setup"):
+                token = st.text_input("TuShare Token", type="password", key="scenario_tushare_token")
+                tushare_submit = st.form_submit_button("验证并安全保存 TuShare", use_container_width=True)
+            if tushare_submit:
+                _validate_and_store_runtime_credentials("tushare", {"TUSHARE_TOKEN": token})
+        with tabs[2]:
+            rows = []
+            for guide in guides.values():
+                required = " 或 ".join(" + ".join(group) for group in guide.required_variable_groups)
+                rows.append({
+                    "服务": guide.display_name,
+                    "环境变量（部署时可选）": required,
+                    "可选高级变量": " / ".join(guide.optional_variables) or "无",
+                    "获取入口": guide.acquisition_url,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "应用内保存会自动注入这些变量。STOCKM1_TUSHARE_ENABLED 只是部署开关，"
+                "应用内验证成功后会自动开启。"
+            )
+
+
+def _validate_and_store_runtime_credentials(provider_id: str, values: Mapping[str, Any]) -> None:
+    try:
+        normalized = activate_runtime_credentials(provider_id, values)
+        if provider_id == "deepseek":
+            result = probe_llm_live()
+        else:
+            result = probe_tushare_live()
+        if not result.usable:
+            raise RuntimeError(f"{result.status}: {result.detail}")
+        path = save_runtime_credentials(provider_id, normalized)
+        st.session_state["scenario_runtime_setup_notice"] = (
+            "success",
+            f"{provider_id} 已通过真实 canary 并安全保存到 {path}；后续启动会自动复用。",
+        )
+        st.rerun()
+    except Exception as exc:
+        st.error(f"验证失败，未保存：{type(exc).__name__}: {exc}")
 
 
 def _render_data_preparation(readiness, db_path: str, as_of_date: date) -> None:
@@ -883,7 +993,7 @@ def _render_data_preparation(readiness, db_path: str, as_of_date: date) -> None:
             st.info(
                 "页面上方可直接补持仓估值行情、公共财务/行业/新闻/情绪/资金流，以及由本地真实行情"
                 "派生的市场状态、因子与交易约束。历史事件研究/相似状态样本必须有真实公告日期和"
-                "成熟的 1/5/20/60 日后验；没有 TuShare/RQData 权限或自有数据时仍会阻断。"
+                "成熟的 1/5/20/60 日后验；没有 TuShare 权限或自有数据时仍会阻断。"
             )
         if issue_codes.intersection({"observed_event_missing", "hypothesis_event_missing"}):
             st.info(
@@ -1034,11 +1144,68 @@ def _render_preparation_actions(db_path: str, context: Mapping[str, Any]) -> Non
             "配置模板：项目根目录 `.env.example`；公共已验证依赖："
             "`requirements-scenario-public.txt`。未执行 live canary 的能力不会显示为可用。"
         )
-    st.markdown("**按组件执行，不使用静默换源**")
+    st.markdown("**自动准备全部可获取数据**")
     ack = st.checkbox(
         "我确认公共网页数据仅用于研究，并自行核对 AKShare 及其上游站点条款",
         key="scenario_public_usage_ack",
     )
+    st.caption(
+        "一次执行会自动获取持仓及参考篮子的两年严格行情，再获取当前持仓的财务、行业、"
+        "公告/新闻、情绪和资金流，最后生成市场状态、因子、残差与交易约束。首次运行可能需要数分钟。"
+    )
+    if st.button(
+        "自动准备全部数据",
+        type="primary",
+        use_container_width=True,
+        disabled=not ack,
+        key="scenario_prepare_everything",
+    ):
+        bar = st.progress(0.0, text="正在启动自动数据准备…")
+
+        def update(phase: str, done: int, total: int, subject: str) -> None:
+            ranges = {"price": (0.0, 0.65), "public": (0.65, 0.92), "local": (0.92, 1.0)}
+            start, finish = ranges.get(phase, (0.0, 1.0))
+            fraction = done / total if total else 0.0
+            bar.progress(
+                min(1.0, start + (finish - start) * fraction),
+                text=f"{phase} · {subject}（{done}/{total}）",
+            )
+
+        try:
+            end_date = latest_likely_closed_trading_date()
+            result = prepare_scenario_data_automatically(
+                db_path,
+                symbols,
+                start_date=end_date - timedelta(days=730),
+                end_date=end_date,
+                include_money_flow=True,
+                progress=update,
+            )
+            rows = [
+                {
+                    "阶段": item.phase,
+                    "组件": item.component,
+                    "对象": item.subject,
+                    "状态": item.status,
+                    "工件数": item.artifact_count,
+                    "详情": item.detail,
+                }
+                for item in result.items
+            ]
+            st.session_state["scenario_preparation_notice"] = {
+                "level": "success" if result.complete else "warning",
+                "message": (
+                    f"自动准备完成：写入 {result.artifact_count} 条可审计工件。"
+                    if result.complete
+                    else f"自动准备已执行并写入 {result.artifact_count} 条工件；上游无数据或失败项见下表。"
+                ),
+                "items": rows,
+            }
+            st.rerun()
+        except Exception as exc:
+            st.error(f"自动数据准备失败：{type(exc).__name__}: {exc}")
+
+    st.markdown("**高级排障：按组件重试**")
     cols = st.columns(3)
     if cols[0].button(
         "获取财务/行业/新闻/情绪",
@@ -1286,7 +1453,7 @@ def _readiness_guidance(code: str) -> str:
     if code in {"artifact_store_empty", "portfolio_artifact_coverage_gap"}:
         return "行情用页面内一键获取；其他缺口按严格 PIT Adapter 入库"
     if code in {"required_datasets_missing", "required_domains_missing", "required_routes_missing"}:
-        return "先用页面逐项准备；历史事件样本缺口须配置有许可的 TuShare/RQData 或导入自有可审计数据"
+        return "先用页面逐项准备；历史事件样本缺口须配置有许可的 TuShare 或导入自有可审计数据"
     if code == "observed_event_missing":
         return "从公告、政策或新闻原文生成事实工件并登记 ObservedEvent"
     if code == "hypothesis_event_missing":
