@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Mapping
 
 from scenario_engine.errors import ContractViolation
@@ -42,7 +43,8 @@ class AssetConstraint:
             raise ContractViolation("share, lot, and listing counters must be integers")
         if self.current_quantity < 0 or not 0 <= self.sellable_quantity <= self.current_quantity:
             raise ContractViolation("sellable_quantity must be within current holdings")
-        if self.lot_size <= 0 or self.listing_days <= 0 or self.last_price <= 0 or self.portfolio_value <= 0:
+        if (self.lot_size <= 0 or self.listing_days <= 0 or self.last_price <= 0 or self.portfolio_value <= 0
+                or not isfinite(self.last_price) or not isfinite(self.portfolio_value)):
             raise ContractViolation("lot_size, listing_days, last_price, and portfolio_value must be positive")
         if self.price_limit_state not in {"none", "limit_up", "limit_down"}:
             raise ContractViolation("price_limit_state must be none, limit_up, or limit_down")
@@ -83,5 +85,5 @@ class PortfolioConstraints:
         for name in ("max_drawdown", "max_single_weight", "max_industry_weight", "min_cash_weight", "max_turnover"):
             if not 0 <= float(getattr(self, name)) <= 1:
                 raise ContractViolation(f"{name} must be in [0, 1]")
-        if self.transaction_cost_rate < 0:
+        if not isfinite(self.transaction_cost_rate) or self.transaction_cost_rate < 0:
             raise ContractViolation("transaction_cost_rate cannot be negative")

@@ -1,4 +1,4 @@
-"""Auditable mixed-integer CVaR optimization with no heuristic fallback."""
+"""Auditable MILP stress research; marginal quantiles are not joint risk."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from scipy.sparse import lil_matrix
 
 from scenario_engine.errors import ContractViolation, InfeasiblePortfolio, OptimizationFailure
 from scenario_engine.quant.contracts import LossCube
+from scenario_engine.quant.risk import expected_shortfall
 
 from .constraints import PortfolioConstraints
 
@@ -65,6 +66,14 @@ class ProposalComparison:
     concentration_after: float
     uncertainty_before: float
     uncertainty_after: float
+    risk_measure: str = "marginal_q10_stress_proxy"
+    calculation_version: str = "simple_returns_cash_costs_v1"
+    publication_eligible: bool = False
+    publication_blockers: tuple[str, ...] = (
+        "calibrated_joint_paths_required",
+        "wealth_path_drawdown_not_validated",
+        "independent_proposal_validation_required",
+    )
 
 
 class PortfolioPolicy:
@@ -97,6 +106,13 @@ class PortfolioPolicy:
         scenarios, uncertainty = self._scenario_surface(loss_cube, symbols)
         before = self._metrics(scenarios, current, 0.10)
         before_uncertainty = float(uncertainty @ current)
+        observation_issues = []
+        try:
+            self._validate_feasible(current, symbols, current, constraints)
+        except InfeasiblePortfolio as exc:
+            observation_issues.append(str(exc))
+        if before[1] > constraints.max_drawdown:
+            observation_issues.append("current portfolio exceeds the stress loss limit")
         comparisons = []
         for objective in self.objectives:
             weights, objective_value = self._solve(
@@ -108,9 +124,9 @@ class PortfolioPolicy:
             proposal = PortfolioProposal(
                 proposal_type=objective.proposal_type,
                 weights={symbol: float(weight) for symbol, weight in zip(symbols, weights)},
-                cash_weight=float(1 - weights.sum()),
-                status="active",
-                activation_conditions=(),
+                cash_weight=float(1 - weights.sum() - transaction_cost),
+                status="research_only",
+                activation_conditions=("requires calibrated joint paths and independent validation",),
                 solver_name="scipy.optimize.milp/highs",
                 solver_status="optimal",
                 objective_value=objective_value,
@@ -136,12 +152,12 @@ class PortfolioPolicy:
             cash_weight=float(1 - current.sum()),
             status=(
                 "risk_limit_breached"
-                if before[1] > constraints.max_drawdown
-                else ("active" if confirmed_signals else "awaiting_confirmed_signal")
+                if observation_issues
+                else "research_only"
             ),
             activation_conditions=(
-                ("current portfolio exceeds max_drawdown; observation is not an executable proposal",)
-                if before[1] > constraints.max_drawdown
+                tuple(observation_issues)
+                if observation_issues
                 else (confirmed_signals or ("requires a validated observable signal",))
             ),
             solver_name="not_applicable",
@@ -169,7 +185,10 @@ class PortfolioPolicy:
         for cell in cube.cells:
             if cell.quantile != "q10":
                 continue
-            rows.setdefault((cell.branch_id, cell.horizon), {})[cell.symbol] = cell.return_value
+            row = rows.setdefault((cell.branch_id, cell.horizon), {})
+            if cell.symbol in row:
+                raise ContractViolation("duplicate symbol in LossCube downside row")
+            row[cell.symbol] = cell.return_value
             if cell.symbol in uncertainty_values:
                 uncertainty_values[cell.symbol].append(
                     float(cell.model_disagreement) + (1.0 - float(cell.coverage))
@@ -181,7 +200,11 @@ class PortfolioPolicy:
             missing = set(symbols).difference(values)
             if missing:
                 raise ContractViolation(f"LossCube row {key} missing symbols: {sorted(missing)}")
-            matrix.append([-float(values[symbol]) for symbol in symbols])
+            with np.errstate(over="raise", invalid="raise"):
+                try:
+                    matrix.append([-float(np.expm1(values[symbol])) for symbol in symbols])
+                except FloatingPointError as exc:
+                    raise ContractViolation("log return cannot be converted to a finite simple return") from exc
         if any(not values for values in uncertainty_values.values()):
             raise ContractViolation("LossCube lacks uncertainty coverage for one or more symbols")
         scenarios = np.asarray(matrix, dtype=float)
@@ -245,7 +268,10 @@ class PortfolioPolicy:
             add({index: -steps[index], u_start + index: -1.0}, ub=0.0)
         add({u_start + index: 1.0 for index in range(asset_count)}, ub=constraints.max_turnover)
         add(
-            {index: steps[index] for index in range(asset_count)},
+            {
+                **{index: steps[index] for index in range(asset_count)},
+                **{u_start + index: constraints.transaction_cost_rate for index in range(asset_count)},
+            },
             ub=1.0 - constraints.min_cash_weight - float(current.sum()),
         )
         industries: dict[str, list[int]] = {}
@@ -292,7 +318,10 @@ class PortfolioPolicy:
             objective.cvar_weight / (scenario_count * objective.tail_probability)
         )
         coefficients[worst_index] = objective.worst_branch_weight
-        coefficients[u_start:eta_index] = objective.turnover_weight
+        coefficients[u_start:eta_index] = (
+            objective.turnover_weight
+            + constraints.transaction_cost_rate * (objective.cvar_weight + objective.worst_branch_weight)
+        )
         coefficients[z_start:u_start] += objective.uncertainty_weight * uncertainty * steps
 
         result = milp(
@@ -322,7 +351,8 @@ class PortfolioPolicy:
     @staticmethod
     def _validate_feasible(weights, symbols, current, constraints):
         tolerance = 1e-7
-        if weights.sum() > 1 - constraints.min_cash_weight + tolerance:
+        cost = np.abs(weights - current).sum() * constraints.transaction_cost_rate
+        if weights.sum() + cost > 1 - constraints.min_cash_weight + tolerance:
             raise InfeasiblePortfolio("cash-weight constraint is infeasible")
         if np.abs(weights - current).sum() > constraints.max_turnover + tolerance:
             raise InfeasiblePortfolio("turnover constraint is infeasible")
@@ -361,6 +391,5 @@ class PortfolioPolicy:
     @staticmethod
     def _metrics(scenarios, weights, tail_probability):
         losses = scenarios @ weights
-        count = max(1, int(np.ceil(len(losses) * tail_probability)))
-        tail = np.sort(losses)[-count:]
-        return float(tail.mean()), float(losses.max())
+        mass = np.full(len(losses), 1.0 / len(losses))
+        return expected_shortfall(losses, mass, tail_probability), float(losses.max())

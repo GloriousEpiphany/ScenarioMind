@@ -77,4 +77,5 @@ class SQLitePointInTimePortfolioResolver:
             portfolio_id=str(payload["portfolio_id"]),
             symbols=tuple(sorted(values)),
             weights={symbol: weights[symbol] for symbol in sorted(values)},
+            snapshot_artifact_id=artifact.artifact_id,
         )

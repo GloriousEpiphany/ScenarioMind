@@ -113,6 +113,7 @@ class MissionController:
         exposure_module: FundamentalAndIndustryExposure,
         regime_module: MarketRegimeClassifier,
         feature_snapshot_builder: FeatureSnapshotBuilder,
+        universe_resolver=None,
     ):
         self.snapshot_module = snapshot_module
         self.event_ledger = event_ledger
@@ -128,6 +129,7 @@ class MissionController:
         self.exposure_module = exposure_module
         self.regime_module = regime_module
         self.feature_snapshot_builder = feature_snapshot_builder
+        self.universe_resolver = universe_resolver
         self._seq = 0
 
     def execute(self, mission: ScenarioMission) -> MissionResult:
@@ -142,6 +144,12 @@ class MissionController:
             self._progress(run_id, "capability", "data_steward", "completed", 1, 1, "capability_ready")
 
             portfolio = self.portfolio_resolver.resolve(mission.portfolio_ref, mission.as_of)
+            universe = None
+            if mission.universe_ref is not None:
+                if self.universe_resolver is None:
+                    raise ContractViolation("mission requests an investment universe but no resolver is configured")
+                universe = self.universe_resolver.resolve(mission.universe_ref, portfolio, mission.as_of)
+                portfolio = universe.expand_portfolio(portfolio, mission.as_of)
             self._progress(run_id, "snapshot", "data_steward", "running", 0, len(plan.required_domains), "snapshot_build")
             snapshot = self.snapshot_module.build(
                 SnapshotRequest(
@@ -213,12 +221,17 @@ class MissionController:
             self._progress(run_id, "branches", "branch_planner", "running", 0, len(branches), "branch_quantify")
             branch_distributions = []
             branch_features = []
+            resolved_states = {root.event_id: root_scenario.state_changes}
             for branch_index, branch in enumerate(branches, start=1):
-                merged_state = self._merge_state(root_scenario.state_changes, branch.state_changes)
-                if {item.key: item.value for item in merged_state} == dict(root_scenario.state):
+                if branch.parent_id not in resolved_states:
+                    raise ContractViolation(f"branch {branch.branch_id} has an unresolved parent")
+                parent_state = resolved_states[branch.parent_id]
+                merged_state = self._merge_state(parent_state, branch.state_changes)
+                if {item.key: item.value for item in merged_state} == {item.key: item.value for item in parent_state}:
                     raise ContractViolation(
                         f"branch {branch.branch_id} does not change quantitative model state and cannot receive numeric output"
                     )
+                resolved_states[branch.hypothesis_event.event_id] = merged_state
                 branch_scenario = StructuredScenario(
                     scenario_id=run_id, root_event_id=root.event_id, event_type=root.event_type,
                     branch_id=branch.branch_id,
@@ -270,6 +283,7 @@ class MissionController:
                 mission, snapshot, root, root_distribution, branch_distributions,
                 comparisons, regime, sentiments, root_features, branch_features, validations,
             )
+            report["investment_universe"] = universe
             self.run_ledger.transition(run_id, "REPORTED", {"sections": len(report)})
             self._progress(run_id, "report", "report_agent", "running", 1, 2, "report_ready_pending_commit")
             result = MissionResult(
@@ -313,7 +327,7 @@ class MissionController:
         if isinstance(exc, (DataUnavailable, InsufficientModelData, UncalibratedModel)):
             return "INSUFFICIENT_DATA", "failed"
         if isinstance(exc, AdapterFailure):
-            return "DEGRADED", "degraded"
+            return "FAILED", "failed"
         return "FAILED", "failed"
 
     def _progress(self, run_id, stage, agent, status, completed, total, code, args=None):
@@ -338,7 +352,7 @@ class MissionController:
 
     @staticmethod
     def _run_id(mission):
-        value = f"{mission.objective}|{mission.portfolio_ref}|{mission.as_of.isoformat()}"
+        value = f"{mission.objective}|{mission.portfolio_ref}|{mission.as_of.isoformat()}|{mission.universe_ref}"
         return "mission_" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:20]
 
     @staticmethod
@@ -405,9 +419,9 @@ class MissionController:
 
     @staticmethod
     def _merge_state(root, branch):
-        merged = {item.key: item for item in root}
-        merged.update({item.key: item for item in branch})
-        return tuple(merged[key] for key in sorted(merged))
+        from scenario_engine.events.state_transition import apply_state_changes
+
+        return apply_state_changes(root, branch)
 
     @staticmethod
     def _validate(snapshot, root_distribution, branches, comparisons):
@@ -507,6 +521,12 @@ class MissionController:
             "root_distribution": root_distribution,
             "branch_distributions": branches,
             "portfolio_comparisons": comparisons,
+            "publication": {
+                "eligible": False,
+                "status": "research_only",
+                "blockers": sorted({reason for item in comparisons for reason in item.publication_blockers}),
+                "risk_measure": "marginal_q10_stress_proxy",
+            },
             "validations": validations,
             "compliance": "research_only_no_trade_execution_no_return_promise",
         }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from math import isfinite
 from typing import Any, Mapping
 
 from scenario_engine.data.contracts import require_aware
@@ -27,7 +28,7 @@ class RiskPolicy:
             value = float(getattr(self, name))
             if not 0 < value <= 1:
                 raise ContractViolation(f"{name} must be in (0, 1]")
-        if self.transaction_cost_rate < 0:
+        if not isfinite(self.transaction_cost_rate) or self.transaction_cost_rate < 0:
             raise ContractViolation("transaction_cost_rate cannot be negative")
 
 
@@ -38,11 +39,14 @@ class ScenarioMission:
     as_of: datetime
     risk_policy: RiskPolicy
     mission_id: str | None = None
+    universe_ref: str | None = None
 
     def __post_init__(self) -> None:
         if not self.objective.strip() or not self.portfolio_ref.strip():
             raise ContractViolation("mission objective and portfolio_ref are required")
         require_aware(self.as_of, "ScenarioMission.as_of")
+        if self.universe_ref is not None and not self.universe_ref.strip():
+            raise ContractViolation("universe_ref cannot be blank")
 
 
 @dataclass(frozen=True)
@@ -115,12 +119,14 @@ class ResolvedPortfolio:
     portfolio_id: str
     symbols: tuple[str, ...]
     weights: Mapping[str, float]
+    snapshot_artifact_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.portfolio_id or not self.symbols or set(self.symbols) != set(self.weights):
             raise ContractViolation("resolved portfolio symbols and weights must match")
         total = sum(float(value) for value in self.weights.values())
-        if any(float(value) < 0 for value in self.weights.values()) or total > 1 + 1e-9:
+        if (len(set(self.symbols)) != len(self.symbols)
+                or any(not isfinite(float(value)) or float(value) < 0 for value in self.weights.values()) or total > 1 + 1e-9):
             raise ContractViolation("resolved portfolio weights are invalid")
 
 

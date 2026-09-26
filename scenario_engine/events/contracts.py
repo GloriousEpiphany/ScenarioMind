@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from math import isfinite
 import re
 from typing import Any, Mapping
 
@@ -90,12 +91,19 @@ class StateChange:
     value: Any
     unit: str | None
     source: str
+    operator: str = "set"
 
     def __post_init__(self) -> None:
         if not self.key or not self.source:
             raise ContractViolation("StateChange requires key and source")
         if self.value is None:
             raise ContractViolation("StateChange.value cannot be None")
+        if self.operator not in {"set", "add", "multiply"}:
+            raise ContractViolation(f"unsupported state transition operator: {self.operator}")
+        if isinstance(self.value, (int, float)) and not isfinite(self.value):
+            raise ContractViolation("StateChange.value must be finite")
+        if self.operator != "set" and (isinstance(self.value, bool) or not isinstance(self.value, (int, float))):
+            raise ContractViolation("arithmetic state transitions require numeric values")
 
 
 @dataclass(frozen=True)
@@ -136,6 +144,10 @@ class ScenarioBranchSpec:
             raise ContractViolation("a branch requires trigger, invalidation, and required-data contracts")
         if not self.generation_basis:
             raise ContractViolation("a branch requires generation_basis")
+        for timestamp in self.observation_window:
+            require_aware(timestamp, "observation_window")
+        if len({item.key for item in self.state_changes}) != len(self.state_changes):
+            raise ContractViolation("branch contains conflicting changes to the same state key")
         if self.observation_window[0] >= self.observation_window[1]:
             raise ContractViolation("observation_window must be increasing")
         if not 0 <= self.priority_score <= 1:
@@ -149,5 +161,5 @@ class ScenarioBranchSpec:
             raise ContractViolation("uncalibrated branches cannot expose probability")
 
     @property
-    def state_fingerprint(self) -> tuple[tuple[str, str, str | None], ...]:
-        return tuple(sorted((item.key, repr(item.value), item.unit) for item in self.state_changes))
+    def state_fingerprint(self) -> tuple:
+        return tuple(sorted((item.key, repr(item.value), item.unit, item.operator) for item in self.state_changes))

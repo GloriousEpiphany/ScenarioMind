@@ -13,6 +13,7 @@ from .factor_model import FactorShockAdapter
 from .analog_model import AnalogStateAdapter
 from .impact_model import EventConditionedImpactModel
 from .model_registry import ModelRegistry
+from .joint_paths import JointScenarioPaths, PathRisk
 
 __all__ = [
     "AssetLossDistribution",
@@ -26,4 +27,6 @@ __all__ = [
     "ScenarioLossDistribution",
     "StructuredScenario",
     "ModelRegistry",
+    "JointScenarioPaths",
+    "PathRisk",
 ]

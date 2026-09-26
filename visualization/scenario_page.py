@@ -745,13 +745,14 @@ def _mission_payload(mission: ScenarioMission) -> dict[str, Any]:
         "as_of": mission.as_of.isoformat(),
         "risk_policy": asdict(mission.risk_policy),
         "mission_id": mission.mission_id,
+        "universe_ref": mission.universe_ref,
     }
 
 
 def _mission_from_payload(payload: Mapping[str, Any], *, mission_id: str) -> ScenarioMission:
     required = {"objective", "portfolio_ref", "as_of", "risk_policy", "mission_id"}
     missing = required.difference(payload)
-    extra = set(payload).difference(required)
+    extra = set(payload).difference(required | {"universe_ref"})
     if missing or extra:
         raise ValueError(f"persisted mission contract mismatch; missing={sorted(missing)}, extra={sorted(extra)}")
     risk_payload = payload["risk_policy"]
@@ -763,6 +764,7 @@ def _mission_from_payload(payload: Mapping[str, Any], *, mission_id: str) -> Sce
         as_of=datetime.fromisoformat(str(payload["as_of"])),
         risk_policy=RiskPolicy(**risk_payload),
         mission_id=mission_id,
+        universe_ref=payload.get("universe_ref"),
     )
 
 
@@ -1003,7 +1005,7 @@ def _render_data_preparation(readiness, db_path: str, as_of_date: date) -> None:
         if issue_codes.intersection({"active_calibrated_model_missing", "active_model_event_contract_mismatch"}):
             st.info(
                 "数值结果要求已登记的 active 模型，同时满足训练截止日、样本外校准、"
-                "分位覆盖误差与 CVaR 闸门；未通过时系统只会阻断，不会输出伪精度。"
+                "生产算法时间回放、分位覆盖误差与 VaR 覆盖闸门；这不代表 ES 或联合风险已验证。"
             )
 
         payload = json.dumps(readiness.as_dict(), ensure_ascii=False, indent=2, default=str).encode("utf-8")
@@ -1459,7 +1461,7 @@ def _readiness_guidance(code: str) -> str:
     if code == "hypothesis_event_missing":
         return "在事实事件就绪后生成带触发、失效条件和数据需求的假设分支"
     if code == "active_calibrated_model_missing":
-        return "取得成熟历史事件样本后做样本外覆盖率/CVaR 校准；只有通过闸门才登记 active"
+        return "取得当时可见的成熟事件样本后回放生产算法，验证区间与 VaR 覆盖；不能回填历史可见时间"
     if code == "active_model_event_contract_mismatch":
         return "按当前根事件的 event_type 与 state 字段重新准备历史事件样本并校准"
     return "按阻断详情完成数据或能力配置后重新检查"
@@ -1624,6 +1626,7 @@ def _render_result(result) -> None:
             )
 
     st.subheader("组合候选与复测")
+    st.warning("当前组合结果仅为边际分位数压力研究。联合路径、途中回撤与独立复测尚未通过，不发布调仓建议。")
     proposal_rows = []
     for comparison in result.portfolio_comparisons:
         proposal_rows.append(
@@ -1631,8 +1634,8 @@ def _render_result(result) -> None:
                 "类型": comparison.proposal.proposal_type,
                 "状态": comparison.proposal.status,
                 "现金权重": comparison.proposal.cash_weight,
-                "CVaR 调整前": comparison.cvar_before,
-                "CVaR 调整后": comparison.cvar_after,
+                "边际 q10 压力代理（前）": comparison.cvar_before,
+                "边际 q10 压力代理（后）": comparison.cvar_after,
                 "最差分支调整前": comparison.worst_branch_before,
                 "最差分支调整后": comparison.worst_branch_after,
                 "换手率": comparison.turnover,
@@ -1653,6 +1656,7 @@ def _render_bundle(bundle: dict[str, Any], *, run_id: str) -> None:
         raise RuntimeError("committed run bundle contains no root asset distribution")
     snapshot = dict(bundle["market_snapshot"])
     st.subheader("已验证结果")
+    st.warning("历史运行包仅保留原始研究记录，不代表已通过当前联合风险与调仓发布闸门。")
     st.caption(f"Run ID：{run_id} · MarketSnapshot：{snapshot.get('snapshot_id')}")
     st.dataframe(
         pd.DataFrame(
@@ -1685,8 +1689,8 @@ def _render_bundle(bundle: dict[str, Any], *, run_id: str) -> None:
                     "类型": item["proposal"]["proposal_type"],
                     "状态": item["proposal"]["status"],
                     "现金权重": item["proposal"]["cash_weight"],
-                    "CVaR 调整前": item["cvar_before"],
-                    "CVaR 调整后": item["cvar_after"],
+                    "边际 q10 压力代理（前）": item["cvar_before"],
+                    "边际 q10 压力代理（后）": item["cvar_after"],
                     "最差分支调整前": item["worst_branch_before"],
                     "最差分支调整后": item["worst_branch_after"],
                     "换手率": item["turnover"],

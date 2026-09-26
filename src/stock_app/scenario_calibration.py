@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 import json
 import os
@@ -14,6 +14,12 @@ import numpy as np
 
 from scenario_engine.errors import ContractViolation, DataUnavailable
 from scenario_engine.quant import ModelPolicy, ModelRegistry
+from scenario_engine.data import DataRequest, MarketArtifactRepository
+from scenario_engine.data.contracts import MarketSnapshot, require_aware
+from scenario_engine.events.contracts import StateChange
+from scenario_engine.quant.contracts import StructuredScenario
+from scenario_engine.quant.replay import predict_fold
+from scenario_engine.signals.feature_snapshot import FeatureSnapshot
 
 
 HORIZONS = (1, 5, 20, 60)
@@ -94,17 +100,16 @@ def calibrate_event_analog_model(
                 f"事件样本 state 字段集合不一致: {sorted(state_key_sets)}"
             )
         evaluations: list[tuple[float, float, float]] = []
-        for symbol in symbols:
-            for horizon in HORIZONS:
-                train_values = np.asarray([
-                    _return_value(sample, symbol, horizon) for sample in training
-                ], dtype=float)
-                if len(train_values) < sample_floor or not np.isfinite(train_values).all():
-                    raise DataUnavailable(f"{symbol}/{horizon}d 训练收益样本不足或非法")
-                q10, q90 = np.quantile(train_values, (0.10, 0.90), method="linear")
-                for sample in validation:
-                    actual = _return_value(sample, symbol, horizon)
-                    evaluations.append((actual, float(q10), float(q90)))
+        fold_records = []
+        repository = MarketArtifactRepository(connection)
+        for sample in validation:
+            distribution, record = _production_fold(
+                repository, training, sample, event_type, symbols, sample_floor,
+            )
+            fold_records.append(record)
+            for asset in distribution.assets:
+                actual = _return_value(sample, asset.symbol, asset.horizon)
+                evaluations.append((actual, asset.q10, asset.q90))
         if len(evaluations) < sample_floor:
             raise DataUnavailable("样本外评估单元少于模型 min_samples")
         inside = [q10 <= actual <= q90 for actual, q10, q90 in evaluations]
@@ -113,22 +118,35 @@ def calibrate_event_analog_model(
         quantile_error = abs(coverage - 0.80)
         cvar_exceedance = float(np.mean(lower_tail))
         source_ids = [sample["artifact_id"] for sample in samples]
-        digest = hashlib.sha256("\n".join(source_ids).encode("utf-8")).hexdigest()
+        frozen_training_ids = tuple(sorted({identifier for fold in fold_records for identifier in fold["training_artifact_ids"]}))
+        digest = hashlib.sha256(json.dumps({
+            "sources": source_ids, "folds": fold_records,
+            "symbols": symbols, "min_samples": sample_floor,
+            "validation_fraction": validation_fraction,
+            "max_quantile_coverage_error": max_q_error,
+            "max_var_exceedance_rate": max_cvar,
+            "algorithm": "production_pit_event_holdout_v1",
+        }, sort_keys=True).encode("utf-8")).hexdigest()
         model_id = "event_analog_empirical"
         version = f"{event_type}:{digest[:16]}"
-        calibration_version = f"chronological_holdout:{digest[16:32]}"
+        calibration_version = f"production_pit_holdout_v1:{digest[16:32]}"
         metrics = {
             "coverage": coverage,
+            "interval_coverage_oos": coverage,
             "sample_size": len(evaluations),
             "out_of_sample": True,
             "quantile_coverage_error": quantile_error,
             "cvar_exceedance_rate": cvar_exceedance,
+            "var_exceedance_rate": cvar_exceedance,
+            "es_validated": False,
+            "joint_risk_validated": False,
             "validated_at": validated_at.isoformat(),
             "target_interval_coverage": 0.80,
             "training_event_count": len(training),
             "validation_event_count": len(validation),
-            "validation_method": "chronological_event_holdout",
-            "tail_method": "fraction of validation outcomes below training q10",
+            "validation_method": "production_pit_event_holdout_v1",
+            "tail_method": "VaR coverage: fraction below production conditional q10; not ES severity",
+            "folds": fold_records,
             "source_artifact_digest": digest,
         }
         passed = quantile_error <= max_q_error and cvar_exceedance <= max_cvar
@@ -145,6 +163,7 @@ def calibrate_event_analog_model(
             calibration_validated=passed,
             max_quantile_coverage_error=max_q_error,
             max_cvar_exceedance_rate=max_cvar,
+            training_artifact_ids=frozen_training_ids,
         )
         status = "active" if passed else "rejected"
         registry.register(
@@ -190,6 +209,8 @@ def _event_samples(connection, event_type: str, known_at: datetime) -> list[dict
     ).fetchall()
     latest: dict[str, dict[str, Any]] = {}
     for row in rows:
+        if datetime.fromisoformat(str(row[2])) > known_at:
+            continue
         payload = json.loads(row[3])
         if payload.get("event_type") != event_type:
             continue
@@ -202,10 +223,78 @@ def _event_samples(connection, event_type: str, known_at: datetime) -> list[dict
             "artifact_id": str(row[0]),
             "event_time": datetime.fromisoformat(str(row[1])),
             "known_at": datetime.fromisoformat(str(row[2])),
+            "label_available_at": payload.get("label_available_at"),
+            "source_event_artifact_id": payload.get("source_event_artifact_id"),
+            "historical_event_id": historical_id,
             "state": state,
             "returns": returns,
         }
     return sorted(latest.values(), key=lambda item: (item["event_time"], item["known_at"]))
+
+
+def _production_fold(repository, training, sample, event_type, symbols, min_samples):
+    cutoff = sample["event_time"]
+    eligible = []
+    for item in training:
+        raw_label_time = item.get("label_available_at")
+        if not raw_label_time:
+            raise ContractViolation("calibration requires explicit label_available_at; re-import legacy samples")
+        label_time = datetime.fromisoformat(raw_label_time)
+        require_aware(label_time, "label_available_at")
+        if max(label_time, item["known_at"], item["event_time"]) < cutoff:
+            eligible.append(item)
+    if len(eligible) < min_samples:
+        raise DataUnavailable(
+            f"PIT production replay has {len(eligible)} mature visible training events before {cutoff.isoformat()}; "
+            f"{min_samples} required. Late historical imports cannot be backdated into a live replay."
+        )
+    start = min(item["event_time"] for item in eligible) - timedelta(days=1)
+    entities = tuple(row[0] for row in repository.connection.execute(
+        "SELECT DISTINCT entity_id FROM market_artifacts WHERE domain='event'"
+    ).fetchall())
+    allowed = {item["historical_event_id"] for item in eligible}
+    artifacts = []
+    for dataset in ("event_study_observation", "analog_state_observation", "observed_event_source"):
+        fetched = repository.query(DataRequest("event", dataset, entities, start, cutoff, cutoff))
+        if dataset == "observed_event_source":
+            sources = [item for item in fetched if item.artifact_id == sample["source_event_artifact_id"]]
+            if len(sources) != 1 or sources[0].payload.get("state") != sample["state"]:
+                raise DataUnavailable("validation event state lacks matching PIT-visible original evidence")
+            artifacts.extend(sources)
+        else:
+            for item in fetched:
+                if item.payload.get("historical_event_id") not in allowed:
+                    continue
+                label_time = item.payload.get("label_available_at")
+                if not label_time:
+                    raise ContractViolation("production replay training artifact lacks label availability")
+                label_time = datetime.fromisoformat(label_time)
+                require_aware(label_time, "label_available_at")
+                if label_time >= cutoff:
+                    raise ContractViolation("production replay training artifact contains an immature label")
+                artifacts.append(item)
+    for symbol in symbols:
+        prices = repository.query(DataRequest("price", "equity_price", (symbol,), start, cutoff, cutoff, frequency="1d", adjustment="none"))
+        if not prices:
+            raise DataUnavailable(f"PIT replay lacks raw price for {symbol}")
+        artifacts.append(max(prices, key=lambda item: item.event_time))
+    snapshot = MarketSnapshot("fold:" + sample["artifact_id"], cutoff, tuple(artifacts), (), {})
+    scenario = StructuredScenario(snapshot.snapshot_id, sample["historical_event_id"], event_type, "root", tuple(
+        StateChange(key, value, None, sample["source_event_artifact_id"]) for key, value in sample["state"].items()
+    ))
+    features = FeatureSnapshot(
+        "features:" + snapshot.snapshot_id, snapshot.snapshot_id, "root", "universe", "event_state_replay",
+        cutoff, {"scenario_state": dict(scenario.state)}, (sample["source_event_artifact_id"],), "production_pit_holdout_v1",
+    )
+    policy = ModelPolicy("event_analog_empirical", "candidate", cutoff.isoformat(), "pending",
+                         {"event_study": 0.5, "analog_state": 0.5}, min_samples=min_samples)
+    distribution = predict_fold(scenario=scenario, snapshot=snapshot, symbols=symbols, policy=policy, feature_snapshot=features)
+    return distribution, {
+        "as_of": cutoff.isoformat(), "validation_artifact_id": sample["artifact_id"],
+        "training_event_count": len(eligible), "snapshot_artifact_ids": [item.artifact_id for item in artifacts],
+        "training_artifact_ids": [item.artifact_id for item in artifacts if item.dataset in {"event_study_observation", "analog_state_observation"}],
+        "quantile_method": "production_weighted_quantiles", "adapters": list(policy.adapter_weights),
+    }
 
 
 def _return_value(sample: dict[str, Any], symbol: str, horizon: int) -> float:

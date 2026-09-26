@@ -35,6 +35,7 @@ from .mission import (
 )
 from .mission.contracts import DeploymentReadiness, ReadinessIssue
 from .portfolio_policy import PortfolioPolicy
+from .universe import PITUniverseResolver
 from .quant import (
     AnalogStateAdapter,
     EventConditionedImpactModel,
@@ -185,6 +186,15 @@ class ScenarioEngine:
             ))
 
         if portfolio is not None:
+            if mission.universe_ref is not None:
+                try:
+                    universe = PITUniverseResolver(self.market_artifact_repository).resolve(mission.universe_ref, portfolio, mission.as_of)
+                    portfolio = universe.expand_portfolio(portfolio, mission.as_of)
+                except ScenarioEngineError as exc:
+                    issues.append(ReadinessIssue(
+                        code="investment_universe_unavailable", component="investment_universe",
+                        summary=str(exc), required_action="补齐同一账户快照的 PIT 候选池、公司论点和证据；不回退为仅持仓研究。",
+                    ))
             coverage_gaps = self._artifact_coverage_gaps(
                 portfolio.symbols,
                 mission.as_of,
@@ -224,6 +234,14 @@ class ScenarioEngine:
                 (active_model_policy.model_id, active_model_policy.version),
             ).fetchone()
             feature_schema = json.loads(metadata_row[0]) if metadata_row is not None else {}
+            calibrated_symbols = feature_schema.get("portfolio_symbols")
+            if calibrated_symbols is not None and set(portfolio.symbols).difference(calibrated_symbols):
+                issues.append(ReadinessIssue(
+                    code="active_model_universe_mismatch", component="model_registry",
+                    summary="候选池包含尚未纳入当前模型样本外校准的证券。",
+                    required_action="按同一生产算法校准持仓与候选股全集；不能将持仓模型的校准结论直接套给新股。",
+                    context={"missing_symbols": sorted(set(portfolio.symbols).difference(calibrated_symbols))},
+                ))
             calibrated_event_type = feature_schema.get("event_type")
             calibrated_state_keys = set(feature_schema.get("state_keys") or ())
             root_state = root.payload.get("state_changes")
@@ -325,6 +343,7 @@ class ScenarioEngine:
             exposure_module=FundamentalAndIndustryExposure(),
             regime_module=MarketRegimeClassifier(),
             feature_snapshot_builder=FeatureSnapshotBuilder(),
+            universe_resolver=PITUniverseResolver(self.market_artifact_repository),
         )
         return controller.execute(mission)
 

@@ -263,6 +263,13 @@ def test_tushare_credentials_auto_enable_without_a_separate_feature_flag(monkeyp
 
 
 def test_price_preparation_prefers_configured_tushare_daily(tmp_path, monkeypatch):
+    class AfterClose(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = datetime(2026, 9, 10, 9, 0, tzinfo=timezone.utc)
+            return fixed.astimezone(tz) if tz is not None else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(scenario_data_prep, "datetime", AfterClose)
     monkeypatch.setenv("TUSHARE_TOKEN", "fixture-token")
     monkeypatch.setenv("STOCKM1_TUSHARE_ENABLED", "1")
     monkeypatch.setattr(scenario_data_prep, "find_spec", lambda _name: object())
@@ -290,7 +297,7 @@ def test_price_preparation_prefers_configured_tushare_daily(tmp_path, monkeypatc
     assert module.client.daily_calls[-1]["ts_code"] == "000001.SZ"
 
 
-def test_price_preparation_falls_back_before_writes_when_tushare_daily_is_denied(
+def test_price_preparation_stops_when_tushare_daily_is_denied(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("TUSHARE_TOKEN", "fixture-token")
@@ -308,6 +315,9 @@ def test_price_preparation_falls_back_before_writes_when_tushare_daily_is_denied
     end = scenario_data_prep.latest_likely_closed_trading_date()
 
     class FallbackDownloader:
+        def __init__(self):
+            raise AssertionError("failed TuShare must not instantiate another source")
+
         def get_stock_daily_data(self, symbol, *, end_date, **_kwargs):
             day = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
             frame = pd.DataFrame([{
@@ -323,16 +333,14 @@ def test_price_preparation_falls_back_before_writes_when_tushare_daily_is_denied
             return frame
 
     monkeypatch.setattr(scenario_data_prep, "DataDownloader", FallbackDownloader)
-    result = scenario_data_prep.prepare_v3_equity_prices(
-        str(tmp_path / "fallback-price.db"),
-        ("000001",),
-        start_date=end - timedelta(days=5),
-        end_date=end,
-    )
-
-    assert result.complete is True
-    assert result.source_id == "tencent_http"
-    assert "写入前回退腾讯" in result.source_note
+    with pytest.raises(RuntimeError, match="permission|权限"):
+        scenario_data_prep.prepare_v3_equity_prices(
+            str(tmp_path / "fallback-price.db"),
+            ("000001",),
+            start_date=end - timedelta(days=5),
+            end_date=end,
+        )
+    assert not (tmp_path / "fallback-price.db").exists()
 
 
 def test_automatic_data_preparation_runs_free_sources_then_local_derivation(monkeypatch):

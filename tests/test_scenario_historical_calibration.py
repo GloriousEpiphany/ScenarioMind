@@ -5,10 +5,12 @@ import json
 import sqlite3
 
 import pandas as pd
+import pytest
 
 from scenario_engine.data import MarketArtifact, MarketArtifactRepository, canonical_payload_hash
 from scenario_engine.mission import MissionController
 from scenario_engine.quant import ModelRegistry
+from scenario_engine.errors import DataUnavailable
 from src.stock_app.scenario_calibration import calibrate_event_analog_model
 from src.stock_app.scenario_historical_events import import_historical_events
 
@@ -94,24 +96,24 @@ def test_user_historical_documents_create_realized_samples_and_gate_model(tmp_pa
     connection.close()
 
     calibrated_at = imported_at + timedelta(minutes=1)
-    result = calibrate_event_analog_model(
-        path,
-        event_type="financing",
-        portfolio_symbols=("000001",),
-        min_samples=10,
-        validation_fraction=0.20,
-        max_quantile_coverage_error=0.99,
-        max_cvar_exceedance_rate=0.99,
-        clock=lambda: calibrated_at,
-    )
-    assert result.active
-    assert result.validation_event_count == 5
+    assert datetime.fromisoformat(sample["label_available_at"]) >= imported_at
+    with pytest.raises(DataUnavailable, match="Late historical imports"):
+        calibrate_event_analog_model(
+            path,
+            event_type="financing",
+            portfolio_symbols=("000001",),
+            min_samples=10,
+            validation_fraction=0.20,
+            max_quantile_coverage_error=0.99,
+            max_cvar_exceedance_rate=0.99,
+            clock=lambda: calibrated_at,
+        )
     connection = sqlite3.connect(path)
-    policy = ModelRegistry(connection).active_as_of(calibrated_at + timedelta(seconds=1))
-    assert policy.adapter_weights == {"analog_state": 0.5, "event_study": 0.5}
+    with pytest.raises(DataUnavailable):
+        ModelRegistry(connection).active_as_of(calibrated_at + timedelta(seconds=1))
     connection.close()
 
-    plan = MissionController.plan("event-only", adapter_ids=policy.adapter_weights)
+    plan = MissionController.plan("event-only", adapter_ids=("event_study", "analog_state"))
     assert "quant" not in plan.required_datasets
     assert plan.required_datasets["event"] == (
         "observed_event_source",

@@ -11,6 +11,7 @@ from scenario_engine.data.contracts import MarketSnapshot
 from scenario_engine.errors import ContractViolation, DataUnavailable, UncalibratedModel
 
 from .contracts import AssetLossDistribution, ModelPolicy, ScenarioLossDistribution, StructuredScenario
+from .risk import expected_shortfall
 
 
 class QuantAdapter(Protocol):
@@ -79,9 +80,12 @@ class EventConditionedImpactModel:
                 q10, q25, median, q75, q90 = self._weighted_quantiles(
                     combined, combined_weights, (0.10, 0.25, 0.50, 0.75, 0.90)
                 )
-                tail = combined[combined <= q10]
-                tail_weights = combined_weights[combined <= q10]
-                cvar = max(0.0, -float(np.average(tail, weights=tail_weights)))
+                with np.errstate(over="raise", invalid="raise"):
+                    try:
+                        simple_losses = -np.expm1(combined)
+                    except FloatingPointError as exc:
+                        raise ContractViolation("model samples overflow simple-return conversion") from exc
+                cvar = max(0.0, expected_shortfall(simple_losses, combined_weights, model_policy.cvar_alpha))
                 probability_status = "calibrated" if model_policy.calibration_validated else "uncalibrated"
                 if model_policy.require_calibration and probability_status != "calibrated":
                     raise UncalibratedModel("model output is not calibrated")

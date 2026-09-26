@@ -65,9 +65,14 @@ class BranchPlanner:
                     probability=(float(event.payload["probability"]) if event.payload.get("probability_status") == "calibrated" else None),
                     probability_status=str(event.payload["probability_status"]),
                 )
-                if spec.state_fingerprint in fingerprints:
+                fingerprint = (
+                    parent_id, spec.state_fingerprint, spec.observation_window,
+                    repr(spec.trigger_conditions), repr(spec.invalidation_conditions),
+                    repr(spec.required_data), spec.probability_status, spec.probability,
+                )
+                if fingerprint in fingerprints:
                     continue
-                fingerprints.add(spec.state_fingerprint)
+                fingerprints.add(fingerprint)
                 branches.append(spec)
                 frontier.append((event.event_id, parent_depth + 1))
                 if len(branches) >= max_total:
@@ -85,6 +90,7 @@ class BranchPlanner:
                 value=item["value"],
                 unit=item.get("unit"),
                 source=f"hypothesis:{event.event_id}",
+                operator=item.get("operator", "set"),
             )
             for item in raw
         )

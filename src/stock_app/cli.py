@@ -194,7 +194,7 @@ def import_scenario_events_command(file_path, symbols):
 @click.option('--symbol', 'symbols', multiple=True, required=True)
 @click.option('--min-samples', type=click.IntRange(min=5), default=None, help='训练事件最小样本数')
 def calibrate_scenario_model_command(event_type, symbols, min_samples):
-    """按时间留出样本校准事件/相似状态模型；未过闸门只登记 rejected。"""
+    """逐折回放生产算法；当时不可见或标签未成熟的样本不能用于校准。"""
     result = calibrate_event_analog_model(
         config.DATABASE_PATH,
         event_type=event_type,
@@ -213,6 +213,125 @@ def calibrate_scenario_model_command(event_type, symbols, min_samples):
     })
     if not result.active:
         raise click.ClickException("模型未通过样本外校准闸门，未登记 active")
+
+
+@cli.command('build-investment-universe')
+@click.option('--universe-ref', required=True, help='候选池引用名')
+@click.option('--portfolio-ref', default='current', show_default=True)
+@click.option('--master-artifact-id', required=True, help='完整 PIT 证券主数据工件 ID')
+@click.option('--thesis-artifact-id', 'thesis_ids', multiple=True, required=True, help='已验证公司论点工件 ID，可重复')
+@click.option('--market', 'markets', multiple=True, required=True, help='明确允许的市场代码，可重复')
+@click.option('--policy-version', required=True)
+@click.option('--expires-at', required=True, help='候选池到期时间，带时区 ISO-8601')
+def build_investment_universe_command(universe_ref, portfolio_ref, master_artifact_id, thesis_ids,
+                                      markets, policy_version, expires_at):
+    """从已入库证券主数据与公司论点构建候选池，保留全部现有持仓。"""
+    from datetime import datetime, timezone
+    from scenario_engine.data import MarketArtifactRepository
+    from scenario_engine.mission import SQLitePointInTimePortfolioResolver
+    from scenario_engine.universe.builder import build_universe_artifact
+
+    db = Database(config.DATABASE_PATH)
+    try:
+        repository = MarketArtifactRepository(db.connect())
+        as_of = datetime.now(timezone.utc)
+        portfolio = SQLitePointInTimePortfolioResolver(repository).resolve(portfolio_ref, as_of)
+        artifact = build_universe_artifact(
+            repository=repository, universe_ref=universe_ref, portfolio=portfolio,
+            master_artifact_id=master_artifact_id, thesis_artifact_ids=thesis_ids,
+            allowed_markets=markets, policy_version=policy_version,
+            as_of=as_of, expires_at=datetime.fromisoformat(expires_at),
+        )
+        repository.ingest_many((artifact,))
+        console.print({"universe_ref": universe_ref, "artifact_id": artifact.artifact_id,
+                       "members": artifact.payload["members"], "exclusions": artifact.payload["exclusions"],
+                       "status": "research_universe_created_not_an_investment_recommendation"})
+    except (ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        db.close()
+
+
+@cli.command('research-portfolio')
+@click.option('--objective', required=True, help='具体持仓或候选股研究目标')
+@click.option('--portfolio-ref', default='current', show_default=True)
+@click.option('--universe-ref', default=None, help='显式使用已构建的 PIT 候选池')
+@click.option('--max-drawdown', type=click.FloatRange(min=0, max=1, min_open=True), required=True)
+@click.option('--max-single-weight', type=click.FloatRange(min=0, max=1, min_open=True), required=True)
+def research_portfolio_command(objective, portfolio_ref, universe_ref, max_drawdown, max_single_weight):
+    """运行严格研究并保存审计报告；研究成功不等于通过调仓发布闸门。"""
+    from datetime import datetime, timezone
+    from scenario_engine import ScenarioEngine
+    from scenario_engine.errors import ScenarioEngineError
+    from scenario_engine.mission import ScenarioMission, RiskPolicy
+
+    engine = ScenarioEngine(db_path=config.DATABASE_PATH, use_llm=False)
+    try:
+        mission = ScenarioMission(objective, portfolio_ref, datetime.now(timezone.utc),
+                                  RiskPolicy(max_drawdown, max_single_weight), universe_ref=universe_ref)
+        result = engine.execute(mission)
+        console.print_json(data=result.as_dict())
+    except ScenarioEngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        engine.close()
+
+
+@cli.command('advisory-research')
+@click.option('--run-id', required=True, help='持久化任务 ID；相同参数可恢复中断任务')
+@click.option('--objective', required=True)
+@click.option('--as-of', required=True, help='冻结知识截止时间，带时区 ISO-8601')
+@click.option('--symbol', 'symbols', multiple=True, required=True)
+@click.option('--dataset', 'datasets', multiple=True, required=True, help='允许读取的 domain/dataset，可重复')
+@click.option('--model-policy-version', required=True)
+@click.option('--model-evaluation-ref', required=True, help='固定模型策略对应的评测记录引用')
+def advisory_research_command(run_id, objective, as_of, symbols, datasets, model_policy_version, model_evaluation_ref):
+    """调用固定模型自主读取 PIT 证据并反证；会产生模型 API 用量，不发布交易建议。"""
+    from datetime import datetime
+    import sqlite3
+    from scenario_engine.agents import AgentModelPolicy
+    from scenario_engine.agents.model import ToolCallingModel
+    from scenario_engine.agents.pit_tools import make_pit_query_tool
+    from scenario_engine.agents.runtime import AgentRuntime
+    from scenario_engine.agents.tools import fingerprint
+    from scenario_engine.data import MarketArtifactRepository
+    from scenario_engine.errors import ScenarioEngineError
+    from src.stock_app.scenario_runtime import load_scenario_environment
+
+    runtime, connection = None, None
+    try:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise click.ClickException('缺少模型 SDK；请安装 requirements-advisory.txt，不会回退到固定流程') from exc
+        load_scenario_environment()
+        model_name = os.getenv('SCENARIO_LLM_MODEL')
+        api_base = os.getenv('SCENARIO_LLM_API_BASE')
+        api_key = os.getenv('SCENARIO_LLM_API_KEY')
+        if not all((model_name, api_base, api_key)):
+            raise click.ClickException('自治研究要求明确配置 SCENARIO_LLM_MODEL、SCENARIO_LLM_API_BASE 和 SCENARIO_LLM_API_KEY')
+        scope = tuple(tuple(item.split('/')) for item in datasets)
+        if any(len(item) != 2 or not all(item) for item in scope):
+            raise click.ClickException('--dataset 必须是非空 domain/dataset')
+        cutoff = datetime.fromisoformat(as_of)
+        policy = AgentModelPolicy(model_policy_version, model_name, model_evaluation_ref)
+        connection = sqlite3.connect(config.DATABASE_PATH, timeout=30, check_same_thread=False)
+        repository = MarketArtifactRepository(connection)
+        query_tool = make_pit_query_tool(repository, allowed_datasets=scope, allowed_symbols=symbols)
+        with OpenAI(base_url=api_base, api_key=api_key, timeout=60, max_retries=0) as client:
+            runtime = AgentRuntime(db_path=config.DATABASE_PATH, model=ToolCallingModel(client, policy), policy=policy, tools=(query_tool,))
+            result = runtime.execute(run_id=run_id, objective=objective, as_of=cutoff,
+                                     context={"symbols": list(symbols), "datasets": list(datasets), "model_endpoint_hash": fingerprint(api_base)})
+            console.print_json(data=result)
+            if result['status'] != 'research_complete':
+                raise click.ClickException(f"研究未完成：{result['status']}；已保存进度，不发布建议")
+    except (ScenarioEngineError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        if runtime is not None:
+            runtime.close()
+        if connection is not None:
+            connection.close()
 
 
 @cli.command()

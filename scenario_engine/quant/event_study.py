@@ -31,6 +31,8 @@ class EventStudyAdapter:
         candidates = []
         provenance: dict[tuple[str, int], tuple[str, ...]] = {}
         for artifact in artifacts:
+            if policy.training_artifact_ids and artifact.artifact_id not in policy.training_artifact_ids:
+                continue
             if artifact.event_time > training_cutoff or artifact.known_at > training_cutoff:
                 continue
             payload = artifact.payload

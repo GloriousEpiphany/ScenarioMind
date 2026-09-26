@@ -27,6 +27,8 @@ class AnalogStateAdapter:
         training_cutoff = datetime.fromisoformat(policy.training_cutoff.replace("Z", "+00:00"))
         ranked = []
         for artifact in candidates:
+            if policy.training_artifact_ids and artifact.artifact_id not in policy.training_artifact_ids:
+                continue
             if artifact.event_time > training_cutoff or artifact.known_at > training_cutoff:
                 continue
             state = artifact.payload.get("pre_event_state")

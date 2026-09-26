@@ -180,6 +180,7 @@ def _price_history(connection, symbols: tuple[str, ...], known_at: datetime) -> 
         output[str(row[1])].append({
             "artifact_id": str(row[0]),
             "event_time": datetime.fromisoformat(str(row[2])),
+            "known_at": datetime.fromisoformat(str(row[3])),
             "close": close,
         })
     for symbol in symbols:
@@ -201,6 +202,7 @@ def _event_artifacts(row, prices, symbols, known_at):
     document_hash = hashlib.sha256(document_text.encode("utf-8")).hexdigest()
     returns: dict[str, dict[str, float]] = {}
     price_ids: list[str] = []
+    label_available_at = event_time
     for symbol in symbols:
         series = prices[symbol]
         anchors = [item for item in series if item["event_time"] <= event_time]
@@ -217,6 +219,10 @@ def _event_artifacts(row, prices, symbols, known_at):
             for horizon in HORIZONS
         }
         price_ids.extend([anchor["artifact_id"], *(forward[h - 1]["artifact_id"] for h in HORIZONS)])
+        label_available_at = max(
+            label_available_at, anchor["known_at"],
+            *(max(forward[h - 1]["event_time"], forward[h - 1]["known_at"]) for h in HORIZONS),
+        )
     source_payload = {
         "historical_event_id": event_id,
         "event_type": event_type,
@@ -242,6 +248,8 @@ def _event_artifacts(row, prices, symbols, known_at):
         "source_event_artifact_id": source.artifact_id,
         "price_artifact_ids": sorted(set(price_ids)),
         "return_method": "log(close at h-th subsequent session / latest close not after event_time)",
+        "label_available_at": max(label_available_at, known_at).isoformat(),
+        "label_window_end": label_available_at.isoformat(),
     }
     event_study = _artifact(
         domain="event", dataset="event_study_observation", entity_id=entity_id,

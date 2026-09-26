@@ -197,6 +197,15 @@ class MarketArtifactRepository:
             artifact.frequency,
         )
 
+    def get_visible(self, artifact_id: str, as_of: datetime) -> MarketArtifact:
+        row = self.connection.execute("SELECT * FROM market_artifacts WHERE artifact_id = ?", (artifact_id,)).fetchone()
+        if row is None:
+            from scenario_engine.errors import DataUnavailable
+            raise DataUnavailable(f"referenced artifact does not exist: {artifact_id}")
+        artifact = self._from_row(row)
+        artifact.assert_visible(as_of)
+        return artifact
+
     def query(self, request: DataRequest, *, source_id: str | None = None) -> tuple[MarketArtifact, ...]:
         placeholders = ",".join("?" for _ in request.entities)
         clauses = [

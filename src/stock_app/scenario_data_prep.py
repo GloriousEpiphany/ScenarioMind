@@ -87,16 +87,22 @@ class AutomaticPreparationResult:
 class _CachedPublicDataModule:
     """Cache the expensive all-market money-flow snapshot within one auto run."""
 
-    def __init__(self, module) -> None:
+    def __init__(self, module=None) -> None:
         self._module = module
         self._money_flow_frames: dict[str, object] = {}
 
     def __getattr__(self, name: str):
-        return getattr(self._module, name)
+        return getattr(self._load(), name)
+
+    def _load(self):
+        if self._module is None:
+            import akshare
+            self._module = akshare
+        return self._module
 
     def stock_fund_flow_individual(self, *, symbol: str):
         if symbol not in self._money_flow_frames:
-            self._money_flow_frames[symbol] = self._module.stock_fund_flow_individual(symbol=symbol)
+            self._money_flow_frames[symbol] = self._load().stock_fund_flow_individual(symbol=symbol)
         return self._money_flow_frames[symbol]
 
 
@@ -124,7 +130,7 @@ def prepare_v3_equity_prices(
     downloader: DataDownloader | None = None,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> PricePreparationResult:
-    """Prefer TuShare daily bars and fall back to Tencent before any write occurs."""
+    """Select a configured source once; provider failures never change sources."""
     load_scenario_environment()
     requested = tuple(dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip()))
     if not requested:
@@ -134,16 +140,13 @@ def prepare_v3_equity_prices(
     if end_date > latest_likely_closed_trading_date():
         raise ValueError("行情结束日必须是已经收盘的日期。")
     if downloader is None and _tushare_price_configured():
-        try:
-            return _prepare_tushare_equity_prices(
-                db_path,
-                requested,
-                start_date=start_date,
-                end_date=end_date,
-                progress=progress,
-            )
-        except RuntimeError as exc:
-            fallback_note = f"TuShare daily 预检失败，已在写入前回退腾讯：{exc}"
+        return _prepare_tushare_equity_prices(
+            db_path,
+            requested,
+            start_date=start_date,
+            end_date=end_date,
+            progress=progress,
+        )
     else:
         fallback_note = "TuShare 未配置，使用无需 token 的腾讯历史日线"
     if str(os.getenv("STOCKM1_TENCENT_ENABLED") or "1").strip().casefold() not in {
@@ -192,6 +195,10 @@ def prepare_v3_equity_prices(
 
 def _tushare_price_configured() -> bool:
     enabled = str(os.getenv("STOCKM1_TUSHARE_ENABLED") or "1").strip().casefold()
+    if (enabled in {"1", "true", "yes", "on"}
+            and str(os.getenv("TUSHARE_TOKEN") or "").strip()
+            and find_spec("tushare") is None):
+        raise RuntimeError("TuShare 已配置但 tushare 依赖缺失；不会自动切换行情来源")
     return (
         enabled in {"1", "true", "yes", "on"}
         and bool(str(os.getenv("TUSHARE_TOKEN") or "").strip())
@@ -232,7 +239,7 @@ def _prepare_tushare_equity_prices(
                     dataset="equity_price",
                     entities=(symbol,),
                     start=datetime.combine(start_date, time.min, tzinfo=SHANGHAI),
-                    end=datetime.combine(end_date, time.max, tzinfo=SHANGHAI),
+                    end=min(datetime.combine(end_date, time.max, tzinfo=SHANGHAI), visibility_time),
                     known_at=visibility_time,
                     fields=("open", "high", "low", "close", "volume", "amount"),
                     frequency="1d",
@@ -321,8 +328,6 @@ def prepare_scenario_data_automatically(
             progress("public", done, total, f"{symbol} {component}")
 
     try:
-        import akshare as ak
-
         public = prepare_public_scenario_data(
             db_path,
             requested,
@@ -330,7 +335,7 @@ def prepare_scenario_data_automatically(
             include_industry=True,
             include_news=True,
             include_money_flow=include_money_flow,
-            ak_module=_CachedPublicDataModule(ak),
+            ak_module=_CachedPublicDataModule(),
             progress=public_progress,
         )
         items.extend(

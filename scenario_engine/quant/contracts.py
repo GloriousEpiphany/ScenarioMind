@@ -49,11 +49,14 @@ class ModelPolicy:
     calibration_validated: bool = False
     max_quantile_coverage_error: float = 0.10
     max_cvar_exceedance_rate: float = 0.20
+    training_artifact_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not all((self.model_id, self.version, self.training_cutoff, self.calibration_version)):
             raise ContractViolation("ModelPolicy provenance fields are required")
-        if not self.adapter_weights or any(float(value) <= 0 for value in self.adapter_weights.values()):
+        if len(set(self.training_artifact_ids)) != len(self.training_artifact_ids) or any(not item for item in self.training_artifact_ids):
+            raise ContractViolation("training artifact IDs must be unique and nonempty")
+        if not self.adapter_weights or any(not isfinite(float(value)) or float(value) <= 0 for value in self.adapter_weights.values()):
             raise ContractViolation("adapter_weights must be non-empty and positive")
         if abs(sum(float(value) for value in self.adapter_weights.values()) - 1.0) > 1e-9:
             raise ContractViolation("adapter_weights must sum to one")
@@ -79,6 +82,10 @@ class ModelPolicy:
 
 @dataclass(frozen=True)
 class AssetLossDistribution:
+    """Log-return quantiles, price quantiles, and non-negative simple-loss ES.
+
+    ``coverage`` is input completeness, not out-of-sample interval coverage.
+    """
     symbol: str
     horizon: int
     median: float
@@ -98,8 +105,14 @@ class AssetLossDistribution:
     probability_status: str
     calibration_version: str
     numeric_provenance: tuple[str, ...]
+    return_convention: str = "log_return"
+    cvar_convention: str = "simple_loss_es"
 
     def __post_init__(self) -> None:
+        if self.return_convention != "log_return":
+            raise ContractViolation("AssetLossDistribution requires log-return quantiles")
+        if self.cvar_convention != "simple_loss_es":
+            raise ContractViolation("AssetLossDistribution requires simple-loss ES")
         numeric = (
             self.median, self.q10, self.q25, self.q75, self.q90,
             self.price_q10, self.price_q25, self.price_median, self.price_q75,

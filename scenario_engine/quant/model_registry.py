@@ -79,6 +79,7 @@ class ModelRegistry:
                     "adapter_weights": policy.adapter_weights,
                     "max_quantile_coverage_error": policy.max_quantile_coverage_error,
                     "max_cvar_exceedance_rate": policy.max_cvar_exceedance_rate,
+                    "training_artifact_ids": policy.training_artifact_ids,
                 }, sort_keys=True),
             ),
         )
@@ -117,12 +118,17 @@ class ModelRegistry:
             calibration_validated=True,
             max_quantile_coverage_error=float(payload["max_quantile_coverage_error"]),
             max_cvar_exceedance_rate=float(payload["max_cvar_exceedance_rate"]),
+            training_artifact_ids=tuple(payload.get("training_artifact_ids", ())),
         )
         self._assert_calibrated(policy, metrics)
         return policy
 
     @staticmethod
     def _assert_calibrated(policy: ModelPolicy, metrics: dict) -> None:
+        if policy.model_id == "event_analog_empirical" and metrics.get("validation_method") != "production_pit_event_holdout_v1":
+            raise UncalibratedModel("event/analog model requires production PIT replay; legacy empirical calibration must be rerun")
+        if policy.model_id == "event_analog_empirical" and not policy.training_artifact_ids:
+            raise UncalibratedModel("event/analog production model requires frozen training artifact IDs")
         if not bool(metrics["out_of_sample"]):
             raise UncalibratedModel("active model calibration is not out-of-sample")
         if float(metrics["quantile_coverage_error"]) > policy.max_quantile_coverage_error:

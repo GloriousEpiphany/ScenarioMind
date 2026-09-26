@@ -35,6 +35,7 @@ MANIFEST
 # Virtual environments
 # ------------------------------------------------------------------------------
 .venv/
+.venv-*/
 venv/
 ENV/
 env/
@@ -45,6 +46,8 @@ venv.bak/
 # Test, coverage, lint, type-checker caches
 # ------------------------------------------------------------------------------
 .pytest_cache/
+.test-cache-*/
+.test-tmp-*/
 .deepeval/
 .benchmarks/
 .testmondata
