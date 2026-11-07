@@ -35,6 +35,7 @@ class DailyPriceRowSchema:
     usage_scope: str
     amount_required: bool = True
     source_metadata_field: str | None = None
+    source_metadata_flag: str = "source_corporate_action_attached"
 
 
 TUSHARE_DAILY_PRICE = DailyPriceRowSchema(
@@ -149,7 +150,7 @@ def normalize_daily_price_rows(
                 payload["source_metadata"] = {
                     schema.source_metadata_field: dict(source_metadata)
                 }
-                quality_flags.append("source_corporate_action_attached")
+                quality_flags.append(schema.source_metadata_flag)
         payload_hash = canonical_payload_hash(payload)
         raw_code = str(row[schema.code_field])
         identity_text = "|".join((

@@ -3,13 +3,16 @@
 import json
 
 from scenario_engine.errors import ContractViolation
+from scenario_engine.sqlite_transactions import atomic_write, create_tables
 from .tools import canonical, fingerprint
 
 
 class ResearchBoard:
     def __init__(self, connection):
         self.connection = connection
-        connection.executescript("""
+        connection.execute("PRAGMA read_uncommitted=OFF")
+        with atomic_write(connection):
+            create_tables(connection, """
             CREATE TABLE IF NOT EXISTS advisory_runs (
                 run_id TEXT PRIMARY KEY, contract_hash TEXT NOT NULL, contract_json TEXT NOT NULL
             );
@@ -25,11 +28,12 @@ class ResearchBoard:
 
     def register_run(self, run_id, contract):
         digest = fingerprint(contract)
-        row = self.connection.execute("SELECT contract_hash FROM advisory_runs WHERE run_id=?", (run_id,)).fetchone()
-        if row is not None and row[0] != digest:
-            raise ContractViolation("cannot resume an advisory run with changed tools, model, budget or inputs")
-        with self.connection:
-            self.connection.execute("INSERT OR IGNORE INTO advisory_runs VALUES (?, ?, ?)", (run_id, digest, canonical(contract)))
+        with atomic_write(self.connection):
+            self.connection.execute("INSERT INTO advisory_runs VALUES (?, ?, ?) ON CONFLICT(run_id) DO NOTHING",
+                                    (run_id, digest, canonical(contract)))
+            row = self.connection.execute("SELECT contract_hash FROM advisory_runs WHERE run_id=?", (run_id,)).fetchone()
+            if row[0] != digest:
+                raise ContractViolation("cannot resume an advisory run with changed tools, model, budget or inputs")
 
     def reserve_attempt(self, run_id, kind, task_id, limit):
         # An interrupted provider call still consumed budget. Count reservations,
@@ -58,11 +62,10 @@ class ResearchBoard:
         return json.loads(row[1])
 
     def save(self, run_id, key, request, payload):
-        existing = self.load(run_id, key, request)
-        if existing is not None:
-            if canonical(existing) != canonical(payload):
+        with atomic_write(self.connection):
+            digest, encoded = fingerprint(request), canonical(payload)
+            inserted = self.connection.execute(
+                "INSERT INTO agent_artifacts VALUES (?, ?, ?, ?) ON CONFLICT(run_id, artifact_key) DO NOTHING",
+                (run_id, key, digest, encoded))
+            if not inserted.rowcount and canonical(self.load(run_id, key, request)) != encoded:
                 raise ContractViolation("immutable agent artifact cannot be overwritten")
-            return
-        with self.connection:
-            self.connection.execute("INSERT INTO agent_artifacts VALUES (?, ?, ?, ?)",
-                                    (run_id, key, fingerprint(request), canonical(payload)))

@@ -115,10 +115,17 @@ class CurrentPortfolioSnapshotModule:
         connection,
         *,
         clock: Callable[[], datetime] | None = None,
+        price_source_id: str | None = None,
+        price_artifact_ids: tuple[str, ...] | None = None,
     ) -> None:
         self.connection = connection
         self.repository = MarketArtifactRepository(connection)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        if price_artifact_ids is not None and (not price_source_id or not price_artifact_ids
+                or len(set(price_artifact_ids)) != len(price_artifact_ids)):
+            raise ContractViolation("frozen portfolio prices require a source and unique artifact IDs")
+        self.price_source_id = price_source_id
+        self.price_artifact_ids = price_artifact_ids
 
     def discover_accounts(self) -> tuple[AccountSummary, ...]:
         rows = self.connection.execute(
@@ -265,6 +272,10 @@ class CurrentPortfolioSnapshotModule:
                 },
             }
             payload_hash = canonical_payload_hash(payload)
+            if self.price_source_id:
+                payload["valuation"]["source_id"] = self.price_source_id
+                payload["valuation"]["input_scope"] = "frozen_artifact_ids" if self.price_artifact_ids else "explicit_source_plan"
+                payload_hash = canonical_payload_hash(payload)
             digest = hashlib.sha256(
                 f"{ref}|{account_id}|{captured_at.isoformat()}|{payload_hash}".encode("utf-8")
             ).hexdigest()
@@ -395,7 +406,14 @@ class CurrentPortfolioSnapshotModule:
             strict_pit=True,
         )
         latest: dict[str, MarketArtifact] = {}
-        for artifact in self.repository.query(request):
+        artifacts = (tuple(self.repository.get_visible(ref, known_at) for ref in self.price_artifact_ids)
+                     if self.price_artifact_ids is not None else self.repository.query(request, source_id=self.price_source_id))
+        for artifact in artifacts:
+            if self.price_source_id and (artifact.domain != "price" or artifact.dataset != "equity_price"
+                    or artifact.source_id != self.price_source_id or artifact.adjustment != "none" or artifact.frequency != "1d"):
+                raise ContractViolation("portfolio price artifact violates the frozen source plan")
+            if artifact.entity_id not in symbols:
+                continue
             previous = latest.get(artifact.entity_id)
             if previous is None or (artifact.event_time, artifact.known_at) > (
                 previous.event_time,

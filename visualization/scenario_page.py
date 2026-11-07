@@ -75,6 +75,11 @@ class _MissionJob:
 
 
 def show_scenario_page() -> None:
+    from visualization.portfolio_research_page import show_portfolio_research_page
+    show_portfolio_research_page()
+
+
+def show_quantitative_research_console() -> None:
     _apply_styles()
     st.header("情景推演任务")
     st.caption(
@@ -478,7 +483,7 @@ def _render_holdings_importer(connection: sqlite3.Connection, accounts) -> None:
             st.session_state["scenario_portfolio_notice"] = (
                 "success",
                 f"已{action}账户“{result.account_name}”：{result.position_count} 只持仓，"
-                f"成本合计 ¥{result.cost_basis:,.2f}，现金 ¥{result.cash:,.2f}。请核对行情后发布快照。",
+                f"成本合计 ¥{result.cost_basis:,.2f}，现金 ¥{result.cash:,.2f}。持仓已保存。",
             )
             st.session_state["scenario_imported_account_id"] = result.account_id
             st.rerun()
@@ -845,7 +850,7 @@ def _render_llm_parser(objective: str, as_of_date: date) -> None:
             st.json(parsed)
 
 
-def _render_runtime_setup() -> None:
+def _render_runtime_setup(*, expanded=None) -> None:
     """Render one-time in-app credentials and official acquisition paths."""
     guides = {item.provider_id: item for item in credential_setup_catalog()}
     capabilities = {item.capability_id: item for item in configured_runtime_capabilities()}
@@ -854,7 +859,7 @@ def _render_runtime_setup() -> None:
         level, message = notice
         getattr(st, level if level in {"success", "warning", "error", "info"} else "info")(message)
     store_path = runtime_credential_store_path()
-    with st.expander("一次配置，自动复用", expanded=not store_path.exists()):
+    with st.expander("模型连接与数据设置", expanded=not store_path.exists() if expanded is None else expanded):
         st.success("腾讯行情与 AKShare 公共数据无需 API Key，应用会在“自动准备全部数据”时直接获取。")
         st.caption(
             "付费账户无法由应用代你注册，但只需在这里录入一次：Windows 使用当前用户 DPAPI 加密，"

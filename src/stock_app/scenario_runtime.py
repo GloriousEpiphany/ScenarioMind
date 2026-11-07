@@ -338,6 +338,21 @@ def configured_runtime_capabilities() -> tuple[RuntimeCapability, ...]:
     ) and _present("TUSHARE_TOKEN")
     capabilities = [
         RuntimeCapability(
+            capability_id="baostock", configured=True,
+            dependency_available=find_spec("baostock") is not None,
+            live_verified=False,
+            status="dependency_missing" if find_spec("baostock") is None else "configured_not_live_verified",
+            detail="免费匿名日线；需实际验证登录、交易日历及完整区间，配置不代表网络可用",
+            source_host="public-api.baostock.com",
+        ),
+        RuntimeCapability(
+            capability_id="eastmoney_http", configured=True,
+            dependency_available=(find_spec("requests") is not None), live_verified=False,
+            status="configured_not_live_verified" if find_spec("requests") is not None else "dependency_missing",
+            detail="显式日线来源；需逐区间核对沪深基准交易日，缺日失败；不自动替换其他来源",
+            source_host="push2his.eastmoney.com",
+        ),
+        RuntimeCapability(
             capability_id="scenario_llm",
             configured=llm_configured,
             dependency_available=openai_available,
@@ -473,6 +488,53 @@ def probe_tushare_live() -> RuntimeCapability:
         )
 
 
+def probe_advisory_live() -> RuntimeCapability:
+    """Exercise two actual tool-call turns, including provider continuation state."""
+    from scenario_engine.agents import AgentModelPolicy
+    from scenario_engine.agents.model import ToolCallingModel
+    from scenario_engine.agents.runtime import control_tool
+    from scenario_engine.agents.tools import canonical
+
+    load_scenario_environment()
+    names = ("SCENARIO_LLM_MODEL", "SCENARIO_LLM_API_BASE", "SCENARIO_LLM_API_KEY")
+    values = [str(os.getenv(name) or "").strip() for name in names]
+    if not all(values):
+        return RuntimeCapability("advisory_tools", False, find_spec("openai") is not None, False,
+                                 "configuration_missing", "自治工具调用要求三个明确的 SCENARIO_LLM_* 配置")
+    model_name, base_url, api_key = values
+    try:
+        from openai import OpenAI
+        policy = AgentModelPolicy("connectivity-probe-v1", model_name, "connectivity-only-not-model-evaluation")
+        descriptor = control_tool("runtime_probe", "Verify the tool transport", {})
+        messages = [{"role": "system", "content": "For this connectivity check call runtime_probe exactly once. "
+                     "Always use this function to acknowledge each tool result. Do not answer in prose."},
+                    {"role": "user", "content": "Check the tool transport."}]
+        with OpenAI(base_url=base_url, api_key=api_key, timeout=90, max_retries=0) as client:
+            model = ToolCallingModel.for_endpoint(client, policy, base_url)
+            for _ in range(2):
+                call = model.next_call(messages, [descriptor])
+                if call.name != "runtime_probe" or call.arguments:
+                    raise ValueError("unexpected probe tool call")
+                messages.extend([{"role": "assistant", "content": None, **call.assistant_state,
+                    "tool_calls": [{"id": call.call_id, "type": "function", "function": {
+                        "name": call.name, "arguments": canonical(call.arguments)}}]},
+                    {"role": "tool", "tool_call_id": call.call_id, "content": '{"transport":"ok"}'}])
+                messages.append({"role": "user", "content": "Now call runtime_probe once again with empty arguments to check continuation."})
+        return RuntimeCapability("advisory_tools", True, True, True, "available",
+            "固定模型两轮真实工具调用及续传通过；仅证明连通性", model=model_name)
+    except ImportError:
+        return RuntimeCapability("advisory_tools", True, False, False, "dependency_missing",
+                                 "请安装 requirements-advisory.txt", model=model_name)
+    except Exception as exc:
+        context = getattr(exc, "context", {})
+        return RuntimeCapability("advisory_tools", True, True, False, "live_probe_failed",
+            f"{type(exc).__name__}; provider_error={context.get('error_type', 'contract')}; "
+            f"http_status={context.get('http_status')}; "
+            f"returned_model={context.get('returned_model')}; "
+            f"finish_reason={context.get('finish_reason')}; calls={context.get('tool_call_count')}; "
+            f"contract={str(exc) if type(exc).__name__ == 'ContractViolation' else 'provider request failed'}", model=model_name)
+
+
 __all__ = [
     "PROJECT_ROOT",
     "CredentialSetupGuide",
@@ -484,6 +546,7 @@ __all__ = [
     "load_scenario_environment",
     "load_runtime_credentials",
     "probe_llm_live",
+    "probe_advisory_live",
     "probe_tushare_live",
     "runtime_credential_store_path",
     "save_runtime_credentials",

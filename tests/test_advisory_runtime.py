@@ -55,7 +55,7 @@ def test_dynamic_tool_loop_independent_critic_and_persistent_reopen(tmp_path):
     p = policy()
     model = ScriptedModel(p, [ToolCall("1", "search_evidence", {"query": "original"}),
                               ToolCall("2", "request_review", {}),
-                              ToolCall("3", "submit_review", {"passed": True, "findings": ["Source inspected"]})])
+                              ToolCall("3", "submit_review", {"passed": True, "findings": ["Source inspected"], "blocking_findings": []})])
     path = str(tmp_path / "runtime.db")
     runtime = AgentRuntime(db_path=path, model=model, policy=p, tools=(tool(),))
     result = execute(runtime)
@@ -74,9 +74,9 @@ def test_dynamic_tool_loop_independent_critic_and_persistent_reopen(tmp_path):
 def test_critic_rejection_returns_to_research_and_replans(tmp_path):
     p = policy()
     model = ScriptedModel(p, [ToolCall("1", "search_evidence", {"query": "first"}), ToolCall("2", "request_review", {}),
-        ToolCall("3", "submit_review", {"passed": False, "findings": ["Need original filing"]}),
+        ToolCall("3", "submit_review", {"passed": False, "findings": ["Need original filing"], "blocking_findings": ["Need original filing"]}),
         ToolCall("4", "search_evidence", {"query": "filing"}), ToolCall("5", "request_review", {}),
-        ToolCall("6", "submit_review", {"passed": True, "findings": ["Filing verified"]})])
+        ToolCall("6", "submit_review", {"passed": True, "findings": ["Filing verified"], "blocking_findings": []})])
     runtime = AgentRuntime(db_path=str(tmp_path / "repair.db"), model=model, policy=p, tools=(tool(),))
     result = execute(runtime)
     assert result["status"] == "research_complete"
@@ -107,7 +107,7 @@ def test_provider_failure_resume_preserves_completed_tools_and_charges_attempt(t
     with pytest.raises(RuntimeError, match="provider down"):
         execute(runtime)
     runtime.close()
-    model = ScriptedModel(p, [ToolCall("2", "request_review", {}), ToolCall("3", "submit_review", {"passed": True, "findings": []})])
+    model = ScriptedModel(p, [ToolCall("2", "request_review", {}), ToolCall("3", "submit_review", {"passed": True, "findings": [], "blocking_findings": []})])
     runtime = AgentRuntime(db_path=path, model=model, policy=p, tools=(tool(handler),))
     assert execute(runtime)["status"] == "research_complete"
     assert len(calls) == 1
@@ -120,7 +120,7 @@ def test_missing_evidence_cannot_be_overridden_by_positive_critic(tmp_path):
     def missing(args, context):
         raise DataUnavailable("Original evidence missing")
     model = ScriptedModel(p, [ToolCall("1", "search_evidence", {"query": "missing"}), ToolCall("2", "request_review", {}),
-                              ToolCall("3", "submit_review", {"passed": True, "findings": []})])
+                              ToolCall("3", "submit_review", {"passed": True, "findings": [], "blocking_findings": []})])
     runtime = AgentRuntime(db_path=str(tmp_path / "missing.db"), model=model, policy=p, tools=(tool(missing),))
     result = execute(runtime)
     assert result["status"] == "budget_exhausted"
@@ -160,7 +160,7 @@ def test_crash_after_tool_result_commit_does_not_repeat_business_tool(tmp_path):
     with pytest.raises(RuntimeError, match="checkpoint"):
         execute(runtime)
     runtime.close()
-    model = ScriptedModel(p, [ToolCall("2", "request_review", {}), ToolCall("3", "submit_review", {"passed": True, "findings": []})])
+    model = ScriptedModel(p, [ToolCall("2", "request_review", {}), ToolCall("3", "submit_review", {"passed": True, "findings": [], "blocking_findings": []})])
     resumed = AgentRuntime(db_path=path, model=model, policy=p, tools=(tool(handler),))
     assert execute(resumed)["status"] == "research_complete"
     assert len(executed) == 1
@@ -176,7 +176,7 @@ def test_same_quality_tool_retry_repairs_error_without_fabricated_result(tmp_pat
         return {"evidence": ["verified original"]}
     model = ScriptedModel(p, [ToolCall("1", "search_evidence", {"query": "source"}),
         ToolCall("2", "search_evidence", {"query": "source"}), ToolCall("3", "request_review", {}),
-        ToolCall("4", "submit_review", {"passed": True, "findings": ["Recovered source checked"]})])
+        ToolCall("4", "submit_review", {"passed": True, "findings": ["Recovered source checked"], "blocking_findings": []})])
     runtime = AgentRuntime(db_path=str(tmp_path / "same-quality.db"), model=model, policy=p, tools=(tool(handler),))
     result = execute(runtime)
     assert result["status"] == "research_complete"

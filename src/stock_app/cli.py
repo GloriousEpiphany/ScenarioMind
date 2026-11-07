@@ -40,12 +40,46 @@ def cli():
     pass
 
 
+from src.stock_app.quantitative_commands import register_quantitative_commands
+register_quantitative_commands(cli)
+from src.stock_app.issuer_document_commands import register_issuer_document_commands
+register_issuer_document_commands(cli)
+
+
+@cli.command('validate-quantitative-release')
+@click.option('--db-path', required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option('--run-id', required=True)
+@click.option('--input-refs', type=click.Path(exists=True, dir_okay=False), default=None,
+              help='已采集的joint_panel/protocol/problem/execution_state工件ID JSON；缺失即记录阻断')
+@click.option('--output', type=click.Path(dir_okay=False), required=True)
+@click.option('--scope', type=click.Choice(['prediction_simulation', 'release']), default='prediction_simulation', show_default=True)
+def validate_quantitative_release_command(db_path, run_id, input_refs, output, scope):
+    """默认验证预测模拟；真实交易资格仅属于单独的 release 范围。不下单。"""
+    from pathlib import Path
+    from src.stock_app.quantitative_validation import validate_quantitative_release
+    from scenario_engine.errors import ScenarioEngineError
+    try:
+        refs = json.loads(Path(input_refs).read_text(encoding='utf-8')) if input_refs else {}
+        result = validate_quantitative_release(db_path, run_id, input_refs=refs, validation_scope=scope)
+        Path(output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+        console.print_json(json.dumps(result, ensure_ascii=False))
+        if not (result['publication_eligible'] or scope == 'prediction_simulation'
+                and result['status'] == 'validated_conditional_simulation_scope'):
+            raise click.exceptions.Exit(2)
+    except ScenarioEngineError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 @cli.command('scenario-doctor')
 @click.option('--live-llm', is_flag=True, help='实际发起一次结构化大模型请求；可能产生少量 API 用量')
 @click.option('--live-tushare', is_flag=True, help='实际调用 TuShare daily 并探测 A 股日行情权限')
-def scenario_doctor(live_llm, live_tushare):
+@click.option('--live-advisory', is_flag=True, help='实际验证两轮自治模型工具调用与续传；会产生 API 用量')
+def scenario_doctor(live_llm, live_tushare, live_advisory):
     """审计情景推演依赖、凭证和真实连通性，不输出任何密钥。"""
     capabilities = list(configured_runtime_capabilities())
+    if live_advisory:
+        from src.stock_app.scenario_runtime import probe_advisory_live
+        capabilities.append(probe_advisory_live())
     if live_llm:
         live = probe_llm_live()
         capabilities = [
@@ -81,6 +115,7 @@ def scenario_doctor(live_llm, live_tushare):
         if (
             (live_llm and item.capability_id == "scenario_llm" and not item.usable)
             or (live_tushare and item.capability_id == "tushare_pro" and not item.usable)
+            or (live_advisory and item.capability_id == "advisory_tools" and not item.usable)
         )
     }
     if requested_failures or any(item.status == "dependency_missing" for item in capabilities):
@@ -319,7 +354,7 @@ def advisory_research_command(run_id, objective, as_of, symbols, datasets, model
         repository = MarketArtifactRepository(connection)
         query_tool = make_pit_query_tool(repository, allowed_datasets=scope, allowed_symbols=symbols)
         with OpenAI(base_url=api_base, api_key=api_key, timeout=60, max_retries=0) as client:
-            runtime = AgentRuntime(db_path=config.DATABASE_PATH, model=ToolCallingModel(client, policy), policy=policy, tools=(query_tool,))
+            runtime = AgentRuntime(db_path=config.DATABASE_PATH, model=ToolCallingModel.for_endpoint(client, policy, api_base), policy=policy, tools=(query_tool,))
             result = runtime.execute(run_id=run_id, objective=objective, as_of=cutoff,
                                      context={"symbols": list(symbols), "datasets": list(datasets), "model_endpoint_hash": fingerprint(api_base)})
             console.print_json(data=result)
@@ -332,6 +367,122 @@ def advisory_research_command(run_id, objective, as_of, symbols, datasets, model
             runtime.close()
         if connection is not None:
             connection.close()
+
+
+@cli.command('portfolio-analysis')
+@click.option('--db-path', type=click.Path(dir_okay=False), default=None)
+@click.option('--account-id', type=int, default=None, help='只有多个有持仓账户时才必须指定')
+@click.option('--run-id', default=None, help='指定已有任务 ID 以恢复；参数取自冻结请求')
+@click.option('--objective', default=None)
+@click.option('--price-source', type=click.Choice(['eastmoney_http', 'baostock', 'tushare', 'tencent_http']), default=None)
+@click.option('--output', type=click.Path(dir_okay=False), default=None)
+@click.option('--max-model-calls', type=click.IntRange(min=24), default=None, help='新任务的全队模型调用上限，默认144，含失败尝试')
+@click.option('--max-tool-calls', type=click.IntRange(min=1), default=None, help='新任务的全队工具调用上限，默认112')
+def portfolio_analysis_command(db_path, account_id, run_id, objective, price_source, output, max_model_calls, max_tool_calls):
+    """真实持仓自动采集、专业 Agent 研究、逐仓影响及条件建议/对冲；会使用模型 API。"""
+    from pathlib import Path
+    import sqlite3
+    from src.stock_app.portfolio_research import DEFAULT_OBJECTIVE
+    from src.stock_app.portfolio_research_jobs import build_request, enqueue, execute_job, load_job
+    from src.stock_app.v3_portfolio import CurrentPortfolioSnapshotModule, automatically_selected_account_id
+    from scenario_engine.errors import ScenarioEngineError
+    path = db_path or config.DATABASE_PATH
+    try:
+        if run_id is None:
+            with sqlite3.connect(path) as connection:
+                accounts = CurrentPortfolioSnapshotModule(connection).discover_accounts()
+            account_id = account_id if account_id is not None else automatically_selected_account_id(accounts)
+            if account_id is None:
+                raise click.ClickException('请通过 --account-id 明确选择有持仓账户')
+            request = build_request(path, account_id, objective=objective or DEFAULT_OBJECTIVE, price_source=price_source,
+                max_model_calls=max_model_calls if max_model_calls is not None else 144,
+                max_tool_calls=max_tool_calls if max_tool_calls is not None else 112)
+            run_id = enqueue(path, request)
+        elif any(value is not None for value in (account_id, objective, price_source, max_model_calls, max_tool_calls)):
+            raise click.ClickException('恢复任务只需 --run-id；不能覆盖冻结参数')
+        console.print(f'持仓研究任务：{run_id}')
+        result = execute_job(path, run_id)
+        if output:
+            Path(output).write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
+        console.print_json(data={key: result.get(key) for key in ('run_id', 'status', 'as_of', 'publication_eligible', 'publication_blockers', 'failed_stage')})
+        if result['status'] != 'conditional_research_complete':
+            raise click.ClickException('持仓研究尚未完成；失败原因与检查点已保存')
+    except ScenarioEngineError as exc:
+        job = load_job(path, run_id=run_id) if run_id else None
+        console.print_json(data=job['error'] if job and job['error'] else {'error_type': type(exc).__name__, 'error_code': exc.code})
+        raise click.ClickException('任务未完成；没有生成降级结果') from exc
+
+
+@cli.command('deductive-research')
+@click.option('--price-source', type=click.Choice(['eastmoney_http', 'baostock', 'tushare', 'tencent_http']),
+              default=None,
+              help='冻结唯一行情源；未指定时加载 STOCKM1_PRICE_SOURCE，缺省 eastmoney_http；失败不换源')
+@click.option('--db-path', type=click.Path(dir_okay=False), default=None, help='数据库路径；默认使用应用数据库')
+@click.option('--run-id', required=True, help='任务 ID；使用相同参数恢复，成功采集项不会重复下载')
+@click.option('--objective', required=True)
+@click.option('--symbol', 'symbols', multiple=True, required=True, help='研究证券代码，可重复')
+@click.option('--start-date', required=True, type=click.DateTime(formats=['%Y-%m-%d']))
+@click.option('--end-date', required=True, type=click.DateTime(formats=['%Y-%m-%d']))
+@click.option('--model-policy-version', required=True)
+@click.option('--model-evaluation-ref', required=True)
+@click.option('--max-model-calls', default=64, type=click.IntRange(min=2), show_default=True,
+              help='包含独立审查及中断尝试的模型调用总上限')
+@click.option('--max-tool-calls', default=48, type=click.IntRange(min=1), show_default=True)
+@click.option('--critic-reserved-calls', default=12, type=click.IntRange(min=1), show_default=True)
+def deductive_research_command(price_source, db_path, run_id, objective, symbols, start_date, end_date,
+                               model_policy_version, model_evaluation_ref, max_model_calls,
+                               max_tool_calls, critic_reserved_calls):
+    """自动采集六类证据、冻结时点并执行模型研究与独立反证；会产生 API 用量。"""
+    from scenario_engine.agents import AgentModelPolicy
+    from scenario_engine.agents.model import ToolCallingModel
+    from scenario_engine.agents.tools import fingerprint
+    from scenario_engine.errors import ScenarioEngineError
+    from src.stock_app.deductive_research import DeductiveResearchPipeline
+    from src.stock_app.scenario_data_prep import latest_likely_closed_trading_date
+    from src.stock_app.scenario_runtime import load_scenario_environment
+
+    pipeline = None
+    try:
+        from openai import OpenAI
+        from src.stock_app.public_https import configured_public_http_profile
+        load_scenario_environment()
+        if price_source is None:
+            from src.stock_app.scenario_data_prep import configured_equity_price_source
+            price_source = configured_equity_price_source()
+        if price_source not in {'eastmoney_http', 'baostock', 'tushare', 'tencent_http'}:
+            raise click.ClickException('STOCKM1_PRICE_SOURCE 必须明确指定受支持的行情源')
+        settings = [str(os.getenv(name) or '').strip() for name in (
+            'SCENARIO_LLM_MODEL', 'SCENARIO_LLM_API_BASE', 'SCENARIO_LLM_API_KEY')]
+        if not all(settings):
+            raise click.ClickException('需要明确配置 SCENARIO_LLM_MODEL、SCENARIO_LLM_API_BASE、SCENARIO_LLM_API_KEY')
+        model_name, api_base, api_key = settings
+        if end_date.date() > latest_likely_closed_trading_date():
+            raise click.ClickException('--end-date 必须是已经收盘的日期')
+        source_policy = {'price': price_source, 'public': 'akshare_public',
+                         'news': 'eastmoney_curl_jsonp_v2', 'flow': 'eastmoney_daily_flow_v1',
+                         'financials': 'akshare-financial-abstract-v2',
+                         'flow_transport': configured_public_http_profile(),
+                         'price_transport': configured_public_http_profile() if price_source == 'eastmoney_http' else 'provider_sdk'}
+        policy = AgentModelPolicy(model_policy_version, model_name, model_evaluation_ref,
+                                  max_model_calls=max_model_calls, max_tool_calls=max_tool_calls,
+                                  critic_reserved_calls=critic_reserved_calls)
+        with OpenAI(base_url=api_base, api_key=api_key, timeout=90, max_retries=0) as client:
+            model = ToolCallingModel.for_endpoint(client, policy, api_base)
+            pipeline = DeductiveResearchPipeline(db_path or config.DATABASE_PATH, model=model, policy=policy)
+            result = pipeline.execute(run_id=run_id, objective=objective, symbols=symbols,
+                start_date=start_date.date(), end_date=end_date.date(), endpoint_hash=fingerprint(api_base),
+                source_policy=source_policy,
+                progress=lambda task, status: console.print(f'{task}: {status}'))
+            console.print_json(data=result)
+            if result['status'] != 'research_complete':
+                raise click.ClickException(f"全流程未完成：{result['status']}；已保存采集进度")
+    except ImportError as exc:
+        raise click.ClickException('缺少自治/数据依赖，请安装 requirements-advisory.txt 和 requirements-scenario-public.txt') from exc
+    except (ScenarioEngineError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        if pipeline is not None:
+            pipeline.close()
 
 
 @cli.command()

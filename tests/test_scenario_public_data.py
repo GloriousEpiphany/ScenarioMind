@@ -90,21 +90,17 @@ class FakeAkshare:
         )
 
     @staticmethod
-    def stock_fund_flow_individual(symbol):
-        assert symbol == "即时"
+    def stock_individual_fund_flow(stock, market):
+        assert stock == "002230" and market == "sz"
         return pd.DataFrame(
             [
                 {
-                    "序号": 1,
-                    "股票代码": 2230,
-                    "股票简称": "科大讯飞",
-                    "最新价": 41.72,
-                    "涨跌幅": "-0.14%",
-                    "换手率": "1.15%",
-                    "流入资金": "4.63亿",
-                    "流出资金": "5.76亿",
-                    "净额": "-1.13亿",
-                    "成交额": "10.45亿",
+                    "日期": "2026-08-14", "收盘价": 41.72, "涨跌幅": -0.14,
+                    "主力净流入-净额": -113_000_000, "主力净流入-净占比": -10.81,
+                    "超大单净流入-净额": -70_000_000, "超大单净流入-净占比": -6.70,
+                    "大单净流入-净额": -43_000_000, "大单净流入-净占比": -4.11,
+                    "中单净流入-净额": 50_000_000, "中单净流入-净占比": 4.78,
+                    "小单净流入-净额": 63_000_000, "小单净流入-净占比": 6.03,
                 }
             ]
         )
@@ -153,12 +149,21 @@ def test_public_ingestion_records_actual_fields_and_registers_fact_boundary(tmp_
     assert payload["total_liabilities"] == pytest.approx(50.0)
     assert payload["publication_time_status"] == "not_provided_by_endpoint"
     assert "publication_time_unavailable" in json.loads(financial[3])
+    # Report periods are separate facts, not versions that expire when the next
+    # period ends. Both remain visible after their actual collection time.
+    from scenario_engine.data import DataRequest, MarketArtifactRepository
+    repository = MarketArtifactRepository(connection)
+    financial_rows = repository.query(DataRequest("fundamental", "pit_financials", ("002230",),
+        datetime(2020, 1, 1, tzinfo=SHANGHAI), clock(), clock()))
+    assert len(financial_rows) == 2
+    assert all(row.valid_to is None and row.valid_from == clock() for row in financial_rows)
 
     flow_payload = json.loads(connection.execute(
         "SELECT payload_json FROM market_artifacts WHERE dataset = 'money_flow'"
     ).fetchone()[0])
-    assert flow_payload["net_inflow_cny"] == pytest.approx(-113_000_000)
-    assert flow_payload["turnover_rate"] == pytest.approx(0.0115)
+    assert flow_payload["main_net_inflow_cny"] == pytest.approx(-113_000_000)
+    assert flow_payload["main_net_inflow_share"] == pytest.approx(-0.1081)
+    assert "net_inflow_cny" not in flow_payload  # Main-order estimates are not all-order net inflow.
 
     event_counts = dict(connection.execute(
         "SELECT event_class, COUNT(*) FROM event_ledger GROUP BY event_class"

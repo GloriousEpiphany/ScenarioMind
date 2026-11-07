@@ -25,6 +25,16 @@ class ContractViolation(ScenarioEngineError):
     code = "contract_violation"
 
 
+class ToolArgumentRejected(ContractViolation):
+    """An in-scope read was rejected before execution; the agent may correct it.
+
+    This is not a data acquisition success or a missing-evidence substitution.
+    Unknown tools, extra authority fields and out-of-universe entities still fail.
+    """
+
+    code = "tool_arguments_rejected"
+
+
 class PointInTimeViolation(ScenarioEngineError):
     code = "point_in_time_violation"
 

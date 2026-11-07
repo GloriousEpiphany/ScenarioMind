@@ -16,6 +16,7 @@ from .point_in_time import PointInTimeMarketSnapshot
 from .router import RoutingPolicy, RoutingRule, StructuredDataRouter
 from .akshare_adapter import AKShareAdapter
 from .tushare_adapter import TuShareAdapter
+from .baostock_adapter import BaoStockAdapter
 from .daily_price import (
     AKSHARE_DAILY_PRICE,
     TENCENT_DAILY_PRICE,
@@ -26,6 +27,7 @@ from .daily_price import (
 
 __all__ = [
     "AvailabilityStatus",
+    "BaoStockAdapter",
     "AKSHARE_DAILY_PRICE",
     "AKShareAdapter",
     "CapabilityManifest",

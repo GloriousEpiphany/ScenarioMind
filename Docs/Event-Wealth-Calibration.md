@@ -1,0 +1,51 @@
+# 事件条件与现金分红财富回放
+
+本模块扩充量化校准工程，未解除真实数据或正式发布阻断。测试夹具不是市场验收证据。
+
+2026-10-30 后续：已新增独立的逐原点历史投影重建、原始来源绑定及模拟范围，见 [来源绑定与重建](Source-Binding-and-Reconstruction.md)。新投影保存今天生成时间和历史信息截止，不进入下文的原始预测档案入口。用户只要求预测模拟，真实交易资格已从该范围分离；概率与来源要求不变。
+
+## 验证模式与用户要求的边界
+
+用户要求真实数据、不掩盖失败，并允许在免费数据不足时保留真实阻断；用户**没有明确要求历史上已运行过内部模型并留下预测档案**。本模块选择的 `archived_origin_forecast_replay` 是较严格的原始预测审计范围，不能把它表述成所有有效历史回放的唯一方法，也不能把内部历史预测档案说成只差一个免费行情 API。
+
+需要区分以下能力：
+
+1. **原始预测档案/前瞻验证**：在真实当时冻结特征定义、事件投影、公司行动计划和协议，后续等待结果成熟；或验证已经存在的原始档案。这是当前函数支持的范围。新登记的协议不能倒填到过去。
+2. **可复现历史回放**：今天确定算法，在每个历史原点只读取当时可见的原始资料，重新训练并生成事件投影，再与成熟结果比较。它不要求内部模型当年真实运行过，但必须明确是事后重构研究，并严格处理训练/验证/最终留出分隔、算法及特征选择泄漏、历史文本与修订版本、模型本身是否含未来知识等问题。不能将生成时间改写成历史 `known_at`。
+
+原始档案回放函数只消费冻结投影。第二条的事件投影生成器、逐原点原始目录检查、独立开发/留出协议已在新模块实现；其与完整财富评分、消融及最终统计验收的集成仍是**工程缺口**。原始行情、事件及公司行动的可靠 PIT 资料是另一个**数据缺口**。两者分别报告，不降低或改名复用当前前瞻/档案门槛。
+
+`scenario_engine/quant/wealth_calibration.py` 的 `replay_event_wealth_calibration` 接受独立的 `JointWealthReplayPanel`、`WealthCalibrationPolicy` 和逐原点 `FrozenOriginProjection` 档案，不复用旧总收益指数证书来冒充更大范围的校准。
+
+每个原点先检查当时真实可见的历史行情、公司行动和事件特征，再拟合 `joint_event_ols_ar1_v1`。因子 AR(1) 和资产暴露回归同时估计事件影响；同步创新先扣除已解释的事件量，避免把同一事件同时记入残差和额外冲击。事件列共线、训练不足或 AR 不稳定即拒绝，不偷偷删除特征或换估计器。
+
+预测必须使用原点已冻结的未来事件特征轨迹及公司行动计划，并带原始采集时间和来源。没有档案就记录 `missing_original_event_and_action_forecast_archive`。不能将后来发生的新闻、实际分红或今天重新生成的模型输出写成当时的预测。一个原点/期限有两份冲突预测也会拒绝。
+
+预测调用现有 `FittedJointFactorModel.simulate_research` / `SynchronizedFactorPathModel`，使用相同日频原始价、拆股、股数和保留分红算法。独立标签根据真实原始价与公司行动逐日累计股数和现金，不通过复利总收益指数替代。例如 100 元除息派 10 元后价格为 90 元，再涨至 99 元，财富是 109 元，收益 9%；将分红再投资则是 10%。输入的一日总收益必须与原始价/每新股股利/拆股恒等式一致。
+
+各期限使用互不重叠成熟标签，报告终值 VaR/ES、联合 energy score、共同尾部、相关性和逐日最大回撤覆盖。相关性由各原点预测均值与二阶矩合成混合分布协方差，包含条件均值变化，避免简单平均条件相关系数产生错误拒绝。统计阈值和允许的消融损失在协议中事前固定。
+
+每折运行完整事件模型、全部事件剔除模型；多个特征时另运行逐特征剔除模型。相同随机种子/历史块位置用于配对比较，各拟合与模拟均保存内容哈希；时间块重抽样给出 full-minus-ablated energy 差值区间。不选择表现最好的折、不删除失败折。
+
+## 接入契约
+
+JSON 解析入口为 `wealth_panel_from_payload`、`wealth_policy_from_payload`、`origin_projection_from_payload`。建议分别使用新数据集 `joint_wealth_event_panel`、`joint_wealth_event_protocol`、`joint_origin_forecast_archive`，不要覆盖 `joint_total_return_panel`。
+
+数据仓库调用方必须逐个解析 `panel.availability_claims()` 和每个 `projection.availability_claims()` 的来源 ID，核对原始工件 `known_at` 不晚于声称的可见时间；协议内 `risk.registered_at` 必须等于不可变协议工件的真实登记时间。还须核对行情口径、交易日历、原始价/公司行动覆盖及事件特征定义在预测原点前可见。函数不具备访问数据库的权力，单独提供任意字符串 ID 不能代替这一步。
+
+有限范围全部统计门槛通过时，状态为 `validated_cash_wealth_event_scope`；缺档案为 `data_incomplete`，统计验收失败为 `rejected`。只有实际通过时才标记该事件投影和不再投资财富范围已校准。任何状态的 `publication_eligible` 都保持 false。
+
+## 仍然独立阻断的范围
+
+- 当前实现是单个已冻结事件投影的条件分布检验，不是所有未来新闻分支及其混合概率的校准。
+- 分红按除息时点作为经济财富计入，税前且不再投资；这不证明分红现金已到账、可用于交易或分红税已确定。
+- 消费一份公司行动预测档案并评价产生的财富，不等于独立认证公司行动预测过程。因此 `corporate_action_price_forecasts_validated`、`tradeable_cash_schedule_validated` 和 `event_branch_mixture_probabilities_validated` 仍为 false。
+- 不覆盖调仓后的真实独立 recourse、概率不确定集合、反向压力或生产求解器许可。
+- 当前无完整真实 PIT/原始预测档案，不能获得上述有限范围的真实通过证书。当前协议要求事前登记和足量非重叠成熟窗口；新登记不能倒填到历史以冒充前瞻验证。回溯探索研究如另行实现，必须采用独立范围和清楚标识。
+
+专项测试命令：
+
+```powershell
+$env:STOCKM1_SCENARIO_LLM_ENABLED='0'
+.tmp/advisory-venv/Scripts/python.exe -m pytest tests/test_event_wealth_calibration.py tests/test_joint_calibration.py tests/test_joint_path_model.py -q -p no:cacheprovider
+```

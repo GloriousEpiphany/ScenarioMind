@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
-import importlib
 import os
 import re
 from typing import Any
 
 from scenario_engine.errors import AdapterFailure
 
-from .contracts import AvailabilityStatus
+from .contracts import AvailabilityStatus, DataArtifactBatch, DataRequest
 from .daily_price import TUSHARE_DAILY_PRICE, normalize_daily_price_rows
 from .optional_adapter import OptionalStructuredDataAdapter
 
@@ -65,7 +65,9 @@ class TuShareAdapter(OptionalStructuredDataAdapter):
         clock=None,
     ) -> "TuShareAdapter":
         """Create the official TuShare Pro ``daily`` transport from ``TUSHARE_TOKEN``."""
-        module = tushare_module or importlib.import_module("tushare")
+        # Pin the documented provider endpoint. Do not inherit SDK-private URLs
+        # or forward account credentials to a redirect chosen by a dependency.
+        module = tushare_module or _OfficialTuShareHTTPModule()
         transport = _TuShareDailyPriceTransport(module)
         adapter = cls(
             price_row_fetcher=transport.fetch_rows,
@@ -75,7 +77,66 @@ class TuShareAdapter(OptionalStructuredDataAdapter):
         adapter.dependency_name = ""
         version = str(getattr(module, "__version__", "unknown"))
         adapter.adapter_version = f"stockm1-tushare/1.0.0+tushare.{version}"
+        adapter._price_transport = transport
+        adapter._acquisition_clock = clock or (lambda: datetime.now(timezone.utc))
         return adapter
+
+    def acquire_daily_prices(self, *, entities, start, end):
+        """Acquire now, stamping first visibility after the response arrives.
+
+        This is deliberately separate from fetching a frozen historical request.
+        A live download cannot become visible at its earlier request start time.
+        """
+        before = self._acquisition_clock()
+        request = DataRequest("price", "equity_price", tuple(entities), start, min(end, before), before,
+                              frequency="1d", adjustment="none", strict_pit=True)
+        rows = self._price_transport.fetch_rows(request)
+        received_at = self._acquisition_clock()
+        request = replace(request, known_at=received_at)
+        artifacts = normalize_daily_price_rows(request, rows, schema=TUSHARE_DAILY_PRICE,
+            adapter_version=self.adapter_version, ingested_at=received_at)
+        return DataArtifactBatch(request, self.source_id,
+            AvailabilityStatus.AVAILABLE if artifacts else AvailabilityStatus.NO_DATA, artifacts)
+
+
+class _OfficialTuShareHTTPModule:
+    __version__ = "official-https-json-v1"
+
+    @staticmethod
+    def pro_api(token):
+        return _OfficialTuShareHTTPClient(token)
+
+
+class _OfficialTuShareHTTPClient:
+    endpoint = "https://api.tushare.pro"
+
+    def __init__(self, token, *, post=None):
+        import requests
+        self.token = token
+        self.post = post or requests.post
+
+    def daily(self, *, fields, **parameters):
+        import pandas as pd
+        response = self.post(self.endpoint, json={"api_name": "daily", "token": self.token,
+            "params": parameters, "fields": fields}, timeout=(10, 30), allow_redirects=False)
+        if 300 <= response.status_code < 400:
+            raise AdapterFailure("TuShare credential redirect is not permitted")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or type(payload.get("code")) is not int:
+            raise AdapterFailure("TuShare HTTP response lacks a numeric status code")
+        if payload["code"] != 0:
+            # Classified and redacted before any public result is recorded.
+            raise RuntimeError(str(payload.get("msg") or "TuShare provider rejected daily request"))
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("fields"), list) or not isinstance(data.get("items"), list):
+            raise AdapterFailure("TuShare HTTP response lacks its declared table")
+        columns, rows = data["fields"], data["items"]
+        if (not columns or any(not isinstance(name, str) for name in columns)
+                or len(set(columns)) != len(columns)
+                or any(not isinstance(row, list) or len(row) != len(columns) for row in rows)):
+            raise AdapterFailure("TuShare HTTP table shape changed")
+        return pd.DataFrame(rows, columns=columns)
 
 
 class _TuShareDailyPriceTransport:
@@ -179,6 +240,9 @@ def _require_price_fields(rows: tuple[dict[str, Any], ...]) -> None:
 
 def _tushare_failure(exc: Exception) -> tuple[AvailabilityStatus, str]:
     error_type = type(exc).__name__
+    names = {item.__name__ for item in type(exc).mro()}
+    if names.intersection({"TimeoutError", "ConnectionError", "Timeout", "OSError"}):
+        return AvailabilityStatus.NETWORK_UNAVAILABLE, f"TuShare service unavailable ({error_type})"
     text = str(exc).casefold()
     if "token" in text and any(word in text for word in ("无效", "invalid", "错误", "不正确")):
         return AvailabilityStatus.AUTH_FAILED, f"TuShare authentication failed ({error_type})"
@@ -188,7 +252,4 @@ def _tushare_failure(exc: Exception) -> tuple[AvailabilityStatus, str]:
         return AvailabilityStatus.PERMISSION_DENIED, f"TuShare daily permission denied ({error_type})"
     if any(word in text for word in ("每分钟", "频率", "rate limit", "too many requests")):
         return AvailabilityStatus.QUOTA_LIMITED, f"TuShare request frequency limited ({error_type})"
-    names = {item.__name__ for item in type(exc).mro()}
-    if names.intersection({"TimeoutError", "ConnectionError", "OSError"}):
-        return AvailabilityStatus.NETWORK_UNAVAILABLE, f"TuShare service unavailable ({error_type})"
     return AvailabilityStatus.INVALID_RESPONSE, f"TuShare daily request failed ({error_type})"

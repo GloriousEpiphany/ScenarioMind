@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 import json
 import sqlite3
@@ -339,7 +339,7 @@ def test_market_artifact_hash_and_same_time_revision_conflicts_fail_closed():
 
 def test_cross_source_artifacts_require_explicit_reconciliation():
     connection = sqlite3.connect(":memory:")
-    repository = MarketArtifactRepository(connection)
+    repository = MarketArtifactRepository(connection, clock=lambda: ts(20))
     left = artifact(
         "vendor-price", "price", "equity_price", "000001", ts(19), ts(19),
         {"close": 10.0}, adjustment="none", source_id="vendor_a",
@@ -366,6 +366,17 @@ def test_cross_source_artifacts_require_explicit_reconciliation():
         resolved_artifact_id=right.artifact_id,
     )
     assert [item.artifact_id for item in repository.query(request)] == [right.artifact_id]
+    earlier = replace(request, end=ts(19), known_at=ts(19))
+    with pytest.raises(DataConflict):
+        repository.query(earlier)
+    assert repository.reconciliations_for((right.artifact_id,), earlier.known_at) == ()
+    repository.clock = lambda: ts(21)
+    repository.record_reconciliation(reconciliation_id='a-new-conflict',dataset='equity_price',
+        left_artifact_id=left.artifact_id,right_artifact_id=right.artifact_id,
+        comparison_rule_version='price-tolerance-v1',difference={'verification':'withdrawn'},
+        status='conflicted',resolved_artifact_id=None)
+    assert repository.reconciliations_for((right.artifact_id,),ts(20)) == ('reconcile-price',)
+    assert repository.reconciliations_for((right.artifact_id,),ts(21)) == ()
 
 
 def test_portfolio_resolver_uses_only_reconciled_point_in_time_artifact():

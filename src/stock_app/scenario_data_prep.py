@@ -87,8 +87,10 @@ class AutomaticPreparationResult:
 class _CachedPublicDataModule:
     """Cache the expensive all-market money-flow snapshot within one auto run."""
 
-    def __init__(self, module=None) -> None:
+    def __init__(self, module=None, *, industry_profile=None) -> None:
+        from src.stock_app.public_transport import industry_source_profile
         self._module = module
+        self.industry_profile = industry_source_profile(industry_profile)
         self._money_flow_frames: dict[str, object] = {}
 
     def __getattr__(self, name: str):
@@ -96,8 +98,8 @@ class _CachedPublicDataModule:
 
     def _load(self):
         if self._module is None:
-            import akshare
-            self._module = akshare
+            from src.stock_app.public_transport import AuditedPublicDataModule
+            self._module = AuditedPublicDataModule(industry_profile=self.industry_profile)
         return self._module
 
     def stock_fund_flow_individual(self, *, symbol: str):
@@ -129,6 +131,7 @@ def prepare_v3_equity_prices(
     end_date: date,
     downloader: DataDownloader | None = None,
     progress: Callable[[int, int, str], None] | None = None,
+    source_id: str | None = None,
 ) -> PricePreparationResult:
     """Select a configured source once; provider failures never change sources."""
     load_scenario_environment()
@@ -139,7 +142,18 @@ def prepare_v3_equity_prices(
         raise ValueError("行情开始日不能晚于结束日。")
     if end_date > latest_likely_closed_trading_date():
         raise ValueError("行情结束日必须是已经收盘的日期。")
-    if downloader is None and _tushare_price_configured():
+    selected = source_id or ("tencent_http" if downloader is not None else configured_equity_price_source())
+    if selected not in {"eastmoney_http", "baostock", "tushare", "tencent_http"}:
+        raise ValueError("unsupported explicit equity price source")
+    if selected == "eastmoney_http":
+        from src.stock_app.eastmoney_prices import prepare_eastmoney_prices
+        return prepare_eastmoney_prices(db_path, requested, start_date=start_date, end_date=end_date)
+    if selected == "baostock":
+        from src.stock_app.price_worker import prepare_baostock_prices
+        return prepare_baostock_prices(db_path, requested, start_date=start_date, end_date=end_date)
+    if selected == "tushare":
+        if not _tushare_price_configured():
+            raise RuntimeError("TuShare 未配置；不会自动切换行情来源")
         return _prepare_tushare_equity_prices(
             db_path,
             requested,
@@ -147,8 +161,7 @@ def prepare_v3_equity_prices(
             end_date=end_date,
             progress=progress,
         )
-    else:
-        fallback_note = "TuShare 未配置，使用无需 token 的腾讯历史日线"
+    fallback_note = "显式选择腾讯历史日线"
     if str(os.getenv("STOCKM1_TENCENT_ENABLED") or "1").strip().casefold() not in {
         "1", "true", "yes", "on"
     }:
@@ -193,6 +206,11 @@ def prepare_v3_equity_prices(
     )
 
 
+def configured_equity_price_source():
+    """Deployment choice, never a reaction to another provider's failure."""
+    return str(os.getenv("STOCKM1_PRICE_SOURCE") or "eastmoney_http").strip().casefold()
+
+
 def _tushare_price_configured() -> bool:
     enabled = str(os.getenv("STOCKM1_TUSHARE_ENABLED") or "1").strip().casefold()
     if (enabled in {"1", "true", "yes", "on"}
@@ -213,9 +231,9 @@ def _prepare_tushare_equity_prices(
     start_date: date,
     end_date: date,
     progress: Callable[[int, int, str], None] | None,
+    adapter=None,
 ) -> PricePreparationResult:
-    visibility_time = datetime.now(timezone.utc)
-    adapter = TuShareAdapter.from_environment(clock=lambda: visibility_time)
+    adapter = adapter or TuShareAdapter.from_environment(clock=lambda: datetime.now(timezone.utc))
     manifest = next(
         item for item in adapter.capabilities()
         if (item.domain, item.dataset) == ("price", "equity_price")
@@ -234,19 +252,11 @@ def _prepare_tushare_equity_prices(
             if progress is not None:
                 progress(index - 1, total, symbol)
             try:
-                request = DataRequest(
-                    domain="price",
-                    dataset="equity_price",
+                batch = adapter.acquire_daily_prices(
                     entities=(symbol,),
                     start=datetime.combine(start_date, time.min, tzinfo=SHANGHAI),
-                    end=min(datetime.combine(end_date, time.max, tzinfo=SHANGHAI), visibility_time),
-                    known_at=visibility_time,
-                    fields=("open", "high", "low", "close", "volume", "amount"),
-                    frequency="1d",
-                    adjustment="none",
-                    strict_pit=True,
+                    end=datetime.combine(end_date, time.max, tzinfo=SHANGHAI),
                 )
-                batch = adapter.fetch(request)
                 if batch.status != AvailabilityStatus.AVAILABLE:
                     raise RuntimeError(f"{batch.status.value}: {batch.detail}")
                 repository.ingest_many(batch.artifacts)

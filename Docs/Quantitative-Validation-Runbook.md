@@ -1,0 +1,75 @@
+# 联合风险、多期决策与交易资格验证
+
+2026-10-30 后续更新：按用户最新要求，默认范围已改为预测、模拟、情景推演，不要求真实交易资格，不下单。验证器为 `quantitative-prerequisites-v5-scoped-simulation`；CLI新增 `--scope prediction_simulation`（默认）与独立 `release`。公司行动/无行动与总收益已新增限定范围的真实来源绑定，363个真实收益标签通过；事件资料缺330日，真实财富校准/历史重建仍blocked。详见 [最新来源与重建契约](Source-Binding-and-Reconstruction.md)。以下v4段落保留为同日较早历史记录，不能据此推定当前仍无总收益来源实现，也不能把旧交易发布要求强加给预测模拟。
+
+2026-10-30 更新：验证器现为 `quantitative-prerequisites-v4`，最新检查点见 [10月30日恢复记录](Session-Checkpoint-20261030.md)。修复混合输入引用误传recourse导致报告不落账的问题，全部阶段失败仍记录；recourse增加证券/日期/字段语义校验。旧总收益基线入口也须有数值来源绑定，不能只检查来源ID和known_at；当前无已实现的总收益及完整公司行动来源验证器，故在拟合前明确阻断。账户资格仅通过JSON结构、数量及来源存在性检查也不能标为facts_validated：实际可卖/权限/账户佣金的来源绑定尚未实现，同样明确阻断。纯计算工程入口仍保留。独立副本上的725条真实冻结证据重开不增调用，CLI正确返回2，正式发布仍未通过。
+
+2026-10-29 后续更新：最新采集已完整、工程全量384项通过，但正式发布仍阻断。详见 [最新恢复记录](Session-Checkpoint-20261029-Acquisition.md)。新增事件财富回放及来源绑定见 [事件财富契约](Event-Wealth-Calibration.md)，独立成熟路径与压力输入见 [recourse工件契约](Recourse-Artifact-Contract.md)，公共费用见 [官方费用核验](Public-Trading-Fees-20261029.md)。下文保留首轮工程范围；不能据旧范围忽略后续修复或未完成项。
+
+当前验证器版本 `quantitative-prerequisites-v5-scoped-simulation`。除旧基线输入外，支持 wealth_panel / wealth_protocol / origin_projections，以及旧release范围的 recourse_policy / recourse_protocol / recourse_paths / stress_paths 工件ID。所有来源与数值须真实绑定；完整目录下仍只接受已实现的行动语义，不能手写通过证明。最终发布签发尚未完成，也不是本轮预测模拟的验收目标。
+
+本轮新增的是可执行的验证与优化工程，**尚未完成三个正式发布阻断的市场验收**。不将测试样本、总收益因子回放、同树求解或当前网页内容，替代完整联合财富路径校准与真实可交易性。
+
+## 当前可运行组件
+
+`scenario_engine/quant/joint_calibration.py`：调用原生产因子拟合函数，逐时点只使用当时可见的训练行；各期限使用不重叠的成熟标签，禁止混用不同期限损失。计算组合 VaR 覆盖与精确二项区间、超限独立性、ES identification score 的时间块置信区间、联合 energy score、相关性与共同尾部误差。协议和阈值版本化，缺历史可见时间、样本不足、标签未成熟均明确阻断。
+
+**范围限制**：当前这一新增回放是每日总收益再投资指数的因子基线，不是已完成的新闻/事件条件联合模型，也不是现金分红不再投资的生产财富路径校准。结果明确标记这些 scope=false；不能拿其证书激活多期发布。下一步要用同一财富路径/公司行动算法完成回放、事件特征与消融、概率不确定集合校准，不能只改变状态字符串。
+
+`portfolio_policy/multi_period.py`：显式 Gurobi 日频情景树；同信息历史共享决策，交易发生在观察后。现金、整数股数、整手买入、零股整体卖出、T+1、冻结股份、已知整数拆股/现金分红、最低佣金、税费、滑点、逐路径累计换手、现金/集中度/行业/ES/路径回撤等进入约束。概率不确定集合必须显式提供顶点与来源，不能默认等权；防守方案不能恶化最差终值。未来节点必须逐交易期覆盖，终端 ES 不混期限。
+
+只接受声明容差内的最优解；Gurobi 缺失/许可失败/超时均停止，不替换 HiGHS。`INF_OR_UNBD` 在相同模型、同一总时间预算内关闭 DualReductions 诊断，再分别报告无解或无界；无解保存 IIS，不自动放宽硬约束。
+
+**范围限制**：尚缺未参与优化的真实成熟路径上 recourse 复测、反向压力状态搜索、概率不确定集合实证校准、券商按分结算和分红税/到账时点等。非整数拆股/现金代股合同尚不支持时直接拒绝。不能把一项同树整数最优解称为完整可发布调仓计划。
+
+`portfolio_policy/proposal_validator.py`：独立重算每节点股数、现金、最低佣金/税费、累计换手、持仓/行业限制、非预见性、ES与财富回撤，并核对优化器输出。不是用“solver_status=optimal”代替复算，结果仍要求独立的样本外及当前交易资格检查。
+
+`portfolio_policy/execution_constraints.py`：规则生效期/来源、账户权限、持仓/可卖/冻结/未交收数量、停牌、价格界限、最小价位、流动性和账户特定费用都必须明确。过期、未知或不一致不能当作可交易。公开交易费率不等于某个账户的实际佣金；不能重复计入已经包含于佣金的规费。
+
+## 数据和CLI
+
+安装到隔离环境：
+
+```powershell
+.tmp/advisory-venv/Scripts/python.exe -m pip install --index-url https://pypi.org/simple -r requirements-quantitative.txt
+```
+
+官方 PyPI 默认附带受限许可证，用于研究/开发/评价；本机已验证为非生产许可证。不要购买或激活其他许可证，除非用户另外授权。参见 [Gurobi 官方许可说明](https://support.gurobi.com/hc/en-us/articles/29682074018833-What-does-Restricted-license-for-non-production-use-only-mean)。
+
+执行验证：
+
+```powershell
+.tmp/advisory-venv/Scripts/python.exe -m src.stock_app.cli validate-quantitative-release `
+  --db-path .tmp/quant-latest-1029.db --run-id quant-latest-20261029 `
+  --output .tmp/quant-latest-validation-1029.json
+```
+
+缺输入、未通过时返回非零并保存报告。此入口检查前置条件，尚不能签发最终发布资格。`--input-refs` 是开发/数据接入入口，指向已采集 MarketArtifact ID，不接受手写“通过”指标。键为 joint_panel/protocol/problem/execution_state，要求 `quant_validation` 域与以下 dataset：
+
+| 键 | 数据集 | 核验 |
+|---|---|---|
+| joint_panel | joint_total_return_panel | 每行真实 source refs、known_at、连续交易期、总收益口径和完整资产集合 |
+| protocol | joint_calibration_protocol | 注册时点必须与不可变工件 known_at 一致，不回填历史注册时间 |
+| problem | multiperiod_problem | 冻结账户/市场时点、校准证书、规则/费用/权限绑定一致 |
+| execution_state | account_execution_state | 当前账户快照、股数及可卖/冻结/未交收、费率、价格与权限有效期 |
+
+验证记录追加到 `quantitative_validation_runs`，绑定研究报告哈希和账户快照；前端不会把旧修订的检查投影到新报告。缺任何输入不清除原阻断。
+
+`PortfolioResearch.execute(..., prepare_only=True)` 是显式的新证据准备契约：只下载/冻结，不调用模型，不生成研究或发布成功。该目的进入不可变契约，不能恢复时换成完整研究冒充同一任务。准备失败的运行也能保存量化阻断。
+
+## 免费接口调查与实测（2026-10-29）
+
+| 来源 | 已核验能力与本次实测 | 边界 |
+|---|---|---|
+| 东方财富，AKShare 文档及命名字段原始接口 | 实际取得002230的18条历史分红送配记录 | 接收时间是真实当前时间；不是历史版本/PIT全量档案；缺实际现金支付/股份到账日、配股覆盖 |
+| 新浪分红 | 本次TLS错误 | 未关证书校验、未自动降级HTTP |
+| 巨潮分红 | 本次40秒有界进程超时 | 不把超时当作零分红或无公司行动 |
+| BaoStock | 官方文档提供原始行情、分红与复权因子接口 | 不因此推定提供所有历史修订版本；已有历史EOF故障记录，不声称本次成功 |
+| QLib PIT | 格式支持历史披露与修订链，采集器使用BaoStock | 官方采集说明含缺发布日期时45/90天偏移；项目不采用这种补日期方法，也不将存储格式当成完整数据源 |
+| TuShare | 官方公开权限表标明分红/财务等需积分权限 | 不把未验证权限当作免费可用，不更换凭据或充值 |
+
+东方财富原始命名字段已核对 SECURITY_CODE、per-10股方案和数值列；`corporate_actions.py` 只解析完整且已实施的方案。NaN不直接补0；仅完整方案语法可明确推出缺省的送/转/派组成，数值列若冲突立即拒绝。每条保存原文、原始字段、单位推导、真实 known_at。现金支付/股份到账日未知时，不能把除息日直接当作可花的现金到账日。
+
+来源：[AKShare分红数据说明](https://akshare.akfamily.xyz/data/stock/stock_issue.html)、[BaoStock复权说明](https://www.baostock.com/mainContent?file=localdatafactorInfo.md)、[QLib PIT设计](https://qlib.readthedocs.io/en/latest/advanced/PIT.html)、[QLib采集器原始说明](https://raw.githubusercontent.com/microsoft/qlib/main/scripts/data_collector/pit/README.md)、[TuShare官方权限](https://tushare.pro/document/1?doc_id=108)。
+
+交易与费用依据：[深交所主板申报数量](https://investor.szse.cn/knowledge/t20230308_599142.html)、[上交所2026交易规则](https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/exchange/c/c_20260424_10816482.shtml)、[财政部印花税公告](https://www.mof.gov.cn/jrttts/202308/t20230828_3904235.htm)、[券商费用公示示例](https://www.ctsec.com/agedNews/detail/9316859)。券商示例不是用户账户的费用确认，不自动写入其交易资格。

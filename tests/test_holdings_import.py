@@ -187,4 +187,4 @@ def test_scenario_page_exposes_frontend_import_when_no_account_exists(tmp_path):
     assert not app.exception
     assert app.radio(key="scenario_portfolio_source").value == "导入现有持仓"
     assert not app.button(key="scenario_import_holdings").disabled
-    assert app.button(key="FormSubmitter:scenario_mission_form-一键开始完整推演").disabled
+    assert any("保存持仓后将自动" in item.value for item in app.info)

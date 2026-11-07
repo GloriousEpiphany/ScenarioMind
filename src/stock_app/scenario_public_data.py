@@ -7,7 +7,7 @@ never inferred from report periods.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 from math import isfinite
@@ -27,7 +27,7 @@ from src.stock_app.scenario_runtime import load_scenario_environment
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 AKSHARE_SOURCE_ID = "akshare_public"
-AKSHARE_ADAPTER_VERSION = "stockm1-akshare-public/1.0.0"
+AKSHARE_ADAPTER_VERSION = "stockm1-akshare-public/1.3.0"
 AKSHARE_LICENSE = "akshare_public_web_research"
 AKSHARE_USAGE = "research_only_verify_upstream_terms"
 
@@ -71,12 +71,8 @@ class AkshareScenarioIngestor:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if ak_module is None:
-            try:
-                import akshare as ak_module
-            except ImportError as exc:
-                raise RuntimeError(
-                    "akshare 未安装；请使用 requirements-scenario-public.txt 安装已验证版本"
-                ) from exc
+            from src.stock_app.public_transport import AuditedPublicDataModule
+            ak_module = AuditedPublicDataModule()
         self.ak = ak_module
         self.connection = connection
         self.repository = MarketArtifactRepository(connection)
@@ -107,6 +103,8 @@ class AkshareScenarioIngestor:
             observed_at = _aware(self.clock(), "ingestion clock")
             try:
                 artifacts = task(normalized, observed_at)
+                observed_at = _aware(self.clock(), "response received clock")
+                artifacts = tuple(replace(item, known_at=observed_at, ingested_at=observed_at) for item in artifacts)
                 if not artifacts:
                     results.append(PreparationItemResult(
                         normalized, component, "no_data", 0, "上游响应中没有该证券的可用记录"
@@ -202,9 +200,8 @@ class AkshareScenarioIngestor:
             }
             complete_periods.append((period, payload))
         artifacts: list[MarketArtifact] = []
-        for index, (period, payload) in enumerate(complete_periods):
+        for period, payload in complete_periods:
             event_time = datetime.combine(period, time(23, 59, 59), tzinfo=SHANGHAI)
-            next_period = complete_periods[index + 1][0] if index + 1 < len(complete_periods) else None
             artifacts.append(_artifact(
                 domain="fundamental",
                 dataset="pit_financials",
@@ -212,19 +209,18 @@ class AkshareScenarioIngestor:
                 event_time=event_time,
                 known_at=observed_at,
                 payload=payload,
-                source_uri=f"akshare://stock_financial_abstract/{symbol}/{report_column}",
-                schema_version="akshare-financial-abstract-v1",
+                source_uri=f"akshare://stock_financial_abstract/{symbol}/{period.strftime('%Y%m%d')}",
+                schema_version="akshare-financial-abstract-v2",
                 quality_flags=(
                     "current_page_snapshot",
                     "publication_time_unavailable",
                     "assets_and_liabilities_formula_derived",
                 ),
                 period_end=event_time,
-                valid_from=event_time,
-                valid_to=(
-                    datetime.combine(next_period, time(23, 59, 59), tzinfo=SHANGHAI)
-                    if next_period is not None else None
-                ),
+                # A later report period does not expire an older report fact.
+                # Availability starts when this snapshot was actually observed;
+                # publication timestamps are not provided by this endpoint.
+                valid_from=observed_at,
             ))
         if not artifacts:
             raise ContractViolation("财务摘要未产生同时含收入、利润、现金流、权益和负债率的报告期")
@@ -284,6 +280,14 @@ class AkshareScenarioIngestor:
             "available_taxonomy_count": int(len(matching)),
             **profile_payload,
         }
+        # The new named-field reader records both original provider envelopes.
+        # Receipt remains current; historical effective dates are not known_at.
+        if changes.attrs.get("transport_profile") == "cninfo_named_fields_https_v1":
+            payload["source_observations"] = {
+                name: {key: frame.attrs[key] for key in
+                       ("source_uri", "received_at", "raw_payload", "raw_payload_sha256", "transport_profile")}
+                for name, frame in (("industry", changes), ("profile", profile))
+            }
         return (_artifact(
             domain="industry",
             dataset="industry_membership",
@@ -291,7 +295,7 @@ class AkshareScenarioIngestor:
             event_time=event_time,
             known_at=observed_at,
             payload=payload,
-            source_uri=f"akshare://stock_industry_change_cninfo/{symbol}/{changed_on.isoformat()}",
+            source_uri=changes.attrs.get("source_uri") or f"akshare://stock_industry_change_cninfo/{symbol}/{changed_on.isoformat()}",
             schema_version="cninfo-industry-membership-v1",
             quality_flags=(
                 "current_page_snapshot",
@@ -330,7 +334,7 @@ class AkshareScenarioIngestor:
                 "url": url,
                 "published_at": event_time.isoformat(),
                 "document_hash": hashlib.sha256(document_text.encode("utf-8")).hexdigest(),
-                "capture_scope": "metadata_and_snippet_returned_by_stock_news_em",
+                "capture_scope": frame.attrs.get("capture_scope", "metadata_and_snippet_returned_by_stock_news_em"),
             }
             artifacts.append(_artifact(
                 domain="event",
@@ -347,36 +351,47 @@ class AkshareScenarioIngestor:
         return tuple(artifacts)
 
     def _money_flow_artifacts(self, symbol: str, observed_at: datetime) -> tuple[MarketArtifact, ...]:
-        frame = self.ak.stock_fund_flow_individual(symbol="即时")
+        from scenario_engine.data.baostock_adapter import baostock_code
+        market = baostock_code(symbol).split(".")[0]
+        frame = self.ak.stock_individual_fund_flow(stock=symbol, market=market)
         if not isinstance(frame, pd.DataFrame) or frame.empty:
             return ()
-        required = {"股票代码", "股票简称", "最新价", "涨跌幅", "换手率", "流入资金", "流出资金", "净额", "成交额"}
+        groups = {"main": "主力", "super_large": "超大单", "large": "大单", "medium": "中单", "small": "小单"}
+        required = {"日期", "收盘价", "涨跌幅"} | {name + "净流入-" + suffix for name in groups.values() for suffix in ("净额", "净占比")}
         missing = required.difference(str(item) for item in frame.columns)
         if missing:
-            raise ContractViolation(f"同花顺资金流全表缺少列: {sorted(missing)}")
-        codes = frame["股票代码"].astype(str).str.replace(r"\.0+$", "", regex=True).str.zfill(6)
-        rows = frame[codes.eq(symbol)]
-        if rows.empty:
-            return ()
-        payloads = [_money_flow_payload(row) for _, row in rows.iterrows()]
-        unique_payloads = {canonical_payload_hash(payload): payload for payload in payloads}
-        if len(unique_payloads) != 1:
-            raise ContractViolation(
-                f"同花顺资金流返回 {len(rows)} 条 {symbol} 且标准化数值不一致，拒绝任选一条"
-            )
-        payload = next(iter(unique_payloads.values()))
-        payload["source_duplicate_count"] = len(rows)
-        return (_artifact(
-            domain="flow",
-            dataset="money_flow",
-            entity_id=symbol,
-            event_time=observed_at,
-            known_at=observed_at,
-            payload=payload,
-            source_uri="akshare://stock_fund_flow_individual/即时",
-            schema_version="ths-individual-money-flow-v1",
-            quality_flags=("current_page_snapshot", "intraday_snapshot"),
-        ),)
+            raise ContractViolation(f"东方财富单证券日资金流缺少列: {sorted(missing)}")
+        artifacts, dates = [], set()
+        for _, row in frame.iterrows():
+            day = date.fromisoformat(str(row["日期"]))
+            event_time = datetime.combine(day, time(15), tzinfo=SHANGHAI)
+            if day in dates or event_time > observed_at:
+                raise ContractViolation("fund flow contains duplicate or unfinished trading sessions")
+            dates.add(day)
+            payload = {"flow_method": "eastmoney_order_size_daily_estimates_v1", "flow_currency": "CNY",
+                       "capture_scope": "requested_equity_latest_100_daily_records",
+                       "transport_profile": frame.attrs.get("transport_profile", "injected_test_transport")}
+            for target, name in groups.items():
+                for suffix, field in (("net_inflow_cny", "净额"), ("net_inflow_share", "净占比")):
+                    value = _finite_or_none(row[name + "净流入-" + field])
+                    if value is None:
+                        raise ContractViolation("fund flow contains missing or nonfinite amounts/shares")
+                    payload[target + "_" + suffix] = value / 100 if field == "净占比" else value
+            for target, name in (("flow_close_price", "收盘价"), ("flow_price_change_percent", "涨跌幅")):
+                value = _finite_or_none(row[name])
+                if value is None:
+                    raise ContractViolation("fund flow lacks its price/date context")
+                payload[target] = value
+            if payload["flow_close_price"] <= 0:
+                raise ContractViolation("fund flow has an invalid close price")
+            if abs(payload["main_net_inflow_cny"] - payload["large_net_inflow_cny"] - payload["super_large_net_inflow_cny"]) > max(1, abs(payload["main_net_inflow_cny"]) * 1e-5):
+                raise ContractViolation("main flow does not reconcile with large and super-large orders")
+            artifacts.append(_artifact(domain="flow", dataset="money_flow", entity_id=symbol,
+                event_time=event_time, known_at=observed_at, payload=payload,
+                source_uri=f"https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?secid={1 if market == 'sh' else 0}.{symbol}&date={day.isoformat()}",
+                schema_version="eastmoney-daily-order-flow-v1",
+                quality_flags=("historical_record_first_seen_at_ingestion", "provider_estimated_order_flow")))
+        return tuple(artifacts)
 
     def _register_news_events(
         self,

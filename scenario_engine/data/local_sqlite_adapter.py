@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import sqlite3
 from typing import Iterable
 
 from scenario_engine.errors import ContractViolation, DataConflict
+from scenario_engine.sqlite_transactions import atomic_write, create_tables, read_snapshot
 
 from .contracts import (
     AvailabilityStatus,
@@ -26,15 +27,29 @@ def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def _utc_key(value: str | None) -> str | None:
+    """Exact UTC ordering, including microseconds, for mixed-offset records."""
+    if value is None:
+        return None
+    instant = datetime.fromisoformat(value)
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ContractViolation("stored PIT timestamp must include a timezone")
+    return instant.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
 class MarketArtifactRepository:
     """Deep SQLite module for immutable, replayable PIT artifacts."""
 
-    def __init__(self, connection):
+    def __init__(self, connection, *, clock=None):
         self.connection = connection
-        self._init_schema()
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.connection.create_function("pit_utc", 1, _utc_key, deterministic=True)
+        connection.execute("PRAGMA read_uncommitted=OFF")
+        with atomic_write(connection):
+            self._init_schema()
 
     def _init_schema(self) -> None:
-        self.connection.executescript(
+        create_tables(self.connection,
             """
             CREATE TABLE IF NOT EXISTS market_artifacts (
                 artifact_id TEXT PRIMARY KEY,
@@ -88,7 +103,6 @@ class MarketArtifactRepository:
             raise ContractViolation(
                 "existing V3 price artifacts lack frequency and require an explicit audited migration"
             )
-        self.connection.commit()
 
     _INSERT_SQL = """
         INSERT INTO market_artifacts (
@@ -117,21 +131,13 @@ class MarketArtifactRepository:
         if not unique:
             return
         try:
-            self.connection.execute("BEGIN IMMEDIATE")
-            self._insert_unique(unique)
-            self.connection.commit()
-        except DataConflict:
-            self.connection.rollback()
-            raise
+            with atomic_write(self.connection):
+                self._insert_unique(unique)
         except sqlite3.IntegrityError as exc:
-            self.connection.rollback()
             raise DataConflict(
                 "artifact batch violated immutable repository constraints",
                 context={"artifact_ids": sorted(unique)},
             ) from exc
-        except Exception:
-            self.connection.rollback()
-            raise
 
     def ingest_many_in_transaction(self, artifacts: Iterable[MarketArtifact]) -> None:
         """Persist an immutable batch inside a caller-owned transaction.
@@ -144,16 +150,7 @@ class MarketArtifactRepository:
             raise ContractViolation(
                 "ingest_many_in_transaction requires an active caller-owned transaction"
             )
-        unique = self._unique_artifacts(artifacts)
-        if not unique:
-            return
-        try:
-            self._insert_unique(unique)
-        except sqlite3.IntegrityError as exc:
-            raise DataConflict(
-                "artifact batch violated immutable repository constraints",
-                context={"artifact_ids": sorted(unique)},
-            ) from exc
+        self.ingest_many(artifacts)
 
     @staticmethod
     def _unique_artifacts(artifacts: Iterable[MarketArtifact]) -> dict[str, MarketArtifact]:
@@ -207,17 +204,21 @@ class MarketArtifactRepository:
         return artifact
 
     def query(self, request: DataRequest, *, source_id: str | None = None) -> tuple[MarketArtifact, ...]:
+        with read_snapshot(self.connection):
+            return self._query(request, source_id=source_id)
+
+    def _query(self, request, *, source_id):
         placeholders = ",".join("?" for _ in request.entities)
         clauses = [
             "domain = ?",
             "dataset = ?",
             f"entity_id IN ({placeholders})",
-            "event_time >= ?",
-            "event_time <= ?",
-            "known_at <= ?",
-            "(published_at IS NULL OR published_at <= ?)",
-            "(valid_from IS NULL OR valid_from <= ?)",
-            "(valid_to IS NULL OR valid_to > ?)",
+            "pit_utc(event_time) >= pit_utc(?)",
+            "pit_utc(event_time) <= pit_utc(?)",
+            "pit_utc(known_at) <= pit_utc(?)",
+            "(published_at IS NULL OR pit_utc(published_at) <= pit_utc(?))",
+            "(valid_from IS NULL OR pit_utc(valid_from) <= pit_utc(?))",
+            "(valid_to IS NULL OR pit_utc(valid_to) > pit_utc(?))",
         ]
         params: list[object] = [
             request.domain, request.dataset, *request.entities,
@@ -227,6 +228,9 @@ class MarketArtifactRepository:
         if source_id is not None:
             clauses.append("source_id = ?")
             params.append(source_id)
+        if request.strict_pit:
+            clauses.append("pit_utc(ingested_at) <= pit_utc(?)")
+            params.append(_iso(request.known_at))
         if request.adjustment is not None:
             clauses.append("adjustment = ?")
             params.append(request.adjustment)
@@ -234,22 +238,29 @@ class MarketArtifactRepository:
             clauses.append("frequency = ?")
             params.append(request.frequency)
         rows = self.connection.execute(
-            f"SELECT * FROM market_artifacts WHERE {' AND '.join(clauses)} ORDER BY event_time, known_at",
+            f"SELECT * FROM market_artifacts WHERE {' AND '.join(clauses)} ORDER BY pit_utc(event_time), pit_utc(known_at)",
             tuple(params),
         ).fetchall()
         artifacts = [self._from_row(row) for row in rows]
-        latest: dict[tuple[str, str, str, str | None], MarketArtifact] = {}
+        latest: dict[tuple[str, str, str, str | None, str | None], MarketArtifact] = {}
         for artifact in artifacts:
             artifact.assert_visible(request.known_at)
             identity = (
                 artifact.dataset,
                 artifact.entity_id,
-                artifact.event_time.isoformat(),
-                _iso(artifact.period_end),
+                _utc_key(artifact.event_time.isoformat()),
+                _utc_key(_iso(artifact.period_end)),
+                # Document publication timestamps are not unique observation
+                # keys. A stable article URI identifies its revisions; different
+                # articles (and their features) must survive the same timestamp.
+                artifact.source_uri if (artifact.domain, artifact.dataset) in {
+                    ("event", "observed_event_source"), ("sentiment", "event_text_features"),
+                    ("event", "cctv_news"),
+                } else None,
             )
             previous = latest.get(identity)
             if previous is not None and artifact.source_id != previous.source_id:
-                resolved_id = self._resolved_cross_source(previous, artifact)
+                resolved_id = self._resolved_cross_source(previous, artifact, request.known_at)
                 latest[identity] = previous if resolved_id == previous.artifact_id else artifact
                 continue
             if (
@@ -299,32 +310,50 @@ class MarketArtifactRepository:
             raise ContractViolation("resolved reconciliation must select one compared artifact")
         if status == "conflicted" and resolved_artifact_id is not None:
             raise ContractViolation("conflicted reconciliation cannot select an artifact")
-        self.connection.execute(
-            "INSERT INTO artifact_reconciliations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                reconciliation_id, dataset, left_artifact_id, right_artifact_id,
-                comparison_rule_version, json.dumps(difference, ensure_ascii=False, sort_keys=True),
-                status, resolved_artifact_id,
-            ),
-        )
-        self.connection.commit()
+        values = (reconciliation_id, dataset, left_artifact_id, right_artifact_id,
+                  comparison_rule_version, json.dumps(difference, ensure_ascii=False, sort_keys=True),
+                  status, resolved_artifact_id)
+        with atomic_write(self.connection):
+            captured = self.clock()
+            self.connection.execute("""CREATE TABLE IF NOT EXISTS artifact_reconciliation_receipts (
+                reconciliation_id TEXT PRIMARY KEY REFERENCES artifact_reconciliations(reconciliation_id),
+                captured_at TEXT NOT NULL)""")
+            for ref in (left_artifact_id, right_artifact_id):
+                if self.get_visible(ref, captured).ingested_at > captured:
+                    raise ContractViolation('reconciliation precedes ingestion of its sources')
+            inserted = self.connection.execute(
+                "INSERT INTO artifact_reconciliations VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(reconciliation_id) DO NOTHING", values)
+            if not inserted.rowcount:
+                saved = self.connection.execute("SELECT * FROM artifact_reconciliations WHERE reconciliation_id=?",
+                                                (reconciliation_id,)).fetchone()
+                if tuple(saved) != values:
+                    raise DataConflict('immutable reconciliation ID was reused for different evidence')
+            self.connection.execute(
+                "INSERT INTO artifact_reconciliation_receipts VALUES (?, ?) ON CONFLICT(reconciliation_id) DO NOTHING",
+                (reconciliation_id, captured.isoformat()))
 
-    def _resolved_cross_source(self, left: MarketArtifact, right: MarketArtifact) -> str:
-        row = self.connection.execute(
+    def _resolved_cross_source(self, left: MarketArtifact, right: MarketArtifact, as_of: datetime) -> str:
+        if not self._has_reconciliation_receipts():
+            raise DataConflict("cross-source artifacts require an explicit resolved reconciliation with capture time")
+        rows = self.connection.execute(
             """
-            SELECT status, resolved_artifact_id FROM artifact_reconciliations
-            WHERE (left_artifact_id = ? AND right_artifact_id = ?)
-               OR (left_artifact_id = ? AND right_artifact_id = ?)
-            ORDER BY reconciliation_id DESC LIMIT 1
+            SELECT status, resolved_artifact_id, pit_utc(captured_at) FROM artifact_reconciliations
+            JOIN artifact_reconciliation_receipts USING(reconciliation_id)
+            WHERE ((left_artifact_id = ? AND right_artifact_id = ?)
+               OR (left_artifact_id = ? AND right_artifact_id = ?))
+               AND pit_utc(captured_at) <= pit_utc(?)
+            ORDER BY pit_utc(captured_at) DESC
             """,
-            (left.artifact_id, right.artifact_id, right.artifact_id, left.artifact_id),
-        ).fetchone()
-        if row is None or row[0] != "resolved" or row[1] not in {left.artifact_id, right.artifact_id}:
+            (left.artifact_id, right.artifact_id, right.artifact_id, left.artifact_id, as_of.isoformat()),
+        ).fetchall()
+        if (not rows or rows[0][0] != "resolved" or rows[0][1] not in {left.artifact_id, right.artifact_id}
+                or any(tuple(r[:2]) != tuple(rows[0][:2]) for r in rows if r[2]==rows[0][2])):
             raise DataConflict(
                 "cross-source artifacts require an explicit resolved reconciliation",
                 context={"left": left.artifact_id, "right": right.artifact_id},
             )
-        return str(row[1])
+        return str(rows[0][1])
 
     def datasets(self, source_id: str | None = None) -> tuple[tuple[str, str], ...]:
         if source_id is None:
@@ -338,19 +367,35 @@ class MarketArtifactRepository:
             ).fetchall()
         return tuple((str(row[0]), str(row[1])) for row in rows)
 
-    def reconciliations_for(self, artifact_ids: tuple[str, ...]) -> tuple[str, ...]:
-        if not artifact_ids:
+    def reconciliations_for(self, artifact_ids: tuple[str, ...], as_of=None) -> tuple[str, ...]:
+        if not artifact_ids or not self._has_reconciliation_receipts():
             return ()
         placeholders = ",".join("?" for _ in artifact_ids)
         rows = self.connection.execute(
             f"""
-            SELECT reconciliation_id FROM artifact_reconciliations
-            WHERE status = 'resolved' AND resolved_artifact_id IN ({placeholders})
-            ORDER BY reconciliation_id
+            SELECT reconciliation_id,left_artifact_id,right_artifact_id,status,resolved_artifact_id,pit_utc(captured_at)
+            FROM artifact_reconciliations
+            JOIN artifact_reconciliation_receipts USING(reconciliation_id)
+            WHERE (left_artifact_id IN ({placeholders}) OR right_artifact_id IN ({placeholders}))
+              AND pit_utc(captured_at) <= pit_utc(?)
+            ORDER BY pit_utc(captured_at) DESC,reconciliation_id
             """,
-            artifact_ids,
+            (*artifact_ids,*artifact_ids, (as_of or self.clock()).isoformat()),
         ).fetchall()
-        return tuple(str(row[0]) for row in rows)
+        newest = {}
+        for row in rows:
+            pair = tuple(sorted(row[1:3]))
+            current = newest.setdefault(pair, [])
+            if not current or row[5] == current[0][5]:
+                current.append(row)
+        ids = set(artifact_ids)
+        return tuple(sorted(row[0] for group in newest.values()
+                            if len({tuple(r[3:5]) for r in group}) == 1
+                            for row in group if row[3]=='resolved' and row[4] in ids))
+
+    def _has_reconciliation_receipts(self):
+        return self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='artifact_reconciliation_receipts'").fetchone() is not None
 
     @staticmethod
     def _from_row(row) -> MarketArtifact:
@@ -397,6 +442,10 @@ class LocalSQLiteAdapter:
         )
 
     def fetch(self, request: DataRequest) -> DataArtifactBatch:
+        with read_snapshot(self.repository.connection):
+            return self._fetch(request)
+
+    def _fetch(self, request):
         artifacts = self.repository.query(request)
         if not artifacts:
             return DataArtifactBatch(
@@ -411,6 +460,6 @@ class LocalSQLiteAdapter:
             status=AvailabilityStatus.AVAILABLE,
             artifacts=artifacts,
             reconciliation_ids=self.repository.reconciliations_for(
-                tuple(item.artifact_id for item in artifacts)
+                tuple(item.artifact_id for item in artifacts), request.known_at
             ),
         )

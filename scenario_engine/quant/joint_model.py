@@ -102,6 +102,26 @@ class JointSimulation:
     algorithm_version: str = "synchronized_factor_blocks_v1"
 
 
+def synchronized_rows(n, steps, sample_count, block_length, seed):
+    if not 1 <= block_length <= n:
+        raise InsufficientModelData('joint innovations lack a complete sampling block')
+    generator = np.random.Generator(np.random.PCG64(seed))
+    blocks = (steps + block_length - 1) // block_length
+    starts = generator.integers(0, n - block_length + 1, size=(sample_count, blocks))
+    return (starts[:, :, None] + np.arange(block_length)[None, None, :]).reshape(sample_count, -1)[:, :steps]
+
+
+def joint_return_steps(panel, indices, initial_factors, transition, factor_intercepts, exposures,
+                       asset_intercepts, factor_shocks, asset_shocks):
+    """Use the same observed innovation row across all factors and assets at each step."""
+    factor_noise = np.asarray(panel.factor_innovations)[indices]
+    residual_noise = np.asarray(panel.asset_residuals)[indices]
+    factor_state = np.broadcast_to(initial_factors, (len(indices), len(initial_factors))).copy()
+    for step in range(indices.shape[1]):
+        factor_state = factor_state @ transition.T + factor_intercepts + factor_noise[:, step] + factor_shocks[step]
+        yield factor_state @ exposures.T + asset_intercepts + residual_noise[:, step] + asset_shocks[step]
+
+
 class SynchronizedFactorPathModel:
     def simulate_research(self, panel: JointInnovationPanel, request: JointPathRequest) -> JointSimulation:
         """Simulate one conditional event path, with cash dividends not reinvested.
@@ -159,13 +179,9 @@ class SynchronizedFactorPathModel:
                                 "algorithm": "synchronized_factor_blocks_v1", "numpy_version": np.__version__},
                                sort_keys=True, default=lambda value: value.isoformat(), allow_nan=False)
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        generator = np.random.Generator(np.random.PCG64(request.random_seed))
-        blocks = (steps + request.block_length - 1) // request.block_length
-        starts = generator.integers(0, n - request.block_length + 1, size=(request.sample_count, blocks))
-        indices = (starts[:, :, None] + np.arange(request.block_length)[None, None, :]).reshape(request.sample_count, -1)[:, :steps]
-        factor_noise = np.asarray(panel.factor_innovations)[indices]
-        residual_noise = np.asarray(panel.asset_residuals)[indices]
-        factor_state = np.broadcast_to(initial_factors, (request.sample_count, factors)).copy()
+        indices = synchronized_rows(n, steps, request.sample_count, request.block_length, request.random_seed)
+        increments = joint_return_steps(panel, indices, initial_factors, transition, factor_intercepts,
+                                       exposures, asset_intercepts, factor_shocks, asset_shocks)
         price_state = np.broadcast_to(prices, (request.sample_count, assets)).copy()
         share_multiplier = np.ones((request.sample_count, assets))
         cash = np.zeros((request.sample_count, assets))
@@ -173,9 +189,7 @@ class SynchronizedFactorPathModel:
         total_returns = np.empty_like(price_paths)
         with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
             try:
-                for step in range(steps):
-                    factor_state = factor_state @ transition.T + factor_intercepts + factor_noise[:, step] + factor_shocks[step]
-                    log_total_return = factor_state @ exposures.T + asset_intercepts + residual_noise[:, step] + asset_shocks[step]
+                for step, log_total_return in enumerate(increments):
                     price_state = price_state * np.exp(log_total_return) / splits[step] - dividends[step]
                     if np.any(price_state <= 0) or not np.isfinite(price_state).all():
                         raise ContractViolation("simulated raw prices are inconsistent with the supplied corporate actions")

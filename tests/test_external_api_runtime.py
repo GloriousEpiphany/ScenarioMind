@@ -250,6 +250,9 @@ def test_runtime_credentials_are_protected_and_reloaded_without_env_file(tmp_pat
 
 
 def test_tushare_credentials_auto_enable_without_a_separate_feature_flag(monkeypatch):
+    # This unit case has no feature flag. A developer's explicit disable in
+    # .env must not be imported back after monkeypatch removes the process flag.
+    monkeypatch.setattr(scenario_runtime, "load_scenario_environment", lambda: ())
     monkeypatch.setenv("TUSHARE_TOKEN", "fixture-token")
     monkeypatch.delenv("STOCKM1_TUSHARE_ENABLED", raising=False)
     monkeypatch.setattr(scenario_runtime, "find_spec", lambda _name: object())
@@ -263,6 +266,7 @@ def test_tushare_credentials_auto_enable_without_a_separate_feature_flag(monkeyp
 
 
 def test_price_preparation_prefers_configured_tushare_daily(tmp_path, monkeypatch):
+    monkeypatch.setenv("STOCKM1_PRICE_SOURCE", "tushare")
     class AfterClose(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -300,6 +304,7 @@ def test_price_preparation_prefers_configured_tushare_daily(tmp_path, monkeypatc
 def test_price_preparation_stops_when_tushare_daily_is_denied(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setenv("STOCKM1_PRICE_SOURCE", "tushare")
     monkeypatch.setenv("TUSHARE_TOKEN", "fixture-token")
     monkeypatch.setenv("STOCKM1_TUSHARE_ENABLED", "1")
     monkeypatch.setattr(scenario_data_prep, "find_spec", lambda _name: object())

@@ -50,7 +50,8 @@ class ApprovedTool:
 
     def __post_init__(self):
         allowed = {"search_evidence", "fetch_document", "query_pit_data", "build_universe",
-                   "estimate_exposure", "simulate_paths", "optimize_portfolio", "validate_proposal", "register_monitor"}
+                   "estimate_exposure", "simulate_paths", "optimize_portfolio", "validate_proposal", "register_monitor",
+                   "propose_hypotheses", "record_assessment"}
         if self.name not in allowed or not self.version or not self.description:
             raise ContractViolation("only explicitly approved, versioned research tools may be registered")
         if self.critic_allowed and not self.read_only:

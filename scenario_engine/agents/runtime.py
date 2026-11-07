@@ -12,7 +12,7 @@ import threading
 from typing import TypedDict
 
 from scenario_engine.data.contracts import require_aware
-from scenario_engine.errors import ContractViolation, DataUnavailable, RetryableFailure
+from scenario_engine.errors import ContractViolation, DataUnavailable, RetryableFailure, ToolArgumentRejected
 from .contracts import ToolCall
 from .research_board import ResearchBoard
 from .roles import RESEARCHER, CRITIC
@@ -42,7 +42,7 @@ def control_tool(name, description, properties):
 
 
 class AgentRuntime:
-    def __init__(self, *, db_path, model, policy, tools):
+    def __init__(self, *, db_path, model, policy, tools, role_prompts=None):
         try:
             from langgraph.graph import StateGraph, START, END
             from langgraph.checkpoint.sqlite import SqliteSaver
@@ -52,6 +52,10 @@ class AgentRuntime:
         if model.policy != policy:
             raise ContractViolation("runtime and model policies differ")
         self.model, self.policy = model, policy
+        self.role_prompts = dict(role_prompts or {"researcher": RESEARCHER, "critic": CRITIC})
+        if (set(self.role_prompts) != {"researcher", "critic"}
+                or not all(isinstance(v, str) and v.strip() for v in self.role_prompts.values())):
+            raise ContractViolation("both versioned researcher and critic prompts are required")
         self._tracing_context = tracing_context
         self.db_path = str(db_path)
         if self.db_path == ":memory:":
@@ -82,40 +86,61 @@ class AgentRuntime:
         self.checkpoint_connection.close()
         self.connection.close()
 
-    def execute(self, *, run_id, objective, as_of, context):
+    def execute(self, *, run_id, objective, as_of, context, review_from_run=None, shared_read_runs=()):
         if not self._execution_lock.acquire(blocking=False):
             raise ContractViolation("an AgentRuntime instance may execute only one run at a time")
         try:
             with self._tracing_context(enabled=False), advisory_lease(self.db_path, run_id) as lost:
                 self._lease_lost = lost
+                self._shared_read_runs = tuple(shared_read_runs)
                 try:
-                    return self._execute(run_id=run_id, objective=objective, as_of=as_of, context=context)
+                    return self._execute(run_id=run_id, objective=objective, as_of=as_of, context=context, review_from_run=review_from_run)
                 finally:
                     self._lease_lost = None
+                    self._shared_read_runs = ()
         finally:
             self._execution_lock.release()
 
-    def _execute(self, *, run_id, objective, as_of, context):
+    def _execute(self, *, run_id, objective, as_of, context, review_from_run=None):
         require_aware(as_of, "advisory.as_of")
         if not run_id or not objective.strip():
             raise ContractViolation("advisory run requires identifiers and an objective")
         contract = {"objective": objective, "as_of": as_of.isoformat(), "context": context,
                     "policy": asdict(self.policy), "runtime_version": "langgraph-research-v1",
+                    "transport": getattr(self.model, "transport_contract", {}),
+                    "role_prompts": self.role_prompts,
                     "tools": [{"descriptor": tool.descriptor(), "version": tool.version,
                                "critic_allowed": tool.critic_allowed} for tool in self.tools.values()]}
+        seed = None
+        if review_from_run is not None:
+            source = self.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?', (review_from_run,)).fetchone()
+            if review_from_run == run_id or source is None or json.loads(source[0]) != contract:
+                raise ContractViolation('reserved review requires an identical frozen source contract')
+            seed = self.board.load(review_from_run, 'research_result', contract)
+            if (not seed or seed['status'] != 'budget_exhausted' or seed['unresolved_errors'] or seed['critic_reviews']
+                    or not any(r.get('status') == 'completed' and r.get('tool') in {'record_assessment', 'propose_hypotheses'} for r in seed['tool_results'])):
+                raise ContractViolation('reserved review requires a validated proposal without unresolved data errors')
+            contract = {**contract, 'reserved_review_handoff': {'source_run': review_from_run, 'source_hash': fingerprint(seed)}}
         self.board.register_run(run_id, contract)
         config = {"configurable": {"thread_id": run_id}, "recursion_limit": 4 * (self.policy.max_model_calls + self.policy.max_tool_calls + 1)}
         snapshot = self.graph.get_state(config)
         if snapshot.values:
             state = self.graph.invoke(None, config) if snapshot.next else snapshot.values
         else:
-            state = self.graph.invoke({
+            initial = {
                 "run_id": run_id, "objective": objective, "as_of": as_of.isoformat(), "context": context,
                 "phase": "researcher", "step": 0, "pending": {}, "results": [], "errors": {}, "reviews": [],
                 "critic_messages": [], "status": "running",
-                "messages": [{"role": "system", "content": RESEARCHER},
+                "messages": [{"role": "system", "content": self.role_prompts["researcher"]},
                              {"role": "user", "content": canonical({"objective": objective, "as_of": as_of.isoformat(), "context": context})}],
-            }, config)
+            }
+            if seed is not None:
+                initial.update(results=seed['tool_results'], errors=seed['unresolved_errors'], reviews=seed['critic_reviews'])
+                initial['pending'] = asdict(ToolCall('reserved-review-handoff', 'request_review', {}))
+                initial['messages'].append({'role': 'assistant', 'content': None, 'tool_calls': [{
+                    'id': 'reserved-review-handoff', 'type': 'function', 'function': {'name': 'request_review', 'arguments': '{}'}}]})
+                initial.update(self._review(initial))
+            state = self.graph.invoke(initial, config)
         result = {"run_id": run_id, "status": state["status"], "publication_eligible": False,
                   "publication_blockers": ["independent_quantitative_publication_gate_required"],
                   "tool_results": state["results"], "critic_reviews": state["reviews"], "unresolved_errors": state["errors"]}
@@ -130,6 +155,8 @@ class AgentRuntime:
         else:
             descriptors.append(control_tool("submit_review", "Submit verifiable audit findings", {
                 "passed": {"type": "boolean"}, "findings": {"type": "array", "items": {"type": "string"}},
+                "blocking_findings": {"type": "array", "items": {"type": "string"},
+                    "description": "All unresolved factual overreach, missing material counterevidence or invalid evidence references; must be empty to pass."},
             }))
         return descriptors
 
@@ -154,6 +181,7 @@ class AgentRuntime:
             raise ContractViolation(f"model requested an unauthorized {phase} tool: {call.name}")
         assistant = {"role": "assistant", "content": None, "tool_calls": [{"id": call.call_id, "type": "function",
             "function": {"name": call.name, "arguments": canonical(dict(call.arguments))}}]}
+        assistant.update(call.assistant_state)
         return {"pending": saved, "step": state["step"] + 1, key: [*state[key], assistant]}
 
     @staticmethod
@@ -173,13 +201,20 @@ class AgentRuntime:
         result = self.board.load(state["run_id"], task_id, request)
         if result is None:
             result = self.board.load(state["run_id"], idempotency_key, request)
+        if result is None and tool.name == 'query_pit_data':
+            # Identical frozen reads are immutable pure results, shared by
+            # separately reviewed peers. A cache hit performs no new tool read.
+            result = next((row for row in state['results'] if row.get('status') == 'completed'
+                           and row.get('tool') == tool.name and row.get('input_hash') == input_hash), None)
+            if result is None:
+                result = self._shared_query_result(state, request)
         if result is None:
             if not self.board.reserve_attempt(state["run_id"], "tool", task_id, self.policy.max_tool_calls):
                 return {"status": "budget_exhausted"}
             context = ToolContext(state["run_id"], task_id, datetime.fromisoformat(state["as_of"]), self.policy.version, input_hash, idempotency_key)
             try:
                 result = tool.run(dict(call.arguments), context)
-            except (DataUnavailable, RetryableFailure) as exc:
+            except (DataUnavailable, RetryableFailure, ToolArgumentRejected) as exc:
                 # Visible, blocking errors let the model seek evidence. No fake
                 # values or weaker implementations enter the success envelope.
                 result = {"tool": tool.name, "tool_version": tool.version, "status": "failed",
@@ -187,12 +222,14 @@ class AgentRuntime:
                           "run_id": state["run_id"], "task_id": task_id,
                           "policy_version": self.policy.version, "as_of": state["as_of"],
                           "idempotency_key": idempotency_key}
+                if isinstance(exc, ToolArgumentRejected):
+                    result["input_rejected_before_read"] = True
             if result["status"] == "completed":
                 self._assert_lease()
                 self.board.save(state["run_id"], idempotency_key, request, result)
         self.board.save(state["run_id"], task_id, request, result)
         errors = dict(state["errors"])
-        if result["status"] == "failed":
+        if result["status"] == "failed" and not result.get("input_rejected_before_read"):
             errors[input_hash] = result
         else:
             errors.pop(input_hash, None)
@@ -200,24 +237,83 @@ class AgentRuntime:
         return {"results": [*state["results"], result], "errors": errors,
                 key: [*state[key], {"role": "tool", "tool_call_id": call.call_id, "content": canonical(result)}]}
 
+    def _shared_query_result(self, state, request):
+        for source_run in getattr(self, '_shared_read_runs', ()):
+            raw = self.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?', (source_run,)).fetchone()
+            if raw is None:
+                continue
+            contract = json.loads(raw[0])
+            if (contract['as_of'] != state['as_of']
+                    or contract['context'].get('evidence_manifest_hash') != state['context'].get('evidence_manifest_hash')
+                    or not state['context'].get('evidence_manifest_hash')
+                    or contract['context'].get('portfolio') != state['context'].get('portfolio')):
+                continue
+            current_tool = self.tools['query_pit_data']
+            descriptor = {'descriptor': current_tool.descriptor(), 'version': current_tool.version, 'critic_allowed': current_tool.critic_allowed}
+            if descriptor not in contract['tools']:
+                continue
+            peer = self.board.load(source_run, 'research_result', contract)
+            if (not peer or peer['status'] != 'research_complete' or not peer['critic_reviews']
+                    or not peer['critic_reviews'][-1]['accepted']):
+                continue
+            match = next((row for row in peer['tool_results'] if row.get('status') == 'completed'
+                          and row.get('tool') == 'query_pit_data' and row.get('input_hash') == fingerprint(request)), None)
+            if match is not None:
+                self.board.save(state['run_id'], 'shared-read:' + fingerprint(request), request,
+                    {'source_run': source_run, 'source_result_hash': fingerprint(peer), 'output_hash': fingerprint(match)})
+                return match
+        return None
+
     def _review(self, state):
         self._assert_lease()
         call = ToolCall(**state["pending"])
         if call.name == "request_review":
             if call.arguments:
                 raise ContractViolation("request_review accepts no model-authored conclusions")
+            proposals = [row for row in state["results"] if row.get("tool") == "propose_hypotheses"
+                         and row.get("status") == "completed"]
+            assessments = [row for row in state["results"] if row.get("tool") == "record_assessment"
+                           and row.get("status") == "completed"]
             return {"phase": "critic", "messages": [*state["messages"],
                     {"role": "tool", "tool_call_id": call.call_id, "content": "Independent evidence review requested."}],
-                    "critic_messages": [{"role": "system", "content": CRITIC}, {"role": "user", "content": canonical({
+                    "critic_messages": [{"role": "system", "content": self.role_prompts["critic"]}, {"role": "user", "content": canonical({
                         "objective": state["objective"], "as_of": state["as_of"], "context": state["context"],
-                        "tool_evidence": state["results"], "unresolved_errors": state["errors"],
+                        "tool_evidence": [row for row in state["results"] if row.get("tool") not in {"propose_hypotheses", "record_assessment"}],
+                        "candidate_hypotheses": proposals[-1] if proposals else None,
+                        **({"candidate_assessment": assessments[-1]} if assessments else {}),
+                        "unresolved_errors": state["errors"],
                     })}]}
         args = call.arguments
-        if (set(args) != {"passed", "findings"} or type(args["passed"]) is not bool
-                or not isinstance(args["findings"], list) or not all(isinstance(item, str) and item.strip() for item in args["findings"])):
+        if (set(args) != {"passed", "findings", "blocking_findings"} or type(args["passed"]) is not bool
+                or any(not isinstance(args[key], list)
+                       or not all(isinstance(item, str) and item.strip() for item in args[key])
+                       for key in ("findings", "blocking_findings"))):
             raise ContractViolation("critic must return a boolean decision and verifiable findings")
-        passed = args["passed"] and bool(state["results"]) and not state["errors"]
-        review = {"model_decision": args["passed"], "accepted": passed, "findings": args["findings"]}
+        required = state["context"].get("required_evidence", [])
+        covered = set()
+        for result in state["results"]:
+            if result.get("status") == "completed" and result.get("tool") == "query_pit_data":
+                for row in result["result"].get("artifacts", []):
+                    if all(key in row for key in ("domain", "dataset", "entity_id")):
+                        covered.add((row["domain"], row["dataset"], row["entity_id"]))
+        missing = [item for item in required if tuple(item) not in covered]
+        read_ids = {row["artifact_id"] for envelope in state["results"]
+                    if envelope.get("status") == "completed" and envelope.get("tool") == "query_pit_data"
+                    for row in envelope["result"].get("artifacts", [])}
+        missing_ids = sorted(set(state["context"].get("required_artifact_ids", [])).difference(read_ids))
+        completed_tools = {row["tool"] for row in state["results"] if row.get("status") == "completed"}
+        missing_tools = sorted(set(state["context"].get("required_tools", [])).difference(completed_tools))
+        passed = (args["passed"] and not args["blocking_findings"] and bool(completed_tools)
+                  and not state["errors"] and not missing and not missing_tools and not missing_ids)
+        review = {"model_decision": args["passed"], "accepted": passed, "findings": args["findings"],
+                  "missing_required_evidence": missing}
+        review["missing_required_tools"] = missing_tools
+        review["blocking_findings"] = args["blocking_findings"]
+        if state["context"].get("required_artifact_ids"):
+            review["unread_required_artifact_ids"] = missing_ids
+        proposals = [row for row in state["results"] if row.get("tool") == "propose_hypotheses"
+                     and row.get("status") == "completed"]
+        review["reviewed_hypotheses_input_hash"] = proposals[-1]["input_hash"] if proposals else None
         if passed:
             return {"status": "research_complete", "reviews": [*state["reviews"], review]}
         return {"phase": "researcher", "reviews": [*state["reviews"], review],

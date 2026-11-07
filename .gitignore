@@ -1,5 +1,9 @@
 # ==============================================================================
 # StockM1 / IGE
+# Ignore rules control Git discovery, not retention or cleanup. Research ledgers,
+# original disclosures, failed-run evidence and replay scripts in .tmp/ are local
+# records to preserve; do not treat every ignored path as disposable.
+# Already tracked files are unaffected by these rules.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -11,6 +15,7 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+.cache/
 
 # ------------------------------------------------------------------------------
 # Build and packaging artifacts
@@ -30,6 +35,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+pip-wheel-metadata/
 
 # ------------------------------------------------------------------------------
 # Virtual environments
@@ -41,6 +47,7 @@ ENV/
 env/
 env.bak/
 venv.bak/
+__pypackages__/
 
 # ------------------------------------------------------------------------------
 # Test, coverage, lint, type-checker caches
@@ -64,6 +71,9 @@ coverage.xml
 .pyre/
 .pytype/
 .ruff_cache/
+# Explicit pytest --basetemp directories created at the repository root.
+/pytest-*/
+/pytest-of-*/
 
 # ------------------------------------------------------------------------------
 # Jupyter / notebook checkpoints
@@ -77,6 +87,8 @@ coverage.xml
 .env.*
 !.env.example
 !.env.sample
+!.env.template
+!.env.*.example
 Agents_Experience/.env
 Agents_Experience/.env.*
 !Agents_Experience/.env.example
@@ -86,6 +98,8 @@ Agents_Experience/user_setting.ini
 
 # Streamlit secrets are local; config.toml is allowed.
 .streamlit/secrets.toml
+# Optional local override of the normally external encrypted credential store.
+runtime-credentials.json
 
 # ------------------------------------------------------------------------------
 # Project data stores and generated market data
@@ -94,6 +108,7 @@ data/*
 *.db
 *.db-*
 *.sqlite
+*.sqlite-*
 *.sqlite3
 *.sqlite3-*
 
@@ -105,6 +120,7 @@ data/*
 # ------------------------------------------------------------------------------
 Agents_Experience/logs/
 Agents_Experience/results/
+portfolio-research-logs/
 Agents_Experience/**/*.log
 Agents_Experience/**/*_portfolio_*.csv
 Agents_Experience/**/*_decision_*.log
@@ -163,6 +179,9 @@ Desktop.ini
 # ------------------------------------------------------------------------------
 # Optional local exports. Do not ignore all CSV files globally, because future
 # fixtures or small sample datasets may be intentionally committed.
+# Source PDFs, JSON contracts, fixtures and test modules are intentionally not
+# ignored globally. Put local CLI exports/downloads in the directories below
+# (or .tmp/) instead of hiding all files with those extensions.
 # ------------------------------------------------------------------------------
 exports/
 reports/

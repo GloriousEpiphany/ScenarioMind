@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import sqlite3
 from zoneinfo import ZoneInfo
 
@@ -196,17 +196,19 @@ def test_transactional_artifact_interface_requires_caller_owned_transaction():
     ).fetchone()[0] == 0
 
 
-def test_scenario_page_recognizes_account_and_publishes_current_snapshot(tmp_path):
+def test_scenario_page_automatically_queues_account_without_manual_snapshot(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
+    from visualization import portfolio_research_page as page
 
     db_path = str(tmp_path / "scenario-page.db")
     connection = _connection(db_path)
     _account(connection)
-    MarketArtifactRepository(connection).add(
-        _price_artifact("000001", 10.0, artifact_id="page-price-000001")
-    )
     connection.close()
 
+    launched = []
+    monkeypatch.setattr(page, "build_request", lambda *a, **k: {
+        "account_id": 1, "version": "ui-test", "objective": "test"})
+    monkeypatch.setattr(page, "start_worker", lambda path, run_id: launched.append(run_id))
     script = (
         "import config\n"
         f"config.DATABASE_PATH = {db_path!r}\n"
@@ -216,15 +218,45 @@ def test_scenario_page_recognizes_account_and_publishes_current_snapshot(tmp_pat
     app = AppTest.from_string(script, default_timeout=20).run()
     assert not app.exception
     assert any("已自动识别唯一账户" in item.value for item in app.success)
-    assert not app.button(key="publish_current_portfolio:1").disabled
-    assert app.button(key="FormSubmitter:scenario_mission_form-一键开始完整推演").disabled
-
-    app.button(key="publish_current_portfolio:1").click().run()
-    assert not app.exception
-    assert app.button(key="publish_current_portfolio:1").disabled
-    assert not app.button(key="FormSubmitter:scenario_mission_form-一键开始完整推演").disabled
+    assert len(launched) == 1
+    # A rerun neither repeats an API job nor requires publishing a snapshot by hand.
+    app.run()
+    assert not app.exception and len(launched) == 1
     connection = sqlite3.connect(db_path)
-    assert connection.execute(
-        "SELECT COUNT(*) FROM market_artifacts WHERE domain = 'portfolio' AND entity_id = 'current'"
-    ).fetchone()[0] == 1
+    assert connection.execute("SELECT COUNT(*) FROM portfolio_research_jobs").fetchone()[0] == 1
+    assert connection.execute("SELECT COUNT(*) FROM market_artifacts WHERE domain='portfolio'").fetchone()[0] == 0
+    connection.close()
+
+def test_explicit_frozen_price_plan_does_not_mix_old_sources_or_later_revisions():
+    from dataclasses import replace
+    from scenario_engine.errors import DataConflict
+    connection = _connection()
+    _account(connection)
+    repository = MarketArtifactRepository(connection)
+    old = _price_artifact('000001', 8.0, artifact_id='old-tencent')
+    selected_payload = {'close': 10.0}
+    selected = replace(old, artifact_id='selected-eastmoney', source_id='eastmoney_http',
+        known_at=old.known_at + timedelta(hours=1),
+        ingested_at=old.ingested_at + timedelta(hours=1),
+        payload=selected_payload, payload_hash=canonical_payload_hash(selected_payload))
+    later_payload = {'close': 99.0}
+    later = replace(selected, artifact_id='later-eastmoney', known_at=selected.known_at + timedelta(hours=1),
+        ingested_at=selected.ingested_at + timedelta(hours=1),
+        payload=later_payload, payload_hash=canonical_payload_hash(later_payload))
+    repository.ingest_many((old, selected, later))
+    with pytest.raises(DataConflict):
+        CurrentPortfolioSnapshotModule(connection, clock=lambda: CAPTURED_AT).preview(1)
+    module = CurrentPortfolioSnapshotModule(connection, clock=lambda: CAPTURED_AT,
+        price_source_id='eastmoney_http', price_artifact_ids=('selected-eastmoney',))
+    assert module.preview(1).positions[0].price == 10.0
+    published = module.publish(1, portfolio_ref='frozen-research')
+    item = repository.get_visible(published.artifact_id, CAPTURED_AT)
+    assert item.payload['positions'][0]['price_artifact_id'] == 'selected-eastmoney'
+    assert item.payload['valuation']['source_id'] == 'eastmoney_http'
+    assert item.payload['total_value'] == 30_000.0
+    bad = CurrentPortfolioSnapshotModule(connection, clock=lambda: CAPTURED_AT,
+        price_source_id='eastmoney_http', price_artifact_ids=('old-tencent',))
+    with pytest.raises(ContractViolation, match='source plan'):
+        bad.publish(1, portfolio_ref='bad-plan')
+    assert connection.execute("SELECT COUNT(*) FROM market_artifacts WHERE domain='portfolio'").fetchone()[0] == 1
     connection.close()

@@ -2,6 +2,10 @@
 -r requirements.txt
 openai==2.13.0
 akshare==1.17.95
+baostock==0.9.4
+curl_cffi==0.13.0
+# Full original disclosure PDF extraction, validated in advisory-venv on 2026-10-30.
+PyMuPDF==1.27.2.2
 
 # SDK 随情景数据依赖自动安装；token/积分仍必须由 TuShare 账户真实授权。
 tushare==1.4.29
