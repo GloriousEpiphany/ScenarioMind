@@ -21,12 +21,14 @@ from src.stock_app.eastmoney_prices import EastmoneyDailyReader, ENDPOINT as EAS
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 CONTEXT_VERSION = "cctv-edition-exchange-benchmarks-v1"
+SCOPED_CONTEXT_VERSION = "exchange-benchmarks-supplementary-news-v2"
 
 
 @dataclass(frozen=True)
 class ContextAcquisition:
     complete: bool
     artifact_ids: tuple[str, ...]
+    evidence_gaps: tuple[dict, ...] = ()
 
 
 def completed_cctv_edition(now):
@@ -133,10 +135,24 @@ class CCTVReader:
         return tuple(result)
 
 
-def acquire_market_context(db_path, *, edition, end_date, clock=None, cctv=None, benchmark=None):
+def acquire_market_context(db_path, *, edition, end_date, clock=None, cctv=None, benchmark=None, cctv_required=True):
     clock = clock or (lambda: datetime.now(timezone.utc))
     reader = benchmark or EastmoneyDailyReader()
-    rows = list((cctv or CCTVReader()).read(edition, clock=clock))
+    if type(cctv_required) is not bool:
+        raise ContractViolation('cctv_required must be boolean')
+    gaps = ()
+    try:
+        rows = list((cctv or CCTVReader()).read(edition, clock=clock))
+    except DataUnavailable as exc:
+        if cctv_required:
+            raise
+        rows = []
+        diagnostics = {key:value for key,value in exc.context.items()
+                       if key in {'source_uri','original_error_type'} and isinstance(value,str) and len(value)<=400}
+        gaps = ({'source_id':'cctv_official', 'edition':edition.isoformat(),
+                 'status':'unavailable', 'error_code':exc.code,
+                 'diagnostics':diagnostics,
+                 'impact':'No claims about this edition or policy events without other original evidence.'},)
     calendars = []
     for secid in ("1.000001", "0.399001"):
         try:
@@ -170,4 +186,4 @@ def acquire_market_context(db_path, *, edition, end_date, clock=None, cctv=None,
     # No partial edition/benchmark transaction can be accepted as success.
     with sqlite3.connect(db_path, timeout=30) as connection:
         MarketArtifactRepository(connection).ingest_many(rows)
-    return ContextAcquisition(True, tuple(row.artifact_id for row in rows))
+    return ContextAcquisition(True, tuple(row.artifact_id for row in rows), gaps)

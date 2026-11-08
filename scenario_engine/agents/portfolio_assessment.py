@@ -15,7 +15,7 @@ TEXTS = {"type": "array", "items": TEXT, "minItems": 1}
 def make_assessment_tool(repository, *, manifest, portfolio, hypotheses):
     sources = {row["artifact_id"]: row for row in manifest}
     symbols = {p["symbol"] for p in portfolio["positions"]}
-    paths = {p["hypothesis_id"] for p in hypotheses}
+    paths = {p["hypothesis_id"]: set(p["entities"]) for p in hypotheses}
     direction = {"type": "string", "enum": ["positive", "negative", "mixed", "uncertain"]}
     holding = _object({"symbol": {"type": "string", "enum": sorted(symbols)},
         "direction": direction, "mechanism": TEXT, "scenario_ids": TEXTS, "evidence_refs": TEXTS,
@@ -58,8 +58,18 @@ def make_assessment_tool(repository, *, manifest, portfolio, hypotheses):
         for row in args["holdings"]:
             if not set(row["scenario_ids"]).issubset(paths):
                 raise ContractViolation("assessment cites scenarios absent from the reviewed scenario graph")
-            if not any(sources[r]["entity_id"] == row["symbol"] for r in row["evidence_refs"]):
+            if any(row["symbol"] not in paths[ref] for ref in row["scenario_ids"]):
+                raise ContractViolation("holding cites a scenario for a different security")
+            if not any(sources[r]["entity_id"] == row["symbol"]
+                       and sources[r]["domain"] in {"event", "fundamental", "industry", "flow"}
+                       for r in row["evidence_refs"]):
                 raise ContractViolation("each holding needs security-specific original evidence")
+        for row in args["hedges"]:
+            for symbol in row["symbols"]:
+                if not any(sources[r]["entity_id"] == symbol
+                           and sources[r]["domain"] in {"event", "fundamental", "industry", "flow"}
+                           for r in row["evidence_refs"]):
+                    raise ContractViolation("each hedged security needs its own original mechanism evidence")
 
     def validate(args):
         try:
@@ -80,7 +90,7 @@ def make_assessment_tool(repository, *, manifest, portfolio, hypotheses):
         if result["publication_eligible"] or result["advice_kind"] != "conditional_research":
             raise ContractViolation("model cannot authorize executable investment advice")
 
-    return ApprovedTool("record_assessment", "portfolio-assessment-v2:" + fingerprint({
+    return ApprovedTool("record_assessment", "portfolio-assessment-v3:" + fingerprint({
         "manifest": manifest, "portfolio": portfolio, "hypotheses": hypotheses}),
         "Record complete evidence-linked, conditional portfolio research. Cover every holding, "
         "cite reviewed scenario IDs, compare no-trade and cash/reduction hedges. "

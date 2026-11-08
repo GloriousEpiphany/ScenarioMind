@@ -35,7 +35,16 @@ MANDATES = {
 }
 
 
-def role_prompts(role):
-    return {"researcher": RESEARCHER + ALGORITHM + "\nYour specialist mandate: " + MANDATES[role],
-        "critic": CRITIC + ALGORITHM + "\nAudit this mandate: " + MANDATES[role]
+def role_prompts(role, *, cctv_required=True):
+    mandate = MANDATES[role]
+    if not cctv_required:
+        if role == 'macro':
+            mandate = ('Study SH/SZ benchmarks, held companies financial and industry exposures, and available original macro evidence. '
+                       'CCTV is supplementary; no full-edition review is implied. Market returns alone do not prove '
+                       'policy events, investor beliefs or causal effects. Without news evidence, restrict factual '
+                       'claims to observed markets and label causal paths as conditional hypotheses.')
+        mandate += (' Report evidence_gaps and their effect on each conclusion. Do not claim unavailable news was '
+                    'reviewed or absence of coverage proves absence of an event.')
+    return {"researcher": RESEARCHER + ALGORITHM + "\nYour specialist mandate: " + mandate,
+        "critic": CRITIC + ALGORITHM + "\nAudit this mandate: " + mandate
             + "\nAudit candidate_assessment as untrusted proposed advice when supplied. Require all holdings, conditions and hedges to have matching original evidence. Peer reviews are not proof. Reject invented calibration, numerical projections, impossible causal attributions or unconditional trade advice."}

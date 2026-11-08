@@ -143,3 +143,35 @@ def test_benchmark_existing_contract_failure_is_not_reclassified(tmp_path):
         acquire_market_context(tmp_path / 'invalid.db', edition=EDITION, end_date=EDITION,
                                clock=lambda: NOW, cctv=reader(), benchmark=InvalidBenchmark())
     assert caught.value is error
+
+
+def test_supplementary_news_failure_preserves_benchmarks_and_explicit_gap(tmp_path):
+    path = tmp_path / 'scoped.db'
+    result = acquire_market_context(path, edition=EDITION, end_date=EDITION, clock=lambda: NOW,
+        cctv=reader(missing=True), benchmark=Benchmark(), cctv_required=False)
+    assert result.complete and len(result.artifact_ids) == 2
+    assert result.evidence_gaps[0]['source_id'] == 'cctv_official'
+    with sqlite3.connect(path) as c:
+        assert c.execute("SELECT DISTINCT dataset FROM market_artifacts").fetchall() == [('benchmark_context',)]
+    with pytest.raises(DataUnavailable, match='calendars disagree'):
+        acquire_market_context(tmp_path / 'invalid.db', edition=EDITION, end_date=EDITION, clock=lambda: NOW,
+            cctv=reader(missing=True), benchmark=Benchmark(mismatch=True), cctv_required=False)
+
+
+def test_optional_news_does_not_hide_corrupt_checkpoint_contract(tmp_path):
+    class InvalidNews:
+        def read(self, *a, **kw):
+            raise ContractViolation('checkpoint bytes altered')
+    with pytest.raises(ContractViolation, match='bytes altered'):
+        acquire_market_context(tmp_path / 'corrupt.db', edition=EDITION, end_date=EDITION, clock=lambda: NOW,
+            cctv=InvalidNews(), benchmark=Benchmark(), cctv_required=False)
+
+
+def test_optional_tls_gap_retains_safe_failure_location(tmp_path):
+    from requests.exceptions import SSLError
+    def fail(*a, **kw):
+        raise SSLError('fixture-secret')
+    result = acquire_market_context(tmp_path/'tls.db', edition=EDITION, end_date=EDITION, clock=lambda:NOW,
+        cctv=CCTVReader(get=fail), benchmark=Benchmark(), cctv_required=False)
+    assert result.evidence_gaps[0]['diagnostics'] == {'source_uri':INDEX, 'original_error_type':'SSLError'}
+    assert 'fixture-secret' not in str(result)

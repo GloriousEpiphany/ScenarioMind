@@ -1,7 +1,7 @@
 # Full Scenario Lab optional runtime.
 #
 # These dependencies are required only when enabling the full external V1/V2
-# roadmap surface from Docs/情景推演改进.md. The core local engine remains usable
+# roadmap surface from Docs/量化研究需求与金融逻辑.md. The core local engine remains usable
 # with requirements.txt.
 
 -r requirements.txt

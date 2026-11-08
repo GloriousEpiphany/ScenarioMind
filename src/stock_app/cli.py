@@ -44,6 +44,8 @@ from src.stock_app.quantitative_commands import register_quantitative_commands
 register_quantitative_commands(cli)
 from src.stock_app.issuer_document_commands import register_issuer_document_commands
 register_issuer_document_commands(cli)
+from src.stock_app.research_operations_commands import register_research_operations
+register_research_operations(cli)
 
 
 @cli.command('validate-quantitative-release')
@@ -374,11 +376,12 @@ def advisory_research_command(run_id, objective, as_of, symbols, datasets, model
 @click.option('--account-id', type=int, default=None, help='只有多个有持仓账户时才必须指定')
 @click.option('--run-id', default=None, help='指定已有任务 ID 以恢复；参数取自冻结请求')
 @click.option('--objective', default=None)
+@click.option('--require-cctv', is_flag=True, help='新任务必须完整分析新闻联播；普通研究只作附加来源')
 @click.option('--price-source', type=click.Choice(['eastmoney_http', 'baostock', 'tushare', 'tencent_http']), default=None)
 @click.option('--output', type=click.Path(dir_okay=False), default=None)
 @click.option('--max-model-calls', type=click.IntRange(min=24), default=None, help='新任务的全队模型调用上限，默认144，含失败尝试')
 @click.option('--max-tool-calls', type=click.IntRange(min=1), default=None, help='新任务的全队工具调用上限，默认112')
-def portfolio_analysis_command(db_path, account_id, run_id, objective, price_source, output, max_model_calls, max_tool_calls):
+def portfolio_analysis_command(db_path, account_id, run_id, objective, require_cctv, price_source, output, max_model_calls, max_tool_calls):
     """真实持仓自动采集、专业 Agent 研究、逐仓影响及条件建议/对冲；会使用模型 API。"""
     from pathlib import Path
     import sqlite3
@@ -394,7 +397,7 @@ def portfolio_analysis_command(db_path, account_id, run_id, objective, price_sou
             account_id = account_id if account_id is not None else automatically_selected_account_id(accounts)
             if account_id is None:
                 raise click.ClickException('请通过 --account-id 明确选择有持仓账户')
-            request = build_request(path, account_id, objective=objective or DEFAULT_OBJECTIVE, price_source=price_source,
+            request = build_request(path, account_id, objective=objective or DEFAULT_OBJECTIVE, price_source=price_source, cctv_required=require_cctv,
                 max_model_calls=max_model_calls if max_model_calls is not None else 144,
                 max_tool_calls=max_tool_calls if max_tool_calls is not None else 112)
             run_id = enqueue(path, request)

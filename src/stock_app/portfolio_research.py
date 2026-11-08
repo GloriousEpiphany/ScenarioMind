@@ -23,7 +23,7 @@ from src.stock_app.market_context import acquire_market_context, CONTEXT_VERSION
 from src.stock_app.v3_portfolio import CurrentPortfolioSnapshotModule
 
 DEFAULT_OBJECTIVE = "根据当前持仓与最新可得市场信息，综合评估情景传导、逐股影响、条件操作建议与对冲方案；明确证据、反证、缺口与发布闸门。"
-TEAM_VERSION = "portfolio-specialist-team-v1"
+TEAM_VERSION = "portfolio-specialist-team-v2-isolated-specialists"
 ROLES = ("macro", "company", "sentiment", "scenario", "portfolio")
 
 
@@ -40,6 +40,21 @@ def account_state(connection, account_id):
 
 
 class PortfolioResearch:
+    def _workflow_contract(self):
+        return {}
+
+    def _complete_output(self, output, root, contract):
+        return output
+
+    def _specialist_context(self, root, role):
+        return {}
+
+    def _additional_evidence(self, as_of, symbols):
+        return ()
+
+    def _prepare_numerical_inputs(self, run_id, root, contract, acquired, symbols):
+        return {}
+
     def __init__(self, db_path, *, model, policy, endpoint_hash, source_policy,
                  clock=None, pipeline_factory=DeductiveResearchPipeline, context_acquirer=acquire_market_context):
         self.db_path, self.model, self.policy = str(db_path), model, policy
@@ -69,13 +84,14 @@ class PortfolioResearch:
                 or type(start_date) is not date or type(end_date) is not date
                 or type(edition) is not date or start_date > end_date or type(prepare_only) is not bool):
             raise ContractViolation("portfolio research requires an account, objective and valid dates")
-        prompts = {role: role_prompts(role) for role in ROLES}
+        cctv_required = self.source_policy.get('cctv_required', True)
+        prompts = {role: role_prompts(role, cctv_required=cctv_required) for role in ROLES}
         contract = {"version": TEAM_VERSION, "algorithm": ALGORITHM_VERSION, "prompts": prompts,
             "account_id": account_id, "objective": objective, "preferences": preferences,
             "start_date": start_date.isoformat(), "end_date": end_date.isoformat(), "edition": edition.isoformat(),
             "model_policy": asdict(self.policy), "transport": getattr(self.model, "transport_contract", {}),
             "endpoint_hash": self.endpoint_hash, "source_policy": self.source_policy,
-            "context_version": CONTEXT_VERSION}
+            "context_version": self.source_policy.get('context_version', CONTEXT_VERSION), **self._workflow_contract()}
         if prepare_only:
             contract['purpose'] = 'quantitative-input-preparation-v1'
         root = "portfolio-team:" + run_id
@@ -116,6 +132,8 @@ class PortfolioResearch:
                 context = self.board.load(root, "market_context", contract)
                 if context is None:
                     context_options = {}
+                    if not cctv_required:
+                        context_options['cctv_required'] = False
                     if (self.context_acquirer is acquire_market_context
                             and self.source_policy.get('cctv_page_checkpoint')):
                         from src.stock_app.checkpointed_context import CheckpointedCCTVReader
@@ -132,7 +150,7 @@ class PortfolioResearch:
                         try:
                             result = self.context_acquirer(self.db_path, edition=edition, end_date=end_date, clock=self.clock, **context_options)
                             if not result.complete or not result.artifact_ids:
-                                raise DataUnavailable("complete CCTV and benchmark context required")
+                                raise DataUnavailable("required market context is incomplete")
                             break
                         except Exception as exc:
                             diagnostics = {key: value for key, value in (getattr(exc, 'context', {}) or {}).items()
@@ -158,6 +176,7 @@ class PortfolioResearch:
                     price_source_id=self.source_policy["price"],
                     price_artifact_ids=tuple(row["artifact_id"] for row in acquired["manifest"] if row["domain"] == "price"))
                 published = module.publish(account_id, portfolio_ref="research:" + run_id)
+                numerical_inputs = self._prepare_numerical_inputs(run_id, root, contract, acquired, symbols)
                 as_of = self.clock()
                 portfolio = self.repository.get_visible(published.artifact_id, as_of)
                 if account_state(self.connection, account_id) != capture:
@@ -176,11 +195,18 @@ class PortfolioResearch:
                     price = self.repository.get_visible(pos["price_artifact_id"], as_of)
                     if price.source_id != self.source_policy["price"] or price.event_time.date() != end_date:
                         raise DataUnavailable("portfolio valuation requires the requested source and latest closed session")
+                for item in self._additional_evidence(as_of, symbols):
+                    if item.artifact_id not in by_id:
+                        manifest.append({'artifact_id':item.artifact_id,'domain':item.domain,'dataset':item.dataset,
+                                         'entity_id':item.entity_id,'payload_hash':item.payload_hash})
+                        by_id[item.artifact_id] = manifest[-1]
                 manifest.sort(key=lambda row: (
                     self.repository.get_visible(row["artifact_id"], as_of).event_time,
                     self.repository.get_visible(row["artifact_id"], as_of).known_at), reverse=True)
                 frozen = {"as_of": as_of.isoformat(), "manifest": manifest, "portfolio": dict(portfolio.payload),
-                          "portfolio_artifact_id": published.artifact_id}
+                          "portfolio_artifact_id": published.artifact_id, **numerical_inputs}
+                if not cctv_required:
+                    frozen['evidence_gaps'] = list(context.get('evidence_gaps', []))
                 self.board.save(root, "team_inputs", contract, frozen)
             as_of = datetime.fromisoformat(frozen["as_of"])
             for row in frozen["manifest"]:
@@ -229,8 +255,11 @@ class PortfolioResearch:
                         "SELECT task_id,status,started_at,finished_at FROM acquisition_attempts WHERE run_id=? ORDER BY attempt_id",
                         ("deduction:" + run_id + ":acquire",))],
             }
+            if not cctv_required:
+                output['evidence_gaps'] = frozen.get('evidence_gaps', [])
             if lost.is_set():
                 raise ContractViolation("team executor lost its lease before report persistence")
+            output = self._complete_output(output, root, contract)
             self.board.save(root, "team_result", contract, output)
             self.event(run_id, "team", "conditional_research_complete")
             return output
@@ -275,9 +304,14 @@ class PortfolioResearch:
             "positions": [{key: p[key] for key in ("symbol", "quantity", "average_cost", "price", "weight", "price_event_time", "price_artifact_id")}
                           for p in portfolio["positions"]]}
         symbols = [p["symbol"] for p in portfolio["positions"]]
+        # Specialists work from originals, without anchoring on earlier opinions.
+        # Only synthesis and assessment consume the separately reviewed claims.
         candidates = {k: self._latest(v, "propose_hypotheses")["hypotheses"] for k, v in peers.items()
-                      if k != "portfolio"}
+                      if k != "portfolio"} if role in {"scenario", "portfolio"} else {}
+        extra_context = self._specialist_context(root, role)
         request = {"role": role, "frozen_hash": fingerprint(frozen), "peers": candidates}
+        if extra_context:
+            request['workflow_context'] = extra_context
         saved = self.board.load(root, "stage:" + role, request)
         if saved is not None:
             return saved
@@ -291,7 +325,8 @@ class PortfolioResearch:
         else:
             tools.append(make_hypothesis_tool(self.repository, manifest=public_manifest,
                 required_entities=symbols if role in {"company", "sentiment", "scenario"} else (),
-                require_child=role == "scenario"))
+                require_child=role == "scenario",
+                require_entity_sources=role in {"company", "sentiment", "scenario"}))
             required_tools = ["propose_hypotheses"]
         requirements = {
             "macro": [["event", "cctv_news", "MARKET"], ["market", "benchmark_context", "1.000001"], ["market", "benchmark_context", "0.399001"]],
@@ -301,6 +336,12 @@ class PortfolioResearch:
             "portfolio": [[d, s, symbol] for d, s in (REQUIRED_DATASETS[1], REQUIRED_DATASETS[3], REQUIRED_DATASETS[5]) for symbol in symbols],
         }
         required = requirements.get(role, [])
+        cctv_required = self.source_policy.get('cctv_required', True)
+        if role == 'macro' and not cctv_required:
+            required = [row for row in required if row[1] != 'cctv_news']
+            required += [[d, s, symbol] for d, s in REQUIRED_DATASETS[1:3] for symbol in symbols]
+        if not cctv_required:
+            extra_context = {**extra_context, 'evidence_gaps': frozen.get('evidence_gaps', [])}
         parent = self
 
         class BudgetedModel:
@@ -339,7 +380,7 @@ class PortfolioResearch:
                 return self.tool.run(args, context)
 
         runtime = AgentRuntime(db_path=self.db_path, model=BudgetedModel(), policy=self.policy,
-            tools=tuple(BudgetedTool(t) for t in tools), role_prompts=role_prompts(role))
+            tools=tuple(BudgetedTool(t) for t in tools), role_prompts=role_prompts(role, cctv_required=cctv_required))
         try:
             result = runtime.execute(run_id=root + ":" + role + (":reserved-review" if reserved_review else ""),
                 review_from_run=root + ":" + role if reserved_review else None, objective=contract["objective"],
@@ -348,10 +389,12 @@ class PortfolioResearch:
                     "symbols": symbols, "portfolio": model_portfolio, "preferences": preferences,
                     "model_endpoint_hash": self.endpoint_hash, "required_evidence": required,
                     "required_artifact_ids": [r["artifact_id"] for r in manifest
-                        if role == "macro" and r["dataset"] == "cctv_news"],
+                        if (role == "macro" and cctv_required and r["dataset"] == "cctv_news")
+                        or (role in {"company", "sentiment"}
+                            and [r['domain'], r['dataset'], r['entity_id']] in required)],
                     "required_tools": required_tools, "peer_candidates": candidates,
                     "algorithm": ALGORITHM_VERSION, "evidence_manifest_hash": fingerprint(manifest),
-                    "scope": "conditional_research_numeric_publication_is_separately_blocked"})
+                    "scope": "conditional_research_numeric_publication_is_separately_blocked", **extra_context})
         finally:
             runtime.close()
         if result["status"] == "research_complete":

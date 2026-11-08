@@ -113,6 +113,7 @@ def _revise_portfolio_report(db_path, run_id, *, findings, model, policy, contin
         families = [root] + [r[0] for r in connection.execute('SELECT revision_root FROM portfolio_report_revisions WHERE run_id=?', (run_id,))]
         model_used = sum(connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_model'", (f,)).fetchone()[0] for f in families)
         tools_used = connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE kind='tool' AND run_id IN (?,?,?,?,?)", tuple(root + ':' + role for role in ROLES)).fetchone()[0]
+        tools_used = max(tools_used, connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_tool'",(root,)).fetchone()[0])
         tools_used += sum(connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_tool'", (f,)).fetchone()[0] for f in families[1:])
         if continuation is not None:
             for previous_json, in connection.execute('SELECT contract_json FROM portfolio_report_revisions WHERE run_id=?', (run_id,)):
@@ -161,7 +162,13 @@ def _revise_portfolio_report(db_path, run_id, *, findings, model, policy, contin
                 def next_call(self, messages, descriptors):
                     return model.next_call(messages, descriptors)
 
-            engine = PortfolioResearch(db_path, model=RemainingBudgetModel(), policy=revision_policy,
+            class CorrectiveResearch(PortfolioResearch):
+                def _specialist_context(self, unused_root, role):
+                    if original_contract.get('controller_version') and role == 'portfolio':
+                        return {'quantitative_results': original.get('quantitative_tools', [])}
+                    return {}
+
+            engine = CorrectiveResearch(db_path, model=RemainingBudgetModel(), policy=revision_policy,
                 endpoint_hash=request['endpoint_hash'], source_policy=request['source_policy'])
             peers = {role: json.loads(connection.execute("SELECT payload_json FROM agent_artifacts WHERE run_id=? AND artifact_key=?", (root, 'stage:' + role)).fetchone()[0])
                      for role in ROLES if role != 'portfolio'}
@@ -217,6 +224,7 @@ def _revise_portfolio_report(db_path, run_id, *, findings, model, policy, contin
             all_families = [root] + [r[0] for r in connection.execute('SELECT revision_root FROM portfolio_report_revisions WHERE run_id=?', (run_id,))]
             total_models = sum(connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_model'", (f,)).fetchone()[0] for f in all_families)
             total_tools = connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE kind='tool' AND run_id IN (?,?,?,?,?)", tuple(root + ':' + role for role in ROLES)).fetchone()[0]
+            total_tools = max(total_tools, connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_tool'",(root,)).fetchone()[0])
             total_tools += sum(connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_tool'", (f,)).fetchone()[0] for f in all_families[1:])
             extra_model_budget, extra_tool_budget = 0, 0
             allocations = []

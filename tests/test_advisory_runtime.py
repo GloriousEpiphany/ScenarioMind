@@ -71,6 +71,20 @@ def test_dynamic_tool_loop_independent_critic_and_persistent_reopen(tmp_path):
     reopened.close()
 
 
+def test_malformed_parallel_calls_are_rejected_then_repaired_with_budget_counted(tmp_path):
+    p=policy()
+    model=ScriptedModel(p,[ContractViolation('multiple calls',context={'tool_call_count':2}),
+        ToolCall('1','search_evidence',{'query':'original'}),ToolCall('2','request_review',{}),
+        ToolCall('3','submit_review',{'passed':True,'findings':['Inspected'],'blocking_findings':[]})])
+    runtime=AgentRuntime(db_path=tmp_path/'repair.db',model=model,policy=p,tools=(tool(),),repair_protocol=True)
+    try:
+        result=execute(runtime)
+        assert result['status']=='research_complete' and len(result['tool_results'])==1
+        assert runtime.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE kind='model'").fetchone()[0]==4
+        assert runtime.connection.execute("SELECT COUNT(*) FROM agent_artifacts WHERE artifact_key LIKE 'protocol-rejection:%'").fetchone()[0]==1
+    finally:runtime.close()
+
+
 def test_critic_rejection_returns_to_research_and_replans(tmp_path):
     p = policy()
     model = ScriptedModel(p, [ToolCall("1", "search_evidence", {"query": "first"}), ToolCall("2", "request_review", {}),

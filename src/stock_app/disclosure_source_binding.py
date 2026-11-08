@@ -63,15 +63,27 @@ def read_publication_dates(repo, ref, symbol, cutoff):
     return _catalogue_metadata(repo, p, symbol, coverage.known_at)
 
 
-def read_disclosure_coverage(repo, ref, symbol, cutoff):
+def read_disclosure_coverage(repo, ref, symbol, cutoff, *, allow_financial_scope=False):
     if repo.get_visible(ref,cutoff).dataset == 'full_text_sequence':
         return _read_sequence(repo,ref,symbol,cutoff,'full_text')
-    coverage = _source(repo, ref, 'event_document_coverage', 'cninfo-disclosure-coverage-v1', symbol, cutoff)
+    scoped = repo.get_visible(ref,cutoff).dataset == 'financial_document_coverage'
+    if scoped and not allow_financial_scope:
+        raise ContractViolation('financial-only coverage cannot substitute for all issuer disclosures')
+    coverage = _source(repo, ref, 'financial_document_coverage' if scoped else 'event_document_coverage',
+        'cninfo-financial-disclosure-coverage-v1' if scoped else 'cninfo-disclosure-coverage-v1', symbol, cutoff)
     p = coverage.payload
-    if (set(p) != {'symbol','org_id','start','end','identity_ref','catalogue_refs','document_refs','count','scope'}
-            or p['symbol'] != symbol or p['scope'] != 'issuer_disclosures_not_all_media_news'):
+    fields = {'symbol','org_id','start','end','identity_ref','catalogue_refs','document_refs','count','scope'}
+    if scoped: fields |= {'selector_version','excluded_catalogue_ids'}
+    if (set(p) != fields or p['symbol'] != symbol or p['scope'] != (
+            'issuer_periodic_reports_and_guidance_only' if scoped else 'issuer_disclosures_not_all_media_news')):
         raise ContractViolation('disclosure coverage scope/schema changed')
     start, end, metadata = _catalogue_metadata(repo, p, symbol, coverage.known_at)
+    if scoped:
+        from src.stock_app.financial_disclosure_coverage import SELECTOR_VERSION, selected_financial_title
+        excluded = sorted(k for k,row in metadata.items() if not selected_financial_title(row['announcementTitle']))
+        if p['selector_version'] != SELECTOR_VERSION or p['excluded_catalogue_ids'] != excluded:
+            raise ContractViolation('financial disclosure selection differs from the counted original catalogue')
+        metadata = {k:row for k,row in metadata.items() if k not in excluded}
     if (not isinstance(p['document_refs'], list) or len(p['document_refs']) != len(metadata)
             or len(p['document_refs']) != len(set(p['document_refs']))):
         raise DataUnavailable('disclosure coverage omits or duplicates original documents')

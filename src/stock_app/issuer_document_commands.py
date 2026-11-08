@@ -7,6 +7,32 @@ import click
 
 
 def register_issuer_document_commands(cli):
+    @cli.command('capture-historical-document')
+    @click.option('--db-path', required=True, type=click.Path(exists=True, dir_okay=False))
+    @click.option('--run-id', required=True)
+    @click.option('--original-ref', required=True)
+    @click.option('--cutoff', required=True, help='带时区的历史重建截止时点')
+    @click.option('--direct', is_flag=True, help='显式直连，仅作用于本次归档 HTTP 会话')
+    @click.option('--archive-scheme',type=click.Choice(['http','https']),default=None)
+    @click.option('--output', required=True, type=click.Path(dir_okay=False))
+    def capture_document(db_path, run_id, original_ref, cutoff, direct, archive_scheme, output):
+        """捕获独立历史 PDF 原字节与索引证明；不回填系统 known_at。"""
+        from datetime import datetime
+        from scenario_engine.errors import ScenarioEngineError
+        from src.stock_app.historical_capture import acquire_document_capture
+        if Path(output).exists():
+            raise click.ClickException('输出已存在；请使用新文件名')
+        try:
+            result = acquire_document_capture(db_path, run_id, original_ref,
+                datetime.fromisoformat(cutoff), direct=direct, archive_scheme=archive_scheme)
+        except (ScenarioEngineError, ValueError) as exc:
+            result = {'run_id': run_id, 'status': 'blocked', 'reason': str(exc), 'publication_eligible': False}
+        with Path(output).open('x', encoding='utf8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        click.echo(json.dumps({k: result.get(k) for k in ('run_id', 'status', 'audit_ref', 'reason')}, ensure_ascii=False))
+        if result['status'] != 'independent_historical_bytes_verified':
+            raise click.exceptions.Exit(2)
+
     @cli.command('run-issuer-document-research')
     @click.option('--db-path', required=True, type=click.Path(exists=True, dir_okay=False))
     @click.option('--run-id', required=True)
@@ -53,63 +79,16 @@ def register_issuer_document_commands(cli):
         if result['status'] != 'research_complete':
             raise click.exceptions.Exit(2)
 
-    @cli.command('run-issuer-event-bridge')
-    @click.option('--db-path', required=True, type=click.Path(exists=True, dir_okay=False))
-    @click.option('--run-id', required=True)
-    @click.option('--inputs', required=True, type=click.Path(exists=True, dir_okay=False))
-    @click.option('--output', required=True, type=click.Path(dir_okay=False))
-    def event_bridge(db_path, run_id, inputs, output):
-        """绑定已审查假设与后续原件，重放历史纸面持仓标签；不签发预测。"""
-        from src.stock_app.issuer_event_bridge import run_issuer_event_bridge
-        if Path(output).exists():
-            raise click.ClickException('输出已存在；请使用新文件名')
-        result = run_issuer_event_bridge(db_path, run_id, **json.loads(Path(inputs).read_text(encoding='utf8')))
-        with Path(output).open('x', encoding='utf8') as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        click.echo(json.dumps({k: result[k] for k in ('run_id', 'status', 'report_ref', 'publication_eligible')}, ensure_ascii=False))
-
-    @cli.command('run-issuer-episode-research')
-    @click.option('--db-path', required=True, type=click.Path(exists=True, dir_okay=False))
-    @click.option('--run-id', required=True)
-    @click.option('--inputs', required=True, type=click.Path(exists=True, dir_okay=False))
-    @click.option('--output', required=True, type=click.Path(dir_okay=False))
-    def episode_research(db_path, run_id, inputs, output):
-        """保留停牌缺口，估计公告类别条件收益；历史可见性及独立校准分别验收。"""
-        from src.stock_app.issuer_episode_research import run_issuer_episode_research
-        from scenario_engine.errors import ScenarioEngineError
-        if Path(output).exists():
-            raise click.ClickException('输出已存在；请使用新文件名')
-        try:
-            result = run_issuer_episode_research(db_path, run_id, **json.loads(Path(inputs).read_text(encoding='utf8')))
-        except ScenarioEngineError as exc:
-            result = {'run_id':run_id,'status':'blocked','error_code':exc.code,'reason':str(exc),
-                      'context':exc.context,'publication_eligible':False}
-        with Path(output).open('x', encoding='utf8') as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        click.echo(json.dumps({k:result.get(k) for k in ('run_id','status','report_ref','reason','context','publication_eligible')},ensure_ascii=False))
-        if result['status'] == 'blocked': raise click.exceptions.Exit(2)
-
-    @cli.command('audit-issuer-episode-research')
-    @click.option('--db-path', required=True, type=click.Path(exists=True, dir_okay=False))
-    @click.option('--report-ref', required=True)
-    @click.option('--output', required=True, type=click.Path(dir_okay=False))
-    def episode_audit(db_path, report_ref, output):
-        """重放冻结来源，独立核验事件脉冲路径与稀疏事件系数不确定性。"""
-        from src.stock_app.issuer_episode_audit import audit_issuer_episode_research
-        if Path(output).exists(): raise click.ClickException('输出已存在；请使用新文件名')
-        result=audit_issuer_episode_research(db_path,report_ref)
-        with Path(output).open('x',encoding='utf8') as f: json.dump(result,f,ensure_ascii=False,indent=2)
-        click.echo(json.dumps({k:result[k] for k in ('status','audit_ref','publication_eligible')},ensure_ascii=False))
-
     @cli.command('build-issuer-profit-labels')
     @click.option('--db-path',required=True,type=click.Path(exists=True,dir_okay=False))
     @click.option('--run-id',required=True)
+    @click.option('--symbol',required=True)
     @click.option('--coverage-ref','coverage_refs',multiple=True,required=True)
     @click.option('--output',required=True,type=click.Path(dir_okay=False))
-    def profit_labels(db_path,run_id,coverage_refs,output):
+    def profit_labels(db_path,run_id,symbol,coverage_refs,output):
         """同报告期原件绑定利润预告区间和实绩，按语义分支去重结算。"""
         from src.stock_app.issuer_profit_labels import run_profit_labels
         if Path(output).exists():raise click.ClickException('输出已存在；请使用新文件名')
-        result=run_profit_labels(db_path,run_id,coverage_refs)
+        result=run_profit_labels(db_path,run_id,coverage_refs,symbol=symbol)
         with Path(output).open('x',encoding='utf8') as out:json.dump(result,out,ensure_ascii=False,indent=2)
         click.echo(json.dumps({k:result[k] for k in ('status','report_ref','resolved_clusters','publication_eligible')},ensure_ascii=False))

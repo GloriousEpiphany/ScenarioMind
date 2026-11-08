@@ -14,6 +14,37 @@ def doc(title,text,day='2012-04-10',ref='doc'):
         known_at=datetime(2026,11,8,tzinfo=timezone.utc),ingested_at=datetime(2026,11,8,tzinfo=timezone.utc))
 
 
+def test_cancelled_and_updated_originals_remain_conflicting_not_selected_for_controls():
+    text='主要会计数据 本报告期 上年同期 归属于上市公司股东的净利润（元） 153,963,783.32 143,092,293.14 7.60% 经营活动'
+    first=actual_profit(doc('2016年半年度报告（已取消）',text,day='2016-08-09',ref='cancelled'))
+    later=actual_profit(doc('2016年半年度报告（更新后）',text.replace('153,963,783.32','256,096,339.67'),day='2016-08-13',ref='updated'))
+    assert first['document_revision_status']=='已取消' and later['document_revision_status']=='更新后'
+    forecast={'target_period':'2016-06-30','lower_cny':'143092300','upper_cny':'214638500',
+              'evidence':{'catalogue_time':'2016-04-26','document_ref':'forecast'}}
+    result=resolve_clusters([forecast],[first,later])[0]
+    assert result['semantic_branch'] is None and result['reason']=='conflicting_forecast_or_actual_versions'
+    assert {r['branch_against_earliest_guidance'] for r in result['version_sensitivity']}=={'within','above'}
+    assert not any(r['eligible_training_label'] for r in result['version_sensitivity'])
+
+
+def test_standalone_owner_row_excludes_adjusted_profit_and_preserves_loss_sign():
+    text=('项目 本报告期 上年同期 归属于上市公司股东的净 盈利：8,000 万元–11,000 万元 '
+          '盈利：7,483.29 万元 利润 比上年同期增长：6.9%-46.99% '
+          '盈利：7,500 万元–10,000 万元 扣除非经常性损益后的净利润')
+    item=doc('2024年度业绩预告',text,day='2025-01-22')
+    rows=guidance(item)
+    assert len(rows)==1 and rows[0]['target_period']=='2024-12-31'
+    assert (Decimal(rows[0]['lower_cny']),Decimal(rows[0]['upper_cny']))==(Decimal('80000000'),Decimal('110000000'))
+    e=rows[0]['evidence'];assert text[e['start']:e['end']]==e['text']
+    item.payload['content']=text.replace('盈利：8,000 万元–11,000 万元','亏损：8,000 万元–11,000 万元')
+    row=guidance(item)[0]
+    assert Decimal(row['lower_cny'])==-110000000 and Decimal(row['upper_cny'])==-80000000
+    item.payload['content']=text.replace('归属于上市公司股东','少数股东')
+    assert guidance(item)==[]
+    item.payload['content']=text.replace('8,000 万元–11,000 万元','8,000 元–11,000 元')
+    assert guidance(item)==[]
+
+
 def test_guidance_binds_period_yuan_base_and_exact_original_span():
     item=doc('2012年第一季度报告全文','3.4 对2012 年1-6 月经营业绩的预计\n归属于上市公司股东的净利润比上年同期增长幅度为：30.00% ～～50.00%\n2011 年1-6 月经营业绩 归属于上市公司股东的净利润（元）：40,115,503.32\n业绩变动的原因说明')
     row=guidance(item)[0]
@@ -25,6 +56,21 @@ def test_guidance_binds_period_yuan_base_and_exact_original_span():
     assert guidance(item)==[]
     item.payload['content']=item.payload['content'].replace('2010 年1-6 月','2011 年度')
     assert guidance(item)==[] # annual base cannot resolve a half-year forecast
+
+
+def test_current_wrapped_owner_label_and_already_negative_loss_bounds():
+    annual = ('项目 本报告期 上年同期 归属于上市公司 盈利：64,500 万元 - 73,000 万元 '
+              '盈利：56,121.30 万元 股东的净利润 比上年同期增长：15%-30% 扣除非经常性损益后的净利润')
+    rows = guidance(doc('2023年度业绩预告', annual))
+    assert len(rows) == 1 and rows[0]['lower_cny'] == '645000000' and rows[0]['upper_cny'] == '730000000'
+    loss = annual.replace('盈利：64,500 万元 - 73,000 万元', '亏损：-46,000 万元～-38,000 万元')
+    row = guidance(doc('2024年半年度业绩预告', loss))[0]
+    assert row['lower_cny'] == '-460000000' and row['upper_cny'] == '-380000000'
+    for inconsistent in ('盈利：-46,000 万元～-38,000 万元', '亏损：-46,000 万元～38,000 万元'):
+        assert not guidance(doc('2024年半年度业绩预告', loss.replace('亏损：-46,000 万元～-38,000 万元', inconsistent)))
+    adjusted = ('2024年半年度业绩预告 本报告期 归属于上市公司股东的净利润 待核实 '
+                '扣除非经常性损益后的净利润 盈利：1,000万元-2,000万元')
+    assert not guidance(doc('2024年半年度业绩预告', adjusted))
 
 
 def test_explicit_interval_and_first_current_year_to_date_column():
@@ -43,6 +89,16 @@ def test_actual_is_not_preliminary_flash_or_unbound_narrative():
     assert actual_profit(doc('2012年半年度报告',text))['actual_cny']=='58417214.31'
     assert actual_profit(doc('2012年业绩快报',text)) is None
     assert actual_profit(doc('2012年半年度报告',text.replace('主要会计数据','公司发展'))) is None
+
+
+def test_annual_profit_never_uses_first_quarter_and_accepts_prior_restatement_columns():
+    quarter='分季度主要会计数据 单位：元 第一季度 第二季度 第三季度 第四季度 归属于上市公司股东的净利润 9,600,565.07 1,453,862.06 6,534,282.08 57,244,158.92 经营活动'
+    assert actual_profit(doc('2023年年度报告',quarter)) is None
+    annual=('主要会计数据 2024 年 2023 年 2022 年 调整前 调整后 单位：元 '
+            '归属于上市公司股东的净利 1,213,198,160.15 524,045,359.01 524,045,359.01 '
+            '131.51% -7,092,091,026.25 -6,747,205,626.25 润（元） '
+            '归属于上市公司股东的扣除非经常性损益')
+    assert actual_profit(doc('2024年年度报告',annual))['actual_cny']=='1213198160.15'
 
 
 def test_wrapped_pdf_row_label_does_not_drop_interleaved_amounts():
@@ -106,12 +162,12 @@ def test_source_bound_entry_rolls_back_result_and_replays_same_business_key(tmp_
         if key=='result':raise RuntimeError('checkpoint failure')
         return original(self,run,key,contract,value)
     monkeypatch.setattr(ResearchBoard,'save',fail)
-    with pytest.raises(RuntimeError):run_profit_labels(db,'immutable',[coverage],clock=lambda:AT)
+    with pytest.raises(RuntimeError):run_profit_labels(db,'immutable',[coverage],symbol='002230',clock=lambda:AT)
     with sqlite3.connect(db) as c:assert c.execute('select count(*) from market_artifacts').fetchone()[0]==before
     monkeypatch.setattr(ResearchBoard,'save',original)
-    result=run_profit_labels(db,'immutable',[coverage],clock=lambda:AT)
-    assert run_profit_labels(db,'immutable',[coverage],clock=lambda:AT)==result
+    result=run_profit_labels(db,'immutable',[coverage],symbol='002230',clock=lambda:AT)
+    assert run_profit_labels(db,'immutable',[coverage],symbol='002230',clock=lambda:AT)==result
     with sqlite3.connect(db) as c:
         assert c.execute('select count(*) from market_artifacts').fetchone()[0]==before+1
         assert c.execute('pragma integrity_check').fetchall()==[('ok',)]
-    with pytest.raises(ContractViolation):run_profit_labels(db,'immutable',[coverage,'changed'],clock=lambda:AT)
+    with pytest.raises(ContractViolation):run_profit_labels(db,'immutable',[coverage,'changed'],symbol='002230',clock=lambda:AT)

@@ -4,7 +4,8 @@ from scenario_engine.errors import ContractViolation, ToolArgumentRejected
 from .tools import ApprovedTool, fingerprint
 
 
-def make_hypothesis_tool(repository, *, manifest, required_entities=(), require_child=False):
+def make_hypothesis_tool(repository, *, manifest, required_entities=(), require_child=False,
+                         require_entity_sources=False):
     sources = {row["artifact_id"]: row for row in manifest}
     symbols = {row["entity_id"] for row in manifest}
     fields = {"hypothesis_id", "parent_id", "title", "mechanism", "entities", "evidence_refs",
@@ -34,6 +35,12 @@ def make_hypothesis_tool(repository, *, manifest, required_entities=(), require_
                 raise ContractViolation("hypothesis exceeds the approved evidence or security scope")
             if not any(sources[ref]["domain"] in {"event", "fundamental", "industry", "flow"} for ref in path["evidence_refs"]):
                 raise ContractViolation("hypothesis cannot use only prices or derived sentiment as original mechanism evidence")
+            if require_entity_sources:
+                for entity in path['entities']:
+                    if not any(sources[ref]['entity_id'] == entity
+                               and sources[ref]['domain'] in {'event', 'fundamental', 'industry', 'flow'}
+                               for ref in path['evidence_refs']):
+                        raise ContractViolation('each hypothesis entity requires its own original mechanism evidence')
         if not set(required_entities).issubset({s for path in paths for s in path["entities"]}):
             raise ContractViolation("hypotheses must cover every required held security")
         if require_child and not any(path["parent_id"] for path in paths):
@@ -69,6 +76,8 @@ def make_hypothesis_tool(repository, *, manifest, required_entities=(), require_
     version = "deductive-paths-v2:" + fingerprint(manifest)
     if required_entities or require_child:
         version += ":" + fingerprint({"required_entities": list(required_entities), "require_child": require_child})
+    if require_entity_sources:
+        version += ':entity-sources-v1'
     return ApprovedTool("propose_hypotheses", version,
         "Record conditional transmission hypotheses, each with original evidence IDs, observable triggers "
         "and falsification conditions. These are uncalibrated hypotheses, never facts, probabilities or price targets.",

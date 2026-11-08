@@ -58,3 +58,18 @@ def test_resuming_a_job_does_not_erase_prior_provider_failure_history(tmp_path):
     with sqlite3.connect(path) as c:
         rows = c.execute('select error_json from portfolio_research_job_errors where run_id=?', (run_id,)).fetchall()
     assert [json.loads(r[0]) for r in rows] == [failure]
+
+
+def test_retired_unfinished_v1_is_explicit_and_does_not_contact_model(tmp_path, monkeypatch):
+    from scenario_engine.agents.research_board import ResearchBoard
+    path = str(tmp_path / 'legacy.db')
+    run_id = jobs.enqueue(path, {'account_id':1, 'version':'portfolio-specialist-team-v1'})
+    with sqlite3.connect(path) as c:
+        ResearchBoard(c).register_run('portfolio-team:'+run_id, {'version':'portfolio-specialist-team-v1'})
+    monkeypatch.setattr(jobs, 'load_scenario_environment', lambda:None)
+    monkeypatch.setenv('SCENARIO_LLM_API_KEY','')
+    result = jobs.execute_job(path, run_id)
+    assert result['status'] == 'requires_new_request' and not result['resume_with_same_run_id']
+    assert jobs.load_job(path,run_id=run_id)['status'] == 'requires_new_request'
+    with sqlite3.connect(path) as c:
+        assert c.execute('SELECT COUNT(*) FROM agent_call_attempts').fetchone()[0] == 0

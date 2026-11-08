@@ -42,7 +42,7 @@ def control_tool(name, description, properties):
 
 
 class AgentRuntime:
-    def __init__(self, *, db_path, model, policy, tools, role_prompts=None):
+    def __init__(self, *, db_path, model, policy, tools, role_prompts=None, repair_protocol=False):
         try:
             from langgraph.graph import StateGraph, START, END
             from langgraph.checkpoint.sqlite import SqliteSaver
@@ -52,6 +52,7 @@ class AgentRuntime:
         if model.policy != policy:
             raise ContractViolation("runtime and model policies differ")
         self.model, self.policy = model, policy
+        self.repair_protocol = repair_protocol
         self.role_prompts = dict(role_prompts or {"researcher": RESEARCHER, "critic": CRITIC})
         if (set(self.role_prompts) != {"researcher", "critic"}
                 or not all(isinstance(v, str) and v.strip() for v in self.role_prompts.values())):
@@ -65,8 +66,8 @@ class AgentRuntime:
         self.tools = {tool.name: tool for tool in tools}
         if not self.tools or len(self.tools) != len(tools):
             raise ContractViolation("agent runtime requires unique approved tools")
-        if any(not tool.read_only for tool in tools):
-            raise ContractViolation("research runtime does not yet support external mutations; publication uses a separate boundary")
+        if any(not tool.read_only and not getattr(tool, 'internal_ledger_only', False) for tool in tools):
+            raise ContractViolation("research runtime rejects external mutations; only idempotent internal ledger tools are supported")
         self.connection = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
         self.checkpoint_connection = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
         self.board = ResearchBoard(self.connection)
@@ -76,7 +77,7 @@ class AgentRuntime:
         graph.add_node("tool", self._tool)
         graph.add_node("review", self._review)
         graph.add_edge(START, "decide")
-        graph.add_conditional_edges("decide", self._route, {"tool": "tool", "review": "review", "end": END})
+        graph.add_conditional_edges("decide", self._route, {"tool": "tool", "review": "review", "retry": "decide", "end": END})
         graph.add_edge("tool", "decide")
         graph.add_conditional_edges("review", lambda state: "end" if state["status"] != "running" else "decide",
                                     {"end": END, "decide": "decide"})
@@ -106,11 +107,13 @@ class AgentRuntime:
         if not run_id or not objective.strip():
             raise ContractViolation("advisory run requires identifiers and an objective")
         contract = {"objective": objective, "as_of": as_of.isoformat(), "context": context,
-                    "policy": asdict(self.policy), "runtime_version": "langgraph-research-v1",
+                    "policy": asdict(self.policy), "runtime_version": ("langgraph-research-v4-protocol-repair"
+                        if self.repair_protocol else "langgraph-research-v3-internal-ledger"),
                     "transport": getattr(self.model, "transport_contract", {}),
                     "role_prompts": self.role_prompts,
                     "tools": [{"descriptor": tool.descriptor(), "version": tool.version,
-                               "critic_allowed": tool.critic_allowed} for tool in self.tools.values()]}
+                               "critic_allowed": tool.critic_allowed,
+                               "internal_ledger_only": getattr(tool, 'internal_ledger_only', False)} for tool in self.tools.values()]}
         seed = None
         if review_from_run is not None:
             source = self.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?', (review_from_run,)).fetchone()
@@ -172,7 +175,17 @@ class AgentRuntime:
             limit = self.policy.max_model_calls - (self.policy.critic_reserved_calls if phase == "researcher" else 0)
             if not self.board.reserve_attempt(state["run_id"], "model", task_id, limit):
                 return {"status": "budget_exhausted", "pending": {}}
-            call = self.model.next_call(state[key], descriptors)
+            try:
+                call = self.model.next_call(state[key], descriptors)
+            except ContractViolation as exc:
+                if not self.repair_protocol or 'tool_call_count' not in exc.context:
+                    raise
+                # Reject the entire malformed response. No partial calls execute,
+                # and the failed decision consumes the same model/global budget.
+                rejection={'code':'single_tool_call_required','tool_call_count':exc.context['tool_call_count']}
+                self.board.save(state['run_id'],'protocol-rejection:'+task_id,request,rejection)
+                return {'pending':{},'step':state['step']+1,key:[*state[key],{'role':'user','content':canonical({
+                    'protocol_rejection':rejection,'instruction':'上一响应未执行。每次只调用一个已批准函数；等待其结果后才能选择下一步。不要并行调用，不要用纯文本结束。'})}]}
             saved = asdict(call)
             canonical(saved)
             self.board.save(state["run_id"], task_id, request, saved)
@@ -188,6 +201,8 @@ class AgentRuntime:
     def _route(state):
         if state["status"] != "running":
             return "end"
+        if not state['pending']:
+            return 'retry'
         return "review" if state["pending"]["name"] in {"request_review", "submit_review"} else "tool"
 
     def _tool(self, state):
@@ -249,7 +264,9 @@ class AgentRuntime:
                     or contract['context'].get('portfolio') != state['context'].get('portfolio')):
                 continue
             current_tool = self.tools['query_pit_data']
-            descriptor = {'descriptor': current_tool.descriptor(), 'version': current_tool.version, 'critic_allowed': current_tool.critic_allowed}
+            descriptor = {'descriptor': current_tool.descriptor(), 'version': current_tool.version,
+                          'critic_allowed': current_tool.critic_allowed,
+                          'internal_ledger_only': getattr(current_tool, 'internal_ledger_only', False)}
             if descriptor not in contract['tools']:
                 continue
             peer = self.board.load(source_run, 'research_result', contract)
@@ -301,19 +318,96 @@ class AgentRuntime:
                     if envelope.get("status") == "completed" and envelope.get("tool") == "query_pit_data"
                     for row in envelope["result"].get("artifacts", [])}
         missing_ids = sorted(set(state["context"].get("required_artifact_ids", [])).difference(read_ids))
+        inspected={r['result']['artifact_id'] for r in state['results']
+                   if r.get('status')=='completed' and r.get('tool')=='fetch_document'}
+        missing_inspections=sorted(set(state['context'].get('required_inspected_document_ids',[]))-inspected)
+        unread_update_quotes=[]
+        if state['context'].get('require_read_update_quotes'):
+            updates=[r['result'].get('updates',[]) for r in state['results']
+                     if r.get('status')=='completed' and r.get('tool')=='record_plan']
+            reads=[r['result'] for r in state['results'] if r.get('status')=='completed' and r.get('tool')=='fetch_document']
+            unread_update_quotes=[u['hypothesis_id'] for u in (updates[-1] if updates else [])
+                if not any(r['artifact_id']==u['artifact_id'] and u['quote'] in r['text'] for r in reads)]
+        # A frozen source ID proves availability, not that the agent inspected it.
+        # Audit only the latest candidate of each kind; superseded drafts remain
+        # in the trace without imposing stale citation requirements on revisions.
+        cited_ids = set()
+        for name in ("propose_hypotheses", "record_assessment"):
+            candidates = [r for r in state["results"] if r.get("tool") == name
+                          and r.get("status") == "completed"]
+            if not candidates:
+                continue
+            candidate = candidates[-1]["result"]
+            if name == "propose_hypotheses":
+                sections = candidate["hypotheses"]
+            else:
+                assessment = candidate["assessment"]
+                sections = [*assessment["holdings"], *assessment["hedges"]]
+            cited_ids.update(ref for section in sections for ref in section["evidence_refs"])
+        unread_citations = sorted(cited_ids - read_ids)
+        # Disclosure readers use either a legacy full-read or an exact-span gate.
+        if "query_pit_data" not in self.tools:
+            unread_citations = []
+        document_lengths = state['context'].get('required_document_lengths', {})
+        unread_documents, unindexed_documents = [], []
+        quoted_manifest = state['context'].get('required_quoted_document_manifest', [])
+        if quoted_manifest:
+            from .disclosure_tools import unread_hypothesis_quotes
+            unread_documents = unread_hypothesis_quotes({'tool_results': state['results']}, quoted_manifest)
+            indexed = {row['artifact_id'] for r in state['results']
+                       if r.get('status') == 'completed' and r.get('tool') == 'search_evidence'
+                       and not r['result'].get('query')
+                       for row in r['result'].get('documents', [])}
+            unindexed_documents = sorted({r['artifact_id'] for r in quoted_manifest} - indexed)
+        if document_lengths:
+            from .disclosure_tools import unread_cited_documents
+            unread_documents = unread_cited_documents({'tool_results': state['results']},
+                [{'artifact_id': ref, 'text_chars': length} for ref, length in document_lengths.items()])
+            indexed = {row['artifact_id'] for r in state['results']
+                       if r.get('status') == 'completed' and r.get('tool') == 'search_evidence'
+                       for row in r['result'].get('documents', [])}
+            unindexed_documents = sorted(set(document_lengths) - indexed)
         completed_tools = {row["tool"] for row in state["results"] if row.get("status") == "completed"}
         missing_tools = sorted(set(state["context"].get("required_tools", [])).difference(completed_tools))
+        audited_tasks = {row['result'].get('task_id') for row in state['results']
+                         if row.get('tool') == 'run_specialist' and row.get('status') == 'completed'
+                         and row['result'].get('status') in {'audited', 'prepared'}}
+        missing_tasks = sorted(set(state['context'].get('required_completed_tasks', [])).difference(audited_tasks))
+        quant_pairs = {(row['tool'],row['result'].get('experiment_id')) for row in state['results']
+                       if row.get('status') == 'completed' and row['tool'] in
+                       {'estimate_exposure','simulate_paths','optimize_portfolio','validate_proposal'}}
+        missing_quant = [(name,experiment) for experiment in state['context'].get('required_quantitative_experiments', [])
+                         for name in ('estimate_exposure','simulate_paths','optimize_portfolio','validate_proposal')
+                         if (name,experiment) not in quant_pairs]
         passed = (args["passed"] and not args["blocking_findings"] and bool(completed_tools)
-                  and not state["errors"] and not missing and not missing_tools and not missing_ids)
+                  and not state["errors"] and not missing and not missing_tools and not missing_ids
+                  and not unread_citations and not unread_documents and not unindexed_documents and not missing_tasks and not missing_quant
+                  and not missing_inspections and not unread_update_quotes)
         review = {"model_decision": args["passed"], "accepted": passed, "findings": args["findings"],
                   "missing_required_evidence": missing}
         review["missing_required_tools"] = missing_tools
+        if state['context'].get('required_completed_tasks'):
+            review['missing_required_tasks'] = missing_tasks
+        if state['context'].get('required_quantitative_experiments'):
+            review['missing_quantitative_experiments'] = missing_quant
         review["blocking_findings"] = args["blocking_findings"]
+        review["unread_cited_artifact_ids"] = unread_citations
+        if state['context'].get('required_inspected_document_ids'):
+            review['uninspected_documents']=missing_inspections
+        if state['context'].get('require_read_update_quotes'):
+            review['updates_without_read_quotes']=unread_update_quotes
+        if document_lengths or quoted_manifest:
+            review['unread_cited_documents'] = unread_documents
+            review['unindexed_documents'] = unindexed_documents
         if state["context"].get("required_artifact_ids"):
             review["unread_required_artifact_ids"] = missing_ids
         proposals = [row for row in state["results"] if row.get("tool") == "propose_hypotheses"
                      and row.get("status") == "completed"]
         review["reviewed_hypotheses_input_hash"] = proposals[-1]["input_hash"] if proposals else None
+        assessments = [row for row in state['results'] if row.get('tool') == 'record_assessment'
+                       and row.get('status') == 'completed']
+        if assessments:
+            review['reviewed_assessment_input_hash'] = assessments[-1]['input_hash']
         if passed:
             return {"status": "research_complete", "reviews": [*state["reviews"], review]}
         return {"phase": "researcher", "reviews": [*state["reviews"], review],

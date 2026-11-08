@@ -19,12 +19,12 @@ from src.stock_app.disclosure_source_binding import read_disclosure_coverage
 from src.stock_app.cninfo_disclosures import SHANGHAI
 from src.stock_app.quantitative_inputs import derived_artifact
 
-RULES={'version':'issuer-profit-range-labels-v6','metric':'consolidated_profit_attributable_to_owners_CNY',
+RULES={'version':'issuer-profit-range-labels-v10-signed-wrapped-guidance','metric':'consolidated_profit_attributable_to_owners_CNY',
     'partition':['below','within','above'],'bounds':'closed_interval',
     'forecast_version':'earliest_unambiguous_complete_guidance_per_target_period',
     'outcome':'earliest_unambiguous_periodic_report_not_earnings_flash',
     'cluster':'symbol_and_target_period','rounding':'printed_bounds_are_not_silently_rounded',
-    'historical_receipt':'actual_only','causal_return_effect':False,'min_training_pairs':126,'min_independent_windows':50}
+    'historical_receipt':'actual_only','causal_return_effect':False}
 
 
 def normalized(text):
@@ -79,17 +79,50 @@ def guidance(document):
     # Standalone revisions are versions of the SAME target, not new outcomes.
     if re.search(r'业绩预告|更正公告',document.payload['title']):
         target=re.search(r'(20\d{2})年(?:半年度|第一季度|前三季度|年度)业绩预告',text)
-        bounds=list(re.finditer(r'盈利[:：]([\d,.]+)万元[—–~～-]([\d,.]+)万元',text))
-        if target and len(bounds)==1 and '归属于' in text and '净利润' in text:
+        bounds=list(re.finditer(r'归属于(?:上市公司股东|母公司所有者)的净利润(?:预计)?(?:为)?[:：]?盈利[:：]([\d,.]+)万元[—–~～-]([\d,.]+)万元',text))
+        if target and len(bounds)==1:
             month=6 if '半年度' in target[0] else 3 if '第一季度' in target[0] else 9 if '前三季度' in target[0] else 12
             lo,hi=[amount(bounds[0][i])*10000 for i in (1,2)]
             if 0<lo<=hi:out.append({'target_period':period(int(target[1]),month),'lower_cny':str(lo),'upper_cny':str(hi),
                 'derivation':'explicit_standalone_interval','evidence':quote(document,pos,0,len(text))})
+    # Modern standalone notices have multiple monetary intervals (owner profit,
+    # adjusted profit, EPS). Bind only the explicitly labelled owner-profit row.
+    # PDF reading order may insert numeric cells into a wrapped metric label.
+    title=re.sub(r'\s+','',document.payload['title'])
+    standalone=re.fullmatch(r'(20\d{2})年?(第一季度|半年度|前三季度|年度)业绩预告',title)
+    if standalone and not out and '本报告期' in text:
+        start=text.find('归属于上市公')
+        header=text.rfind('本报告期',0,start) if start>=0 else -1
+        if header>=0 and start-header<120:
+            start=header  # first current-value cell may precede its wrapped row label
+        stop=text.find('扣除非经常',start) if start>=0 else -1
+        if start>=0 and 0<stop-start<800:
+            row=text[start:stop]
+            label=re.search(r'归属于上市公.{0,200}?司.{0,200}?股东.{0,200}?净.{0,200}?利.{0,200}?润',row)
+            first_amount=re.search(r'(?:盈利|亏损)[:：]',row)
+            bounds=(re.match(r'(盈利|亏损)[:：]([+-]?[\d,]+(?:\.\d+)?)万元(?:至|[—–~～-])([+-]?[\d,]+(?:\.\d+)?)万元',
+                             row[first_amount.start():]) if first_amount else None)
+            if label and bounds:
+                values=[amount(bounds[i])*10000 for i in (2,3)]
+                if bounds[1]=='亏损':
+                    if min(values)<0<max(values):return out
+                    values=[-abs(v) for v in values]
+                elif min(values)<0:return out
+                lo,hi=sorted(values)
+                month={'第一季度':3,'半年度':6,'前三季度':9,'年度':12}[standalone[2]]
+                out.append({'target_period':period(int(standalone[1]),month),'lower_cny':str(lo),'upper_cny':str(hi),
+                    'derivation':'explicit_standalone_owner_row_CNY_10000',
+                    'evidence':quote(document,pos,start,stop)})
     return out
 
 
 def actual_profit(document):
     title=re.sub(r'\s+','',document.payload['title'])
+    revision='original'
+    suffix=re.search(r'[（(](更新后|已取消|修订版|修订后)[）)]$',title)
+    if suffix:
+        revision=suffix[1]
+        title=title[:suffix.start()]
     m=re.fullmatch(r'(20\d{2})年?(第一季度|第三季度|半年度|年度)报告(?:全文|正文|摘要)?',title)
     if not m:return None
     year=int(m[1]);month={'第一季度':3,'第三季度':9,'半年度':6,'年度':12}[m[2]]
@@ -97,11 +130,12 @@ def actual_profit(document):
     # PDF row sorting can place numeric cells between fragments of a wrapped
     # row label. Only numeric cells may intervene, never another semantic label.
     cells=r'(?:[\d,.%+\-]+)?'
-    metric=r'归属于(?:上市公司股'+cells+r'东|母公司所有者)'+cells+r'的净'+cells+r'利'+cells+r'润'
+    metric=r'归属于(?:上市公'+cells+r'司股'+cells+r'东|母公司所有者)'+cells+r'的净'+cells+r'利'+cells+r'润'
     for hit in re.finditer(metric,text):
         before=text[max(0,hit.start()-1200):hit.start()]
         if not any(k in before for k in ('主要会计数据','主要财务数据','主要会计数据和财务指标')):continue
         if '利润表' in before:continue
+        if month==12 and re.search(r'分季度|第一季度.*第二季度.*第三季度',before):continue
         end_candidates=[p for p in (text.find('归属于上市公司股东的扣除',hit.end()),text.find('扣除非经常',hit.end()),text.find('经营活动',hit.end()),
             text.find('基本每股收益',hit.end())) if p>=0]
         end=min(end_candidates,default=min(len(text),hit.end()+250))
@@ -117,9 +151,11 @@ def actual_profit(document):
             if len(numbers)!=2 or not ('1-9月' in before or '年初至报告期末' in before):continue
             chosen=numbers[1]
         else:
-            if not 2<=len(numbers)<=4:continue
+            maximum=6 if (month==12 and str(year)+'年' in before and '调整前' in before and '调整后' in before) else 4
+            if not 2<=len(numbers)<=maximum:continue
             chosen=numbers[0]
         return {'target_period':period(year,month),'actual_cny':str(amount(chosen[0])),
+            'document_revision_status':revision,
             'evidence':quote(document,pos,max(0,hit.start()-min(len(before),300)),end),
             'unit_basis':'explicit_yuan_metric_or_local_table_header',
             'column':'year_to_date_current' if month==9 else 'current_period'}
@@ -147,6 +183,7 @@ def actual_profit(document):
             numbers=re.findall(r'[-+]?\d[\d,]*\.\d{2}(?!\d)',raw)
             if len(numbers)!=2:continue
             results.append({'target_period':period(year,month),'actual_cny':str(amount(numbers[0])),
+                'document_revision_status':revision,
                 'evidence':quote(document,pos,section.start(),finish),
                 'unit_basis':'explicit_yuan_cumulative_consolidated_income_statement',
                 'column':'current_consolidated_owner_profit'})
@@ -165,6 +202,14 @@ def resolve_clusters(forecasts,actuals):
         actual=outcomes[0];available=[v for v in versions if v['evidence']['catalogue_time']<actual['evidence']['catalogue_time']]
         if not available:record['reason']='forecast_does_not_precede_actual';groups.append(record);continue
         earliest=available[0];peers=[v for v in available if v['evidence']['catalogue_time']==earliest['evidence']['catalogue_time']]
+        # Keep corrections observable, without selecting a convenient version
+        # to manufacture a missing class or increasing independent cluster count.
+        record['version_sensitivity'] = [{
+            'actual_ref':a['evidence']['document_ref'], 'actual_cny':a['actual_cny'],
+            'document_revision_status':a.get('document_revision_status','original'),
+            'branch_against_earliest_guidance': ('below' if Decimal(a['actual_cny'])<Decimal(earliest['lower_cny'])
+                else 'above' if Decimal(a['actual_cny'])>Decimal(earliest['upper_cny']) else 'within'),
+            'eligible_training_label':False} for a in outcomes]
         # Conflicting simultaneous versions or restatements are not chosen opportunistically.
         if (len({(Decimal(v['lower_cny']),Decimal(v['upper_cny'])) for v in peers})!=1
                 or len({Decimal(a['actual_cny']) for a in outcomes})!=1):
@@ -178,8 +223,10 @@ def resolve_clusters(forecasts,actuals):
     return groups
 
 
-def run_profit_labels(db_path,run_id,coverage_refs,*,clock=None):
-    now=(clock or (lambda:datetime.now(timezone.utc)))();contract={**RULES,'coverage_refs':list(coverage_refs),'symbol':'002230'}
+def run_profit_labels(db_path,run_id,coverage_refs,*,symbol,clock=None):
+    if not isinstance(symbol,str) or not re.fullmatch(r'[0-9]{6}',symbol):
+        raise ContractViolation('profit labels require an explicit six-digit issuer code')
+    now=(clock or (lambda:datetime.now(timezone.utc)))();contract={**RULES,'coverage_refs':list(coverage_refs),'symbol':symbol}
     root='issuer-profit-labels:'+run_id
     with sqlite3.connect(db_path,timeout=30) as c,advisory_lease(db_path,root) as lost:
         c.execute('pragma journal_mode=WAL');repo,board=MarketArtifactRepository(c),ResearchBoard(c)
@@ -188,7 +235,7 @@ def run_profit_labels(db_path,run_id,coverage_refs,*,clock=None):
         if saved:repo.get_visible(saved['report_ref'],now);return saved
         documents={}
         for ref in coverage_refs:
-            for d in read_disclosure_coverage(repo,ref,'002230',now)[3]:
+            for d in read_disclosure_coverage(repo,ref,symbol,now,allow_financial_scope=True)[3]:
                 if d.artifact_id in documents:raise ContractViolation('overlapping original coverage')
                 documents[d.artifact_id]=d
         forecasts=[];actuals=[];gaps=[]
@@ -205,7 +252,7 @@ def run_profit_labels(db_path,run_id,coverage_refs,*,clock=None):
             'publication_eligible':False,'independent_calibration_completed':False,'new_model_calls':0,
             'event_definition':'issuer_reported_same_period_owner_profit_relative_to_earliest_explicit_guidance',
             'not_claimed':['causal_price_effect','earliest_full_market_expectation','original_system_forecast','all_issuer_events']}
-        item=derived_artifact('issuer_semantic_profit_labels',RULES['version'],report,now,entity='002230');output={**report,'report_ref':item.artifact_id}
+        item=derived_artifact('issuer_semantic_profit_labels',RULES['version'],report,now,entity=symbol);output={**report,'report_ref':item.artifact_id}
         if lost.is_set():raise ContractViolation('profit-label lease lost')
         with atomic_write(c):repo.ingest_many_in_transaction((item,));board.save(root,'result',contract,output)
         return output

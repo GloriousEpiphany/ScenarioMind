@@ -204,20 +204,23 @@ def _document_version(repo, item):
     return replace(item,revision_id='cninfo-content:'+item.payload_hash)
 
 
-def acquire_disclosure_archive(db_path, run_id, symbol, start, end, *, reader=None, clock=None, dates_only=False):
+def acquire_disclosure_archive(db_path, run_id, symbol, start, end, *, reader=None, clock=None, dates_only=False, financial_only=False):
     from scenario_engine.agents.lease import advisory_lease
     reader=reader or CninfoDisclosureReader()
     root = ('disclosure-dates:' if dates_only else 'disclosure-archive:') + run_id
+    if financial_only:
+        if dates_only:raise ContractViolation('financial scope and dates-only scope are mutually exclusive')
+        root = 'disclosure-financial:' + run_id
     with advisory_lease(db_path,root) as lost:
         try:
             return _acquire_disclosure_archive(db_path,run_id,symbol,start,end,reader=reader,clock=clock,
-                lease_lost=lost,root=root,dates_only=dates_only)
+                lease_lost=lost,root=root,dates_only=dates_only,financial_only=financial_only)
         finally:
             if hasattr(reader,'close'):
                 reader.close()
 
 
-def _acquire_disclosure_archive(db_path, run_id, symbol, start, end, *, reader, clock=None, lease_lost, root, dates_only):
+def _acquire_disclosure_archive(db_path, run_id, symbol, start, end, *, reader, clock=None, lease_lost, root, dates_only, financial_only=False):
     clock = clock or (lambda: datetime.now(timezone.utc)); reader = reader or CninfoDisclosureReader()
     _validate_symbol(symbol)
     if type(start) is not date or type(end) is not date or start > end or end >= clock().astimezone(SHANGHAI).date():
@@ -225,9 +228,13 @@ def _acquire_disclosure_archive(db_path, run_id, symbol, start, end, *, reader, 
     contract = {'version': VERSION, 'symbol': symbol, 'start': start.isoformat(), 'end': end.isoformat(), 'page_size': PAGE_SIZE}
     if dates_only:
         contract['scope'] = 'issuer_publication_dates_only'
+    if financial_only:
+        from src.stock_app.financial_disclosure_coverage import SELECTOR_VERSION,selected_financial_title
+        contract.update(scope='issuer_periodic_reports_and_guidance_only',selector_version=SELECTOR_VERSION)
     result = {'run_id': run_id, 'status': 'data_incomplete', 'catalogue_refs': [], 'document_refs': [],
               'failures': [], 'publication_eligible': False,
               'scope': 'issuer_publication_dates_only' if dates_only else 'issuer_disclosures_not_all_media_news'}
+    if financial_only:result['scope']='issuer_periodic_reports_and_guidance_only'
     with sqlite3.connect(db_path, timeout=30) as c:
         repo, board = MarketArtifactRepository(c), ResearchBoard(c)
         board.register_run(root, contract)
@@ -302,6 +309,11 @@ def _acquire_disclosure_archive(db_path, run_id, symbol, start, end, *, reader, 
                 result.update(status='issuer_publication_dates_complete', coverage_ref=coverage.artifact_id,
                               document_count=total, historical_visibility_validated=False)
             return result
+        excluded = []
+        if financial_only:
+            excluded = sorted(r['announcementId'] for r in rows if not selected_financial_title(r['announcementTitle']))
+            rows = [r for r in rows if r['announcementId'] not in excluded]
+            result.update(catalogue_count=total,excluded_catalogue_ids=excluded,all_issuer_documents_complete=False)
         if hasattr(reader, 'prepare_pdfs'):
             reader.prepare_pdfs([r['adjunctUrl'] for r in rows
                 if board.load(root,'document:'+r['announcementId'],contract) is None
@@ -353,7 +365,7 @@ def _acquire_disclosure_archive(db_path, run_id, symbol, start, end, *, reader, 
                 if consecutive_failures >= 3:
                     result['failures'].append({'component': 'acquisition',
                         'reason': 'three consecutive document failures; remaining work preserved for explicit resume'})
-                    result['unacquired_document_count'] = total - len(result['document_refs'])
+                    result['unacquired_document_count'] = len(rows) - len(result['document_refs'])
                     return result
         if result['failures']:
             result['raw_only_refs'] = [f['context']['original_pdf_ref'] for f in result['failures']
@@ -364,9 +376,13 @@ def _acquire_disclosure_archive(db_path, run_id, symbol, start, end, *, reader, 
         payload = {'symbol': symbol, 'org_id': org, 'start': start.isoformat(), 'end': end.isoformat(),
             'identity_ref': issuer.artifact_id, 'catalogue_refs': result['catalogue_refs'], 'document_refs': result['document_refs'],
             'count': total, 'scope': result['scope']}
-        coverage = acquire('coverage', lambda: artifact('event_document_coverage', 'cninfo-disclosure-coverage-v1',
+        if financial_only:
+            payload.update(selector_version=SELECTOR_VERSION,excluded_catalogue_ids=excluded)
+        coverage = acquire('coverage', lambda: artifact(
+            'financial_document_coverage' if financial_only else 'event_document_coverage',
+            'cninfo-financial-disclosure-coverage-v1' if financial_only else 'cninfo-disclosure-coverage-v1',
             symbol, payload, 'stockm1://cninfo-disclosure-coverage', clock()))
         if coverage:
-            result.update(status='original_disclosure_archive_complete', coverage_ref=coverage.artifact_id,
-                          document_count=total, historical_visibility_validated=False)
+            result.update(status='financial_document_scope_complete' if financial_only else 'original_disclosure_archive_complete', coverage_ref=coverage.artifact_id,
+                          document_count=len(rows), historical_visibility_validated=False)
         return result

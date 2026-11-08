@@ -149,6 +149,39 @@ def test_real_graph_runs_five_specialists_and_critics_then_reopens_without_calls
     engine.close()
 
 
+def test_scoped_macro_uses_benchmarks_and_persists_news_gap_without_rewriting_old_contract(tmp_path):
+    class ScopedModel(Model):
+        def next_call(self, messages, descriptors):
+            call = super().next_call(messages, descriptors)
+            role = json.loads(messages[1]['content'])['context']['specialist_role']
+            if role == 'macro' and call.name == 'propose_hypotheses':
+                args = hypothesis('macro')
+                args['hypotheses'][0]['evidence_refs'] = ['pit_financials:000001', 'benchmark_context:1.000001']
+                return ToolCall('proposal', call.name, args)
+            return call
+    engine, model, _ = workflow(tmp_path, model=ScopedModel())
+    gap = {'source_id':'cctv_official', 'status':'unavailable'}
+    def scoped(db, **kw):
+        assert kw['cctv_required'] is False
+        rows = [artifact('market','benchmark_context',code) for code in ('1.000001','0.399001')]
+        with sqlite3.connect(db) as c:
+            MarketArtifactRepository(c).ingest_many(rows)
+        return ContextAcquisition(True, tuple(r.artifact_id for r in rows), (gap,))
+    engine.context_acquirer = scoped
+    engine.source_policy['cctv_required'] = False
+    try:
+        result = run(engine)
+        assert result['status'] == 'conditional_research_complete'
+        assert result['evidence_gaps'] == [gap] or result['evidence_gaps'] == (gap,)
+        assert not result['publication_eligible']
+        assert run(engine) == result
+        engine.source_policy['cctv_required'] = True
+        with pytest.raises(ContractViolation):
+            run(engine)
+    finally:
+        engine.close()
+
+
 def test_explicit_quantitative_evidence_preparation_never_calls_or_claims_ai_completion(tmp_path):
     engine, model, downloaded = workflow(tmp_path)
     result = engine.execute(run_id='quant-preparation', account_id=1, start_date=date(2026, 1, 1), end_date=DAY, edition=DAY, prepare_only=True)
@@ -225,6 +258,41 @@ def test_assessment_rejects_missing_holding_fabricated_source_and_unknown_scenar
         mutate(value)
         with pytest.raises(ContractViolation):
             tool.run(value, ToolContext('r', 't', NOW + timedelta(seconds=1), 'p', 'h', 'key'))
+    engine.close()
+
+
+def test_primary_specialists_never_receive_peer_claims(tmp_path):
+    engine, model, _ = workflow(tmp_path)
+    assert run(engine)['status'] == 'conditional_research_complete'
+    contexts = [json.loads(messages[1]['content'])['context'] for messages in model.messages]
+    for context in contexts:
+        if context['specialist_role'] in {'macro', 'company', 'sentiment'}:
+            assert context['peer_candidates'] == {}
+        else:
+            assert context['peer_candidates']
+    engine.close()
+
+
+def test_assessment_rejects_cross_security_scenario_and_mixed_source_loopholes(tmp_path):
+    engine, _, _ = workflow(tmp_path)
+    output = run(engine)
+    context = ToolContext('r', 't', NOW + timedelta(seconds=1), 'p', 'h', 'key')
+    foreign_paths = deepcopy(output['scenarios'])
+    foreign_paths[0]['entities'] = ['999999']
+    tool = make_assessment_tool(engine.repository, manifest=output['evidence'],
+        portfolio=output['portfolio'], hypotheses=foreign_paths)
+    with pytest.raises(ContractViolation, match='different security'):
+        tool.run(assessment(), context)
+    tool = make_assessment_tool(engine.repository, manifest=output['evidence'],
+        portfolio=output['portfolio'], hypotheses=output['scenarios'])
+    value = assessment()
+    value['holdings'][0]['evidence_refs'] = ['equity_price:000001', 'cctv_news:MARKET']
+    with pytest.raises(ContractViolation, match='security-specific'):
+        tool.run(value, context)
+    value = assessment()
+    value['hedges'][0]['evidence_refs'] = ['cctv_news:MARKET']
+    with pytest.raises(ContractViolation, match='hedged security'):
+        tool.run(value, context)
     engine.close()
 
 

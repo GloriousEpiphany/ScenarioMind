@@ -15,7 +15,7 @@ from scenario_engine.agents.model import ToolCallingModel
 from scenario_engine.agents.portfolio_roles import ALGORITHM_VERSION, role_prompts
 from scenario_engine.agents.tools import canonical, fingerprint
 from scenario_engine.errors import ContractViolation, DataUnavailable
-from src.stock_app.market_context import completed_cctv_edition, CONTEXT_VERSION
+from src.stock_app.market_context import completed_cctv_edition, CONTEXT_VERSION, SCOPED_CONTEXT_VERSION
 from src.stock_app.portfolio_research import PortfolioResearch, account_state, DEFAULT_OBJECTIVE, TEAM_VERSION, ROLES
 from src.stock_app.scenario_data_prep import configured_equity_price_source, latest_likely_closed_trading_date
 from src.stock_app.scenario_runtime import load_scenario_environment
@@ -35,7 +35,9 @@ def connect(db_path):
 
 
 def build_request(db_path, account_id, *, objective=DEFAULT_OBJECTIVE, preferences=None, now=None,
-                  price_source=None, max_model_calls=144, max_tool_calls=112):
+                  price_source=None, max_model_calls=144, max_tool_calls=112, cctv_required=False):
+    if type(cctv_required) is not bool:
+        raise ContractViolation('cctv_required must be boolean')
     load_scenario_environment()
     now = now or datetime.now(timezone.utc)
     model, endpoint, key = [str(os.getenv(n) or "").strip() for n in (
@@ -47,7 +49,9 @@ def build_request(db_path, account_id, *, objective=DEFAULT_OBJECTIVE, preferenc
     end_date = latest_likely_closed_trading_date(now)
     profile = configured_public_http_profile()
     source = price_source or configured_equity_price_source()
-    return {"version": TEAM_VERSION, "account_id": account_id, "account_hash": fingerprint(capture),
+    from src.stock_app.research_controller import VERSION, PROMPTS, QUANT_PROMPTS
+    return {"version": VERSION, "controller_prompts_hash": fingerprint({'controller':PROMPTS,'quantitative':QUANT_PROMPTS}),
+        "account_id": account_id, "account_hash": fingerprint(capture),
         "objective": objective, "preferences": preferences or {"horizon": "1至3个月", "risk_tolerance": "中等", "cash_need": "保留应急现金"},
         "start_date": (end_date - timedelta(days=550)).isoformat(), "end_date": end_date.isoformat(),
         "edition": completed_cctv_edition(now).isoformat(), "endpoint_hash": fingerprint(endpoint),
@@ -59,10 +63,11 @@ def build_request(db_path, account_id, *, objective=DEFAULT_OBJECTIVE, preferenc
             "flow": "eastmoney_daily_flow_v1", "financials": "akshare-financial-abstract-v2",
             "flow_transport": profile, "price_transport": profile if source == "eastmoney_http" else "provider_sdk",
             "cctv": "cctv_complete_edition_https_v1", "cctv_transport": "requests_tls_v1",
+            "cctv_required": cctv_required,
             "cctv_page_checkpoint": "same-source-cctv-page-checkpoint-v1",
-            "market": "eastmoney_dual_exchange_context_v1", "context_version": CONTEXT_VERSION,
+            "market": "eastmoney_dual_exchange_context_v1", "context_version": CONTEXT_VERSION if cctv_required else SCOPED_CONTEXT_VERSION,
             "max_task_attempts": 3, "price_request_checkpoint": "same-source-price-request-checkpoint-v1"},
-        "algorithm": ALGORITHM_VERSION, "prompts_hash": fingerprint({r: role_prompts(r) for r in ROLES})}
+        "algorithm": ALGORITHM_VERSION, "prompts_hash": fingerprint({r: role_prompts(r, cctv_required=cctv_required) for r in ROLES})}
 
 
 def enqueue(db_path, request):
@@ -190,17 +195,35 @@ def execute_job(db_path, run_id):
         raise ContractViolation("unknown portfolio research job")
     if job["status"] == "conditional_research_complete":
         _ensure_quantitative_check(db_path, run_id, job['result'], job['request'])
+        _ensure_tracking_worker(db_path, job['result'])
         return job["result"]
     with advisory_lease(db_path, "portfolio-job:" + run_id):
         request = job["request"]
         workflow = None
+        # v1 used different evidence/peer semantics. Preserve finished reports,
+        # but never resume unfinished work by relabelling its frozen contract v2.
+        with sqlite3.connect(db_path) as c:
+            exists = c.execute("SELECT 1 FROM sqlite_master WHERE name='advisory_runs'").fetchone()
+            previous = c.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?',
+                                 ('portfolio-team:'+run_id,)).fetchone() if exists else None
+            retired = request.get('version') == 'portfolio-specialist-team-v1' or (
+                previous and json.loads(previous[0]).get('version') == 'portfolio-specialist-team-v1')
+            if retired:
+                completed = c.execute("SELECT 1 FROM agent_artifacts WHERE run_id=? AND artifact_key='team_result'",
+                                      ('portfolio-team:'+run_id,)).fetchone() if previous else None
+                if not completed:
+                    result = {'run_id':run_id, 'status':'requires_new_request', 'publication_eligible':False,
+                              'reason':'retired_v1_execution_contract', 'resume_with_same_run_id':False,
+                              'message':'旧版未完成研究的执行协议已退休。原证据与预算保留；请按当前目标创建新任务，不能原 ID 改写合同。'}
+                    update_job(db_path, run_id, result['status'], result=result)
+                    return result
         try:
             from openai import OpenAI
             endpoint, key, model_name = [str(os.getenv(n) or "").strip() for n in (
                 "SCENARIO_LLM_API_BASE", "SCENARIO_LLM_API_KEY", "SCENARIO_LLM_MODEL")]
             if (not key or fingerprint(endpoint) != request["endpoint_hash"] or model_name != request["policy"]["model"]
                     or configured_public_http_profile() != request["source_policy"]["flow_transport"]
-                    or fingerprint({r: role_prompts(r) for r in ROLES}) != request["prompts_hash"]):
+                    or fingerprint({r: role_prompts(r, cctv_required=request['source_policy'].get('cctv_required', True)) for r in ROLES}) != request["prompts_hash"]):
                 raise ContractViolation("configuration changed; use a new research request")
             with sqlite3.connect(db_path) as connection:
                 if fingerprint(account_state(connection, request["account_id"])) != request["account_hash"]:
@@ -216,14 +239,27 @@ def execute_job(db_path, run_id):
                     result = revise_portfolio_report(db_path, run_id, findings=correction['findings'], model=model, policy=policy,
                         continuation=correction.get('continuation'))
                 else:
-                    workflow = PortfolioResearch(db_path, model=model,
-                        policy=policy, endpoint_hash=request["endpoint_hash"], source_policy=request["source_policy"])
+                    from src.stock_app.research_controller import ResearchController, VERSION, PROMPTS, QUANT_PROMPTS
+                    options = {}
+                    implementation = PortfolioResearch
+                    if request['version'] == VERSION:
+                        if request.get('controller_prompts_hash') != fingerprint({'controller':PROMPTS,'quantitative':QUANT_PROMPTS}):
+                            raise ContractViolation('controller prompts changed; create a new request')
+                        implementation = ResearchController
+                        refs = request.get('quantitative_input_refs', {})
+                        options = {'quantitative_jobs': request.get('quantitative_jobs') or
+                            {'default': {'panel_ref': refs.get('joint_panel', ''), 'validation_refs': refs}},
+                            'tracking_enabled': request.get('tracking_enabled', True),
+                            'feedback_context': request.get('feedback_context')}
+                    workflow = implementation(db_path, model=model,
+                        policy=policy, endpoint_hash=request["endpoint_hash"], source_policy=request["source_policy"], **options)
                     result = workflow.execute(run_id=run_id, account_id=request["account_id"], objective=request["objective"],
                         start_date=date.fromisoformat(request["start_date"]), end_date=date.fromisoformat(request["end_date"]),
                         edition=date.fromisoformat(request["edition"]), preferences=request["preferences"])
             update_job(db_path, run_id, result["status"], result=result)
             if result['status'] == 'conditional_research_complete':
                 _ensure_quantitative_check(db_path, run_id, result, request)
+                _ensure_tracking_worker(db_path, result)
             return result
         except Exception as exc:
             # Provider exceptions may include credentials. Persist types/codes,
@@ -244,12 +280,22 @@ def execute_job(db_path, run_id):
                 workflow.close()
 
 
+def _ensure_tracking_worker(db_path, result):
+    if result.get('monitoring', {}).get('status') == 'registered':
+        from src.stock_app.research_worker import launch_worker
+        launch_worker(db_path)
+
+
 def _ensure_quantitative_check(db_path, run_id, result, request):
     from src.stock_app.quantitative_validation import latest_quantitative_validation, validate_quantitative_release, VALIDATOR_VERSION
     current = latest_quantitative_validation(db_path, run_id, research_hash=fingerprint(result))
     if (current is None or current.get('validator_version') != VALIDATOR_VERSION
             or current.get('validation_scope') != 'prediction_simulation'):
-        validate_quantitative_release(db_path, run_id, input_refs=request.get('quantitative_input_refs'),
+        refs = dict(request.get('quantitative_input_refs') or {})
+        preparation = result.get('quantitative_preparation') or {}
+        if preparation.get('status') == 'source_bound_total_returns':
+            refs['joint_panel'] = preparation['joint_panel']
+        validate_quantitative_release(db_path, run_id, input_refs=refs or None,
             validation_scope='prediction_simulation')
 
 

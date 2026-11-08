@@ -1,11 +1,13 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 import sqlite3
 
 import pytest
 
 from scenario_engine.agents.contracts import AgentModelPolicy, ToolCall
-from scenario_engine.agents.disclosure_tools import make_disclosure_tools, unread_cited_documents
+from scenario_engine.agents.disclosure_tools import (make_disclosure_tools, unread_cited_documents,
+    make_quoted_hypothesis_tool, unread_hypothesis_quotes)
+from scenario_engine.agents.research_board import ResearchBoard
 from scenario_engine.agents.tools import ToolContext
 from scenario_engine.data import MarketArtifactRepository
 from scenario_engine.errors import ContractViolation, PointInTimeViolation
@@ -76,7 +78,8 @@ def test_full_read_check_requires_every_character_of_latest_cited_original():
     assert unread_cited_documents({'tool_results': results + [chunk(90, 210)]}, manifest) == []
 
 
-def test_real_runtime_freezes_originals_independently_reviews_and_resumes_without_calls(tmp_path):
+@pytest.mark.parametrize('legacy', [False, True])
+def test_real_runtime_freezes_originals_independently_reviews_and_resumes_without_calls(tmp_path, legacy):
     db, coverage, manifest, item = fixture(tmp_path)
     policy = AgentModelPolicy('fixture', 'fixed', 'test-only', 12, 8, 3)
     class Model:
@@ -87,7 +90,9 @@ def test_real_runtime_freezes_originals_independently_reviews_and_resumes_withou
                     'mechanism': 'If the reported action occurs, exposure may change', 'entities': ['002230'],
                     'evidence_refs': [item.artifact_id], 'trigger_conditions': ['Disclosed action occurs'],
                     'invalidation_conditions': ['Action is withdrawn']}
-            self.calls = [ToolCall('index', 'search_evidence', {'offset': 0}),
+            if not legacy:
+                path['evidence_quotes'] = [{'artifact_id': item.artifact_id, 'offset': 0, 'quote': item.payload['content'][:30]}]
+            self.calls = [ToolCall('index', 'search_evidence', {'offset': 0, **({} if legacy else {'query': ''})}),
                 ToolCall('read', 'fetch_document', {'artifact_id': item.artifact_id, 'offset': 0}),
                 ToolCall('paths', 'propose_hypotheses', {'hypotheses': [path, {**path, 'hypothesis_id': 'child', 'parent_id': 'parent'}]}),
                 ToolCall('request', 'request_review', {}),
@@ -95,15 +100,108 @@ def test_real_runtime_freezes_originals_independently_reviews_and_resumes_withou
         def next_call(self, messages, tools):
             return self.calls.pop(0)
     model = Model()
+    if legacy:
+        with sqlite3.connect(db) as c:
+            ResearchBoard(c).register_run('issuer-document-research:new-independent-contract',
+                {'version': 'issuer-document-research-v2-read-gate', 'symbol': '002230', 'coverage_refs': [coverage],
+                 'objective': 'Test source-bound conditional mechanisms', 'policy': asdict(policy),
+                 'transport': model.transport_contract, 'endpoint_hash': 'fixture-endpoint'})
     def run(refs=(coverage,), p=policy):
         return run_issuer_document_research(db, 'new-independent-contract', '002230', refs,
             model=model, policy=p, objective='Test source-bound conditional mechanisms', endpoint_hash='fixture-endpoint',
             clock=lambda: AT+timedelta(seconds=1))
     result = run()
     assert result['status'] == 'research_complete' and not result['publication_eligible']
-    assert result['unread_cited_documents'] == [] and result['probability_status'] == 'uncalibrated'
+    assert result['unread_cited_documents' if legacy else 'hypotheses_with_unread_quotes'] == []
+    assert result['probability_status'] == 'uncalibrated'
+    with sqlite3.connect(db) as c:
+        artifact = MarketArtifactRepository(c).get_visible(result['report_ref'], AT + timedelta(seconds=1))
+        assert artifact.schema_version == ('issuer-document-research-v1' if legacy else 'issuer-document-research-v3-quoted-spans')
     assert not model.calls and run() == result
     with pytest.raises(ContractViolation):
         run(refs=(coverage, 'different'))
     with pytest.raises(ContractViolation):
         run(p=replace(policy, max_model_calls=20))
+
+
+def test_targeted_quotes_require_exact_source_and_actually_read_offsets(tmp_path):
+    db, _, manifest, item = fixture(tmp_path)
+    context = ToolContext('r', 't', AT, 'v', 'h', 'i')
+    with sqlite3.connect(db) as c:
+        repo = MarketArtifactRepository(c)
+        search, fetch = make_disclosure_tools(repo, manifest=manifest, chunk_chars=100, targeted=True)
+        metadata = search.run({'offset': 0, 'query': ''}, context)['result']
+        assert len(metadata['documents']) == 1 and metadata['query'] == ''
+        found = search.run({'offset': 0, 'query': 'counterevidence'}, context)['result']
+        assert found['total_matches'] == 3 and not found['document_text_included']
+        assert all('text' not in match for match in found['documents'])
+        tool = make_quoted_hypothesis_tool(repo, manifest=manifest)
+        path = {'hypothesis_id': 'h1', 'parent_id': None, 'title': 'Conditional action',
+            'mechanism': 'If confirmed, exposure changes', 'entities': ['002230'],
+            'evidence_refs': [item.artifact_id], 'trigger_conditions': ['Confirm action'],
+            'invalidation_conditions': ['Withdraw action'],
+            'evidence_quotes': [{'artifact_id': item.artifact_id, 'offset': 20, 'quote': item.payload['content'][20:50]}]}
+        proposed = tool.run({'hypotheses': [path]}, context)
+        quote = proposed['result']['hypotheses'][0]['evidence_quotes'][0]
+        assert quote['end'] == 50 and quote['payload_hash'] == item.payload_hash
+        assert quote['raw_pdf_sha256'] == item.payload['raw_pdf_sha256']
+        # Reading another portion of the same document is insufficient.
+        wrong_read = fetch.run({'artifact_id': item.artifact_id, 'offset': 100}, context)
+        assert unread_hypothesis_quotes({'tool_results': [wrong_read, proposed]}, manifest) == ['h1']
+        partial_read = fetch.run({'artifact_id': item.artifact_id, 'offset': 0}, context)
+        assert not partial_read['result']['complete_document']
+        assert unread_hypothesis_quotes({'tool_results': [partial_read, proposed]}, manifest) == []
+        # An exact quote at a wrong location or with an altered source identity is rejected.
+        bad = {**path, 'evidence_quotes': [{**path['evidence_quotes'][0], 'offset': 21}]}
+        from scenario_engine.errors import ToolArgumentRejected
+        with pytest.raises(ToolArgumentRejected, match='declared offset'):
+            tool.run({'hypotheses': [bad]}, context)
+        altered = {**partial_read, 'result': {**partial_read['result'], 'payload_hash': 'wrong'}}
+        assert unread_hypothesis_quotes({'tool_results': [altered, proposed]}, manifest) == ['h1']
+
+
+@pytest.mark.parametrize('gap', ['unread_quote', 'unindexed_document'])
+def test_runtime_rejects_critic_approval_until_original_read_gap_is_repaired(tmp_path, gap):
+    from scenario_engine.agents.runtime import AgentRuntime
+    db, _, manifest, item = fixture(tmp_path)
+    policy = AgentModelPolicy('fixture', 'fixed', 'test-only', 16, 10, 4)
+    path = {'hypothesis_id': 'h1', 'parent_id': None, 'title': 'Conditional action',
+        'mechanism': 'If confirmed, exposure changes', 'entities': ['002230'],
+        'evidence_refs': [item.artifact_id], 'trigger_conditions': ['Confirm action'],
+        'invalidation_conditions': ['Withdraw action'],
+        'evidence_quotes': [{'artifact_id': item.artifact_id, 'offset': 20, 'quote': item.payload['content'][20:50]}]}
+    class Model:
+        transport_contract = {'profile': 'fixture'}
+        def __init__(self):
+            self.policy = policy
+            repair = (ToolCall('repair', 'fetch_document', {'artifact_id': item.artifact_id, 'offset': 0})
+                if gap == 'unread_quote' else ToolCall('repair', 'search_evidence', {'offset': 0, 'query': ''}))
+            self.calls = [
+                ToolCall('index', 'search_evidence', {'offset': 0, 'query': '' if gap == 'unread_quote' else 'counterevidence'}),
+                ToolCall('read', 'fetch_document', {'artifact_id': item.artifact_id, 'offset': 100 if gap == 'unread_quote' else 0}),
+                ToolCall('paths', 'propose_hypotheses', {'hypotheses': [path]}),
+                ToolCall('request', 'request_review', {}),
+                ToolCall('wrong-approval', 'submit_review', {'passed': True, 'findings': ['Claims approved'], 'blocking_findings': []}),
+                repair, ToolCall('request-again', 'request_review', {}),
+                ToolCall('approval', 'submit_review', {'passed': True, 'findings': ['Original gap repaired'], 'blocking_findings': []})]
+        def next_call(self, messages, tools):
+            return self.calls.pop(0)
+    model = Model()
+    with sqlite3.connect(db) as c:
+        repo = MarketArtifactRepository(c)
+        tools = (*make_disclosure_tools(repo, manifest=manifest, chunk_chars=100, targeted=True),
+            make_quoted_hypothesis_tool(repo, manifest=manifest))
+        runtime = AgentRuntime(db_path=db, model=model, policy=policy, tools=tools)
+        try:
+            result = runtime.execute(run_id='quoted-gap', objective='Test evidence review gates', as_of=AT,
+                context={'required_quoted_document_manifest': manifest,
+                    'required_tools': ['search_evidence', 'fetch_document', 'propose_hypotheses']})
+        finally:
+            runtime.close()
+    assert result['status'] == 'research_complete' and not model.calls
+    first, last = result['critic_reviews']
+    assert first['model_decision'] is True and first['accepted'] is False
+    assert first['unread_cited_documents' if gap == 'unread_quote' else 'unindexed_documents'] == (
+        ['h1'] if gap == 'unread_quote' else [item.artifact_id])
+    assert last['accepted'] is True
+    assert last['unread_cited_documents'] == last['unindexed_documents'] == []

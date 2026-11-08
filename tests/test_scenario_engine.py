@@ -1862,10 +1862,10 @@ class ScenarioEngineTestCase(unittest.TestCase):
     def test_phase0_golden_scenario_assets_are_present_and_parseable(self):
         fixtures = get_golden_scenarios()
         self.assertEqual(len(fixtures), 10)
-        with open("Docs/scenario_lab_golden_scenarios.json", encoding="utf-8") as fh:
+        with open("Docs/情景实验标准样例.json", encoding="utf-8") as fh:
             doc_fixtures = json.load(fh)
         self.assertEqual(len(doc_fixtures), 10)
-        self.assertTrue(os.path.exists("Docs/scenario_lab_sample_report.md"))
+        self.assertTrue(os.path.exists("Docs/情景实验报告样例.md"))
         parser = ScenarioParser()
         for item in fixtures:
             with self.subTest(item=item["query"]):

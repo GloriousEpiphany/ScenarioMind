@@ -47,15 +47,18 @@ class ApprovedTool:
     validate_result: Callable
     critic_allowed: bool = False
     read_only: bool = True
+    internal_ledger_only: bool = False
 
     def __post_init__(self):
         allowed = {"search_evidence", "fetch_document", "query_pit_data", "build_universe",
                    "estimate_exposure", "simulate_paths", "optimize_portfolio", "validate_proposal", "register_monitor",
-                   "propose_hypotheses", "record_assessment"}
+                   "propose_hypotheses", "record_assessment", "record_plan", "run_specialist"}
         if self.name not in allowed or not self.version or not self.description:
             raise ContractViolation("only explicitly approved, versioned research tools may be registered")
         if self.critic_allowed and not self.read_only:
             raise ContractViolation("independent critic tools must be read-only")
+        if self.internal_ledger_only and self.read_only:
+            raise ContractViolation('ledger effects must be declared as mutations')
         if self.parameters.get("type") != "object" or self.parameters.get("additionalProperties") is not False:
             raise ContractViolation("tool schema must reject unknown arguments")
         if not all(callable(item) for item in (self.execute, self.validate_arguments, self.validate_result)):

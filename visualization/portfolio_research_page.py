@@ -96,6 +96,8 @@ def show_portfolio_research_page():
         risk = st.selectbox("风险承受", ["中等", "谨慎", "较高"], key="portfolio_risk")
         cash = st.text_input("现金安排", value="保留应急现金", key="portfolio_cash_need")
         objective = st.text_area("研究重点", value=DEFAULT_OBJECTIVE, key="portfolio_objective")
+        cctv_required = st.checkbox("本次必须分析完整《新闻联播》", value=False,
+            help="普通研究按相关性使用新闻；勾选后，节目资料不完整时会停止本次研究。")
     preferences = {"horizon": horizon, "risk_tolerance": risk, "cash_need": cash}
     controls = st.columns([3, 1])
     automatic = controls[0].toggle("打开本页时自动分析最新持仓", value=st.session_state.get("portfolio_autostart", True), key="portfolio_autostart",
@@ -112,7 +114,8 @@ def show_portfolio_research_page():
             cols = st.columns(2)
             budgets["max_model_calls"] = int(cols[0].number_input("新任务模型调用上限", min_value=24, value=int(latest["request"]["policy"]["max_model_calls"]), step=12))
             budgets["max_tool_calls"] = int(cols[1].number_input("新任务工具核对上限", min_value=1, value=int(latest["request"]["policy"]["max_tool_calls"]), step=8))
-        request = build_request(config.DATABASE_PATH, selected, objective=objective, preferences=preferences, **budgets)
+        request = build_request(config.DATABASE_PATH, selected, objective=objective, preferences=preferences,
+                                cctv_required=cctv_required, **budgets)
         if st.session_state.get("portfolio_refresh_at"):
             request["requested_refresh_at"] = st.session_state["portfolio_refresh_at"]
         current = latest and fingerprint(latest["request"]) == fingerprint(request)
@@ -202,7 +205,9 @@ def _render_job_snapshot(db_path, run_id, expected_request_hash):
             st.caption(job["error"]["error_type"] + " · " + job["error"]["error_code"])
         with st.expander("失败记录"):
             st.json(job["error"] or result)
-        if status != "budget_exhausted" and st.button("从失败处重试", key="retry:" + run_id):
+        if status == 'requires_new_request':
+            st.info(result['message'])
+        if status not in {"budget_exhausted", "requires_new_request"} and st.button("从失败处重试", key="retry:" + run_id):
             start_worker(db_path, run_id)
             st.rerun()
         if status == "budget_exhausted":
@@ -211,6 +216,8 @@ def _render_job_snapshot(db_path, run_id, expected_request_hash):
 
 
 def render_report(result, db_path):
+    if result.get('evidence_gaps'):
+        st.warning('本次未取得完整《新闻联播》资料。相关节目与政策事实不能据此确认；结论限于已核验的证据。')
     report = result["assessment"]["assessment"]
     st.subheader("综合判断")
     portfolio = result["portfolio"]
