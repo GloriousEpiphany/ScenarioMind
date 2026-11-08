@@ -206,7 +206,7 @@ def test_reserved_critic_capacity_reviews_existing_candidate_without_expanding_b
     child = json.loads(engine.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?', (root + ':portfolio:reserved-review',)).fetchone()[0])
     assert child['reserved_review_handoff']['source_hash'] == fingerprint(parent)
     assert engine.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_model'", (root,)).fetchone()[0] == 18
-    assert engine.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_tool'", (root,)).fetchone()[0] == 4
+    assert engine.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_tool'", (root,)).fetchone()[0] == 1
     cache = engine.connection.execute("SELECT payload_json FROM agent_artifacts WHERE run_id=? AND artifact_key LIKE 'shared-read:%'", (root + ':portfolio:reserved-review',)).fetchall()
     assert len(cache) == 1 and json.loads(cache[0][0])['source_run'] == 'portfolio-team:test:sentiment'
     assert child['policy']['max_model_calls'] == 24 and child['policy']['max_tool_calls'] == 16

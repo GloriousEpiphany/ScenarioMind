@@ -92,3 +92,13 @@ def test_maturity_audit_runs_before_close_without_issuing_or_advancing_time(tmp_
     assert result[0]['status']=='audit_completed' and result[0]['forecast_issued'] is False
     assert result[0]['maturity_audit']['status']=='blocked'
     assert audit_forward_watches(db,clock=lambda:at)==[]
+def test_background_monitor_does_not_start_new_model_budgets_without_opt_in(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from src.stock_app.research_worker import launch_worker
+    commands = []
+    monkeypatch.setattr(subprocess, 'Popen', lambda command, **kw: commands.append(command) or SimpleNamespace(pid=42))
+    assert launch_worker(tmp_path / 'monitor.db') == 42
+    assert '--execute-feedback' not in commands[-1]
+    assert launch_worker(tmp_path / 'monitor.db', execute_feedback=True) == 42
+    assert '--execute-feedback' in commands[-1]

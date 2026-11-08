@@ -401,7 +401,7 @@ def portfolio_analysis_command(db_path, account_id, run_id, objective, require_c
                 max_model_calls=max_model_calls if max_model_calls is not None else 144,
                 max_tool_calls=max_tool_calls if max_tool_calls is not None else 112)
             run_id = enqueue(path, request)
-        elif any(value is not None for value in (account_id, objective, price_source, max_model_calls, max_tool_calls)):
+        elif require_cctv or any(value is not None for value in (account_id, objective, price_source, max_model_calls, max_tool_calls)):
             raise click.ClickException('恢复任务只需 --run-id；不能覆盖冻结参数')
         console.print(f'持仓研究任务：{run_id}')
         result = execute_job(path, run_id)

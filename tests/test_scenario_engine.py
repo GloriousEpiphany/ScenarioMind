@@ -1880,8 +1880,10 @@ class ScenarioEngineTestCase(unittest.TestCase):
         self.assertIn("python_executable", status)
         self.assertIn("packages", status)
         self.assertIn("full_external_runtime_available", status)
-        for package in ["pytest", "langgraph", "deepeval", "ragas", "opentelemetry"]:
+        for package in ["langgraph", "langsmith", "openai", "akshare", "curl_cffi", "gurobipy"]:
             self.assertIn(package, status["packages"])
+        self.assertNotIn("pytest", status["packages"])
+        self.assertIn("advisory_runtime_error", status)
 
     def test_v2_research_repository_saves_and_searches_real_documents(self):
         engine = ScenarioEngine(self.db_path, persist=False)

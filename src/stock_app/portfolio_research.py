@@ -9,6 +9,7 @@ from datetime import date, datetime, timezone
 import sqlite3
 
 from scenario_engine.agents.deductive_tools import make_hypothesis_tool
+from scenario_engine.agents.dependencies import require_advisory_runtime
 from scenario_engine.agents.lease import advisory_lease
 from scenario_engine.agents.pit_tools import make_frozen_pit_query_tool
 from scenario_engine.agents.portfolio_assessment import make_assessment_tool
@@ -101,6 +102,8 @@ class PortfolioResearch:
             if saved is not None:
                 from src.stock_app.portfolio_report_revision import latest_report
                 return latest_report(self.connection, run_id, saved)
+            if not prepare_only:
+                require_advisory_runtime()
             capture = self.board.load(root, "account_capture", contract)
             if capture is None:
                 capture = account_state(self.connection, account_id)
@@ -380,11 +383,12 @@ class PortfolioResearch:
                 return self.tool.run(args, context)
 
         runtime = AgentRuntime(db_path=self.db_path, model=BudgetedModel(), policy=self.policy,
-            tools=tuple(BudgetedTool(t) for t in tools), role_prompts=role_prompts(role, cctv_required=cctv_required))
+            tools=tuple(BudgetedTool(t) for t in tools), role_prompts=role_prompts(role, cctv_required=cctv_required),
+            repair_protocol=True)
         try:
             result = runtime.execute(run_id=root + ":" + role + (":reserved-review" if reserved_review else ""),
                 review_from_run=root + ":" + role if reserved_review else None, objective=contract["objective"],
-                shared_read_runs=tuple(peer['run_id'] for peer in peers.values()) if reserved_review else (),
+                shared_read_runs=tuple(peer['run_id'] for peer in peers.values()),
                 as_of=datetime.fromisoformat(frozen["as_of"]), context={"specialist_role": role,
                     "symbols": symbols, "portfolio": model_portfolio, "preferences": preferences,
                     "model_endpoint_hash": self.endpoint_hash, "required_evidence": required,

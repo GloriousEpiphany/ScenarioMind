@@ -5,7 +5,7 @@ import json
 from scenario_engine.agents.planning import ResearchPlan, REQUIRED_TASKS, plan_schema
 from scenario_engine.agents.quantitative_tools import make_quantitative_tools, QuantToolPolicy
 from scenario_engine.agents.runtime import AgentRuntime
-from scenario_engine.agents.tools import ApprovedTool, ToolContext, fingerprint
+from scenario_engine.agents.tools import ApprovedTool
 from scenario_engine.errors import ContractViolation
 from src.stock_app.portfolio_research import PortfolioResearch, TeamBudgetExhausted, ROLES
 from src.stock_app.research_tracking import register_watch
@@ -78,7 +78,18 @@ class ResearchController(PortfolioResearch):
             start = min(next(iter(dates.values())))
             end = date.fromisoformat(contract['end_date'])
             for symbol in symbols:
-                markets[symbol] = prepare_forecast_market(self.db_path, root + ':quant:' + symbol, symbol, start, end, clock=self.clock)
+                attempts = self.source_policy.get('max_task_attempts', 3)
+                for attempt in range(1, attempts + 1):
+                    markets[symbol] = prepare_forecast_market(
+                        self.db_path, root + ':quant:' + symbol, symbol, start, end, clock=self.clock)
+                    failed_sources = sorted(set(markets[symbol].get('failures', {})) - {'panel'})
+                    if markets[symbol]['status'] == 'source_bound_total_returns' or not failed_sources or attempt == attempts:
+                        break
+                    # Reuse this acquisition's successful source checkpoints.
+                    # A failed transport read must not freeze an empty experiment
+                    # before the request's existing same-source retries are spent.
+                    self.event(run_id, 'quantitative_acquisition', 'retrying', symbol=symbol,
+                               attempt=attempt, failed_components=failed_sources)
                 if markets[symbol]['status'] != 'source_bound_total_returns':
                     raise DataUnavailable('quantitative acquisition is incomplete for ' + symbol)
             prices = set()
@@ -188,7 +199,7 @@ class ResearchController(PortfolioResearch):
                         return self.tool.run(arguments, ctx)
 
                 quant_runtime = AgentRuntime(db_path=parent.db_path,model=QuantModel(),policy=parent.policy,
-                    tools=tuple(QuantTool(t) for t in quant_tools),role_prompts=QUANT_PROMPTS)
+                    tools=tuple(QuantTool(t) for t in quant_tools),role_prompts=QUANT_PROMPTS, repair_protocol=True)
                 try:
                     stage = quant_runtime.execute(run_id=root + ':quantitative', objective=task['question'],
                         as_of=datetime.fromisoformat(frozen['as_of']), context={'specialist_role':'quantitative',
@@ -233,7 +244,8 @@ class ResearchController(PortfolioResearch):
                 {'type':'object','properties':{'task_id':{'type':'string','enum':list(REQUIRED_TASKS)}},
                  'required':['task_id'],'additionalProperties':False},
                 bounded(run), valid_task, lambda r,c: None, read_only=False, internal_ledger_only=True))
-        runtime = AgentRuntime(db_path=self.db_path, model=BudgetedModel(), policy=self.policy, tools=tools, role_prompts=PROMPTS)
+        runtime = AgentRuntime(db_path=self.db_path, model=BudgetedModel(), policy=self.policy, tools=tools,
+                               role_prompts=PROMPTS, repair_protocol=True)
         try:
             result = runtime.execute(run_id=root + ':controller', objective=contract['objective'],
                 as_of=datetime.fromisoformat(frozen['as_of']), context={'required_tools':['record_plan','run_specialist'],

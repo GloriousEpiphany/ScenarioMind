@@ -155,18 +155,22 @@ def test_model_interruption_reuses_frozen_inputs_and_resumes_graph(tmp_path):
     pipeline.close()
 
 
-def test_critic_cannot_approve_missing_required_dataset(tmp_path):
-    pipeline, _ = setup_pipeline(tmp_path, Model(evidence_calls()[:1] + review_calls() + [RuntimeError("stop")]))
+def test_missing_required_dataset_blocks_review_and_survives_resume(tmp_path):
+    pipeline, _ = setup_pipeline(tmp_path, Model(evidence_calls()[:1] + review_calls()[:-1] + [RuntimeError("stop")]))
     with pytest.raises(RuntimeError, match="stop"):
         run(pipeline)
     row = pipeline.connection.execute("SELECT checkpoint FROM checkpoints ORDER BY checkpoint_id DESC LIMIT 1").fetchone()
     assert row is not None
-    # Reopen with enough budget and all remaining evidence; the first critique
-    # must still record its deterministic coverage rejection.
+    # Coverage rejection is audited before any critic call, and resume must
+    # read the remaining frozen evidence before independent approval.
+    import json
+    feedback = json.loads(pipeline.connection.execute(
+        "SELECT payload_json FROM agent_artifacts WHERE artifact_key LIKE 'review-preflight:%'"
+    ).fetchone()[0])
+    assert len(feedback['review_preflight']['missing_required_evidence']) == 5
     pipeline.model = Model(evidence_calls()[1:] + review_calls())
     result = run(pipeline)
-    assert not result["critic_reviews"][0]["accepted"]
-    assert len(result["critic_reviews"][0]["missing_required_evidence"]) == 5
+    assert [review['accepted'] for review in result['critic_reviews']] == [True]
     pipeline.close()
 
 

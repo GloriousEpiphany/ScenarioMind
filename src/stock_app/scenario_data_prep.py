@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo
 
 from scenario_engine.data import (
     AvailabilityStatus,
-    DataRequest,
     MarketArtifactRepository,
     TuShareAdapter,
 )

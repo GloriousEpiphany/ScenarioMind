@@ -167,6 +167,9 @@ def _render_job_snapshot(db_path, run_id, expected_request_hash):
     if status == "superseded":
         st.info("这次尚未执行的请求已合并到更新的持仓或投资偏好任务中。")
     elif status == "conditional_research_complete":
+        if job.get("error"):
+            st.warning("报告已完成，但后续验证或跟踪启动失败；具体原因如下。")
+            st.json(job["error"])
         render_report(job["result"], db_path)
     elif status in {"queued", "running"}:
         st.info("任务已排队，轮到后会自动开始。你可以离开页面。" if status == "queued" else "正在采集与研究。你可以离开页面；后台任务和证据会继续保存。")

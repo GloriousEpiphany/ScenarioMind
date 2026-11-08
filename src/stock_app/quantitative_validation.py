@@ -3,7 +3,6 @@
 No evidence ID, calibrated metric, broker term or solver result is fabricated
 when an acquisition provider does not supply a required typed artifact.
 """
-from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 import sqlite3

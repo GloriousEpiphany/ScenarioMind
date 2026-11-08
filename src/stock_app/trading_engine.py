@@ -2,7 +2,7 @@
 交易引擎模块
 """
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple
 from rich.console import Console
 from rich.table import Table
 

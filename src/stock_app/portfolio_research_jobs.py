@@ -10,11 +10,12 @@ import sys
 from uuid import uuid4
 
 from scenario_engine.agents.contracts import AgentModelPolicy
+from scenario_engine.agents.dependencies import require_advisory_runtime
 from scenario_engine.agents.lease import advisory_lease
 from scenario_engine.agents.model import ToolCallingModel
 from scenario_engine.agents.portfolio_roles import ALGORITHM_VERSION, role_prompts
 from scenario_engine.agents.tools import canonical, fingerprint
-from scenario_engine.errors import ContractViolation, DataUnavailable
+from scenario_engine.errors import ContractViolation, DataUnavailable, RuntimeUnavailable
 from src.stock_app.market_context import completed_cctv_edition, CONTEXT_VERSION, SCOPED_CONTEXT_VERSION
 from src.stock_app.portfolio_research import PortfolioResearch, account_state, DEFAULT_OBJECTIVE, TEAM_VERSION, ROLES
 from src.stock_app.scenario_data_prep import configured_equity_price_source, latest_likely_closed_trading_date
@@ -36,6 +37,7 @@ def connect(db_path):
 
 def build_request(db_path, account_id, *, objective=DEFAULT_OBJECTIVE, preferences=None, now=None,
                   price_source=None, max_model_calls=144, max_tool_calls=112, cctv_required=False):
+    require_advisory_runtime()
     if type(cctv_required) is not bool:
         raise ContractViolation('cctv_required must be boolean')
     load_scenario_environment()
@@ -130,6 +132,7 @@ def start_worker(db_path, run_id):
     job = load_job(db_path, run_id=run_id)
     if job is None:
         raise ContractViolation("cannot launch an unknown research job")
+    require_advisory_runtime()
     with sqlite3.connect(db_path, timeout=30) as connection:
         exists = connection.execute("SELECT 1 FROM sqlite_master WHERE name='advisory_leases'").fetchone()
         lease = connection.execute("SELECT expires_at FROM advisory_leases WHERE run_id=?",
@@ -193,10 +196,6 @@ def execute_job(db_path, run_id):
     job = load_job(db_path, run_id=run_id)
     if job is None:
         raise ContractViolation("unknown portfolio research job")
-    if job["status"] == "conditional_research_complete":
-        _ensure_quantitative_check(db_path, run_id, job['result'], job['request'])
-        _ensure_tracking_worker(db_path, job['result'])
-        return job["result"]
     with advisory_lease(db_path, "portfolio-job:" + run_id):
         request = job["request"]
         workflow = None
@@ -209,16 +208,33 @@ def execute_job(db_path, run_id):
             retired = request.get('version') == 'portfolio-specialist-team-v1' or (
                 previous and json.loads(previous[0]).get('version') == 'portfolio-specialist-team-v1')
             if retired:
-                completed = c.execute("SELECT 1 FROM agent_artifacts WHERE run_id=? AND artifact_key='team_result'",
+                completed = c.execute("SELECT payload_json FROM agent_artifacts WHERE run_id=? AND artifact_key='team_result'",
                                       ('portfolio-team:'+run_id,)).fetchone() if previous else None
-                if not completed:
-                    result = {'run_id':run_id, 'status':'requires_new_request', 'publication_eligible':False,
-                              'reason':'retired_v1_execution_contract', 'resume_with_same_run_id':False,
-                              'message':'旧版未完成研究的执行协议已退休。原证据与预算保留；请按当前目标创建新任务，不能原 ID 改写合同。'}
+                if completed:
+                    # A saved v1 report is an archive, not permission to run v2
+                    # prompts or current postprocessing against its old contract.
+                    result = json.loads(completed[0])
                     update_job(db_path, run_id, result['status'], result=result)
                     return result
+                result = {'run_id':run_id, 'status':'requires_new_request', 'publication_eligible':False,
+                          'reason':'retired_v1_execution_contract', 'resume_with_same_run_id':False,
+                          'message':'旧版未完成研究的执行协议已退休。原证据与预算保留；请按当前目标创建新任务，不能原 ID 改写合同。'}
+                update_job(db_path, run_id, result['status'], result=result)
+                return result
+        stage = "post_research" if job["status"] == "conditional_research_complete" else "runtime_preflight"
         try:
+            if stage == "post_research":
+                result = job["result"]
+                _ensure_quantitative_check(db_path, run_id, result, request)
+                _ensure_tracking_worker(db_path, result)
+                update_job(db_path, run_id, result["status"], result=result)
+                return result
+            require_advisory_runtime()
             from openai import OpenAI
+            from src.stock_app.research_controller import ResearchController, VERSION, PROMPTS, QUANT_PROMPTS
+            stage = "request_validation"
+            if request['version'] not in {TEAM_VERSION, VERSION}:
+                raise ContractViolation('unsupported research request version; create a new request')
             endpoint, key, model_name = [str(os.getenv(n) or "").strip() for n in (
                 "SCENARIO_LLM_API_BASE", "SCENARIO_LLM_API_KEY", "SCENARIO_LLM_MODEL")]
             if (not key or fingerprint(endpoint) != request["endpoint_hash"] or model_name != request["policy"]["model"]
@@ -236,10 +252,10 @@ def execute_job(db_path, run_id):
                 with sqlite3.connect(db_path) as connection:
                     correction = pending_revision(connection, run_id)
                 if correction:
+                    stage = "report_revision"
                     result = revise_portfolio_report(db_path, run_id, findings=correction['findings'], model=model, policy=policy,
                         continuation=correction.get('continuation'))
                 else:
-                    from src.stock_app.research_controller import ResearchController, VERSION, PROMPTS, QUANT_PROMPTS
                     options = {}
                     implementation = PortfolioResearch
                     if request['version'] == VERSION:
@@ -251,12 +267,14 @@ def execute_job(db_path, run_id):
                             {'default': {'panel_ref': refs.get('joint_panel', ''), 'validation_refs': refs}},
                             'tracking_enabled': request.get('tracking_enabled', True),
                             'feedback_context': request.get('feedback_context')}
+                    stage = "research"
                     workflow = implementation(db_path, model=model,
                         policy=policy, endpoint_hash=request["endpoint_hash"], source_policy=request["source_policy"], **options)
                     result = workflow.execute(run_id=run_id, account_id=request["account_id"], objective=request["objective"],
                         start_date=date.fromisoformat(request["start_date"]), end_date=date.fromisoformat(request["end_date"]),
                         edition=date.fromisoformat(request["edition"]), preferences=request["preferences"])
             update_job(db_path, run_id, result["status"], result=result)
+            stage = "post_research"
             if result['status'] == 'conditional_research_complete':
                 _ensure_quantitative_check(db_path, run_id, result, request)
                 _ensure_tracking_worker(db_path, result)
@@ -265,15 +283,23 @@ def execute_job(db_path, run_id):
             # Provider exceptions may include credentials. Persist types/codes,
             # never raw response bodies or exception strings.
             error = {"error_type": type(exc).__name__, "error_code": getattr(exc, "code", "research_failed"),
-                     "message": "任务未完成，已保存成功检查点；没有切源、换模型或生成替代结果。"}
+                     "message": "任务未完成；已写入的检查点会保留，可在修复原因后恢复。"}
             context = getattr(exc, "context", {}) or {}
             safe_keys = {"error_type", "http_status", "choice_count", "finish_reason", "tool_call_count",
-                         "requested_model", "returned_model"}
+                         "requested_model", "returned_model", "component", "requirements_file", "python_executable", "protocol_error"}
             error["diagnostics"] = {k: v for k, v in context.items() if k in safe_keys
                 and (v is None or isinstance(v, (int, bool)) or isinstance(v, str) and len(v) <= 160)}
+            error["diagnostics"]["stage"] = stage
+            if isinstance(exc, RuntimeUnavailable):
+                error["message"] = str(exc)
             if error["diagnostics"].get("http_status") == 402:
                 error["message"] = "模型服务返回 HTTP 402。请检查 API 账户余额，补充后从断点重试；已通过的研究与证据不会重复执行。"
-            update_job(db_path, run_id, "failed", error=error)
+            if stage == "post_research":
+                # Validation/worker launch failure must not erase the completed report.
+                error["message"] = "研究报告已完成；后续验证或跟踪启动失败，可恢复原任务重试。"
+                update_job(db_path, run_id, result["status"], result=result, error=error)
+            else:
+                update_job(db_path, run_id, "failed", error=error)
             raise
         finally:
             if workflow is not None:

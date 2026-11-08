@@ -96,6 +96,91 @@ def test_plan_cannot_remove_dependencies_or_roles():
         ResearchPlan.from_payload(payload)
 
 
+def test_quantitative_research_review_keeps_publication_blocks_without_looping(tmp_path):
+    seen = []
+    class ScopeModel(PlanningModel):
+        def next_call(self, messages, descriptors):
+            payload = json.loads(messages[1]['content'])
+            if payload['context'].get('specialist_role') == 'quantitative' and any(
+                    d['function']['name'] == 'submit_review' for d in descriptors):
+                seen.append(payload['research_review_scope'])
+                assert all(r['result']['status'] == 'blocked' for r in payload['tool_evidence'])
+            return super().next_call(messages, descriptors)
+    engine, _, _ = controller(tmp_path)
+    engine.model = ScopeModel()
+    try:
+        result = run(engine)
+        assert result['status'] == 'conditional_research_complete' and not result['publication_eligible']
+        assert len(seen) == 1 and seen[0]['decision_target'] == 'conditional_research_completion'
+        assert seen[0]['path_quantiles']['levels'] == [.1, .5, .9]
+        assert seen[0]['path_quantiles']['keys'] == 'horizon_in_trading_steps'
+        assert all(r['result']['status'] == 'blocked' for r in result['quantitative_tools'])
+        assert engine.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='model'",
+            ('portfolio-team:test:quantitative',)).fetchone()[0] == 6
+        amendment = json.loads(engine.connection.execute(
+            "SELECT payload_json FROM agent_artifacts WHERE artifact_key='review-scope-amendment'"
+        ).fetchone()[0])
+        assert not amendment['publication_gate_changed'] and not amendment['budget_reset']
+    finally:
+        engine.close()
+
+
+def test_unregistered_stop_conditions_are_repaired_before_any_plan_is_recorded(tmp_path):
+    class RepairingPlanModel(PlanningModel):
+        def next_call(self, messages, descriptors):
+            context = json.loads(messages[1]['content'])['context']
+            if 'specialist_role' not in context and not any(d['function']['name'] == 'submit_review' for d in descriptors):
+                count = sum(m['role'] == 'assistant' for m in messages)
+                if count == 0:
+                    wrong = plan()
+                    wrong['stop_conditions'].append('invented_completion_rule')
+                    return ToolCall('invalid-plan', 'record_plan', wrong)
+                if count == 1:
+                    rejected = json.loads(messages[-1]['content'])
+                    assert rejected['input_rejected_before_read']
+                    assert 'must contain exactly' in rejected['message']
+                    return ToolCall('correct-plan', 'record_plan', plan())
+                # The scripted scheduler ignores its rejected planning turn.
+                messages = [*messages[:2], *messages[4:]]
+            return super().next_call(messages, descriptors)
+    engine, _, _ = controller(tmp_path)
+    engine.model = RepairingPlanModel()
+    try:
+        result = run(engine)
+        assert result['status'] == 'conditional_research_complete'
+        assert len(result['research_plans']) == 1
+        assert result['research_plans'][0]['stop_conditions'] == sorted(plan()['stop_conditions'])
+        assert result['controller_review'][-1]['accepted']
+    finally:
+        engine.close()
+
+
+def test_review_scope_upgrade_replays_committed_legacy_decision_without_spending_again(tmp_path, monkeypatch):
+    from scenario_engine.agents.runtime import AgentRuntime
+    from scenario_engine.agents.research_board import ResearchBoard
+    engine, _, _ = controller(tmp_path)
+    original_save = ResearchBoard.save
+    quant_run = 'portfolio-team:test:quantitative'
+    def crash_after_decision(board, run_id, key, request, payload):
+        original_save(board, run_id, key, request, payload)
+        if run_id == quant_run and key == 'decision:0':
+            raise RuntimeError('crash after legacy decision commit')
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(AgentRuntime, '_review_scope', staticmethod(lambda state: None))
+            patch.setattr(ResearchBoard, 'save', crash_after_decision)
+            with pytest.raises(RuntimeError, match='legacy decision commit'):
+                run(engine)
+        before = engine.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?', (quant_run,)).fetchone()[0]
+        result = run(engine)
+        assert result['status'] == 'conditional_research_complete'
+        assert engine.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?', (quant_run,)).fetchone()[0] == before
+        assert dict(engine.connection.execute('SELECT kind,COUNT(*) FROM agent_call_attempts WHERE run_id=? GROUP BY kind',
+                                             (quant_run,))) == {'model': 6, 'tool': 4}
+    finally:
+        engine.close()
+
+
 def test_final_validation_receives_automatically_prepared_panel(monkeypatch):
     from src.stock_app.portfolio_research_jobs import _ensure_quantitative_check
     captured=[]

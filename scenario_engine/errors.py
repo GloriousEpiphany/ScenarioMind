@@ -43,6 +43,10 @@ class DataUnavailable(ScenarioEngineError):
     code = "data_unavailable"
 
 
+class RuntimeUnavailable(ScenarioEngineError):
+    code = "runtime_unavailable"
+
+
 class DataConflict(ScenarioEngineError):
     code = "data_conflicted"
 

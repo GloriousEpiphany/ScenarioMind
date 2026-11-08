@@ -28,14 +28,11 @@ from visualization.agent_charts import (
     create_stock_profit_pie_chart, create_stock_pool_comparison_chart,
     create_stock_performance_table
 )
-from visualization.agent_config_manager import AgentConfigManager
-from visualization.agent_runner import AgentRunner
 from visualization.agent_simulator_page import show_agent_simulator_page
 from visualization.scenario_page import show_scenario_page
 from src.stock_app.data_downloader import DataDownloader
 from src.stock_app.database import Database
 import time
-import plotly.graph_objects as go
 
 # 常用指数定义（使用SH/SZ前缀区分市场，避免与股票代码冲突）
 COMMON_INDICES = {

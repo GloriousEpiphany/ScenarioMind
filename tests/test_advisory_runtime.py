@@ -71,9 +71,11 @@ def test_dynamic_tool_loop_independent_critic_and_persistent_reopen(tmp_path):
     reopened.close()
 
 
-def test_malformed_parallel_calls_are_rejected_then_repaired_with_budget_counted(tmp_path):
+@pytest.mark.parametrize('context', [{'tool_call_count': 2}, {'protocol_error': 'invalid_tool_arguments_json'},
+                                   {'protocol_error': 'invalid_tool_call'}])
+def test_malformed_calls_are_rejected_then_repaired_with_budget_counted(tmp_path, context):
     p=policy()
-    model=ScriptedModel(p,[ContractViolation('multiple calls',context={'tool_call_count':2}),
+    model=ScriptedModel(p,[ContractViolation('malformed response',context=context),
         ToolCall('1','search_evidence',{'query':'original'}),ToolCall('2','request_review',{}),
         ToolCall('3','submit_review',{'passed':True,'findings':['Inspected'],'blocking_findings':[]})])
     runtime=AgentRuntime(db_path=tmp_path/'repair.db',model=model,policy=p,tools=(tool(),),repair_protocol=True)
@@ -83,6 +85,38 @@ def test_malformed_parallel_calls_are_rejected_then_repaired_with_budget_counted
         assert runtime.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE kind='model'").fetchone()[0]==4
         assert runtime.connection.execute("SELECT COUNT(*) FROM agent_artifacts WHERE artifact_key LIKE 'protocol-rejection:%'").fetchone()[0]==1
     finally:runtime.close()
+
+
+def test_v3_protocol_recovery_preserves_contract_tools_and_spent_budget(tmp_path):
+    import json
+    path = tmp_path / 'legacy-protocol.db'
+    p = policy()
+    executed = []
+    original_tool = tool(lambda args, context: executed.append(args['query']) or {'evidence': [args['query']]})
+    old = AgentRuntime(db_path=path, model=ScriptedModel(p, [
+        ToolCall('read', 'search_evidence', {'query': 'original'}),
+        ContractViolation('parallel response', context={'tool_call_count': 3})]), policy=p, tools=(original_tool,))
+    with pytest.raises(ContractViolation):
+        execute(old)
+    before = old.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?', ('run',)).fetchone()[0]
+    old.close()
+    repaired = AgentRuntime(db_path=path, model=ScriptedModel(p, [
+        ContractViolation('parallel response', context={'tool_call_count': 2}),
+        ToolCall('review', 'request_review', {}),
+        ToolCall('critic', 'submit_review', {'passed': True, 'findings': ['Original read verified'], 'blocking_findings': []})]),
+        policy=p, tools=(original_tool,), repair_protocol=True)
+    try:
+        result = execute(repaired)
+        assert result['status'] == 'research_complete'
+        assert executed == ['original']
+        assert repaired.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?', ('run',)).fetchone()[0] == before
+        assert repaired.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE kind='model'").fetchone()[0] == 5
+        amendment = json.loads(repaired.connection.execute("SELECT payload_json FROM agent_artifacts WHERE artifact_key='protocol-repair-amendment'").fetchone()[0])
+        assert not amendment['budget_reset'] and not amendment['partial_calls_executed']
+        with pytest.raises(ContractViolation):
+            repaired.execute(run_id='run', objective='Different objective', as_of=NOW, context={'portfolio_ref': 'current'})
+    finally:
+        repaired.close()
 
 
 def test_critic_rejection_returns_to_research_and_replans(tmp_path):
@@ -129,17 +163,19 @@ def test_provider_failure_resume_preserves_completed_tools_and_charges_attempt(t
     runtime.close()
 
 
-def test_missing_evidence_cannot_be_overridden_by_positive_critic(tmp_path):
+def test_missing_evidence_blocks_critic_before_spending_review_budget(tmp_path):
     p = policy(max_model_calls=4, max_tool_calls=2, critic_reserved_calls=1)
     def missing(args, context):
         raise DataUnavailable("Original evidence missing")
     model = ScriptedModel(p, [ToolCall("1", "search_evidence", {"query": "missing"}), ToolCall("2", "request_review", {}),
-                              ToolCall("3", "submit_review", {"passed": True, "findings": [], "blocking_findings": []})])
+                              ToolCall("3", "request_review", {})])
     runtime = AgentRuntime(db_path=str(tmp_path / "missing.db"), model=model, policy=p, tools=(tool(missing),))
     result = execute(runtime)
     assert result["status"] == "budget_exhausted"
     assert result["unresolved_errors"]
-    assert not result["critic_reviews"][0]["accepted"]
+    assert result['critic_reviews'] == []
+    assert 'review_preflight' in model.contexts[-1][-1]['content']
+    assert runtime.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE kind='model'").fetchone()[0] == 3
     runtime.close()
 
 
@@ -156,6 +192,19 @@ def test_sdk_model_mismatch_is_rejected_without_fallback():
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: SimpleNamespace(model="weaker-model"))))
     with pytest.raises(ContractViolation, match="different model"):
         ToolCallingModel(client, policy()).next_call([], [])
+
+
+@pytest.mark.parametrize('arguments,code', [('{"secret":"private",', 'invalid_tool_arguments_json'),
+    ('{"value":NaN}', 'invalid_tool_arguments_json'), ('[]', 'invalid_tool_call')])
+def test_invalid_provider_arguments_have_safe_protocol_diagnostics(arguments, code):
+    call = SimpleNamespace(id='call', type='function', function=SimpleNamespace(name='search_evidence', arguments=arguments))
+    response = SimpleNamespace(model=policy().model, choices=[SimpleNamespace(
+        finish_reason='tool_calls', message=SimpleNamespace(tool_calls=[call]))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
+    with pytest.raises(ContractViolation) as error:
+        ToolCallingModel(client, policy()).next_call([], [])
+    assert error.value.context == {'protocol_error': code}
+    assert 'private' not in str(error.value)
 
 
 def test_crash_after_tool_result_commit_does_not_repeat_business_tool(tmp_path):

@@ -1,7 +1,7 @@
 """Explicit OCR completion of an archive, preserving previous failure records."""
 from datetime import datetime,timezone
 
-from scenario_engine.errors import ContractViolation,DataUnavailable
+from scenario_engine.errors import DataUnavailable
 from src.stock_app.cninfo_disclosures import artifact
 from src.stock_app.pdf_ocr import bound_ocr_text,raw_pdf,OcrPolicy
 

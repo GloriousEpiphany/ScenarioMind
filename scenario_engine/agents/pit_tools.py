@@ -79,9 +79,9 @@ def make_frozen_pit_query_tool(repository, *, manifest, page_size=40):
                 and args["dataset"] in {k[1] for k in groups}
                 and args["symbol"] in {k[2] for k in groups}):
             from scenario_engine.errors import ToolArgumentRejected
-            mapping = sorted({(k[0], k[1]) for k in groups})
+            mapping = sorted(groups)
             raise ToolArgumentRejected("No read was executed: correct the domain/dataset/entity combination. "
-                "Available domain/dataset pairs: " + canonical(mapping))
+                "Available domain/dataset/entity combinations: " + canonical(mapping))
         if key not in groups or type(args["offset"]) is not int or args["offset"] < 0:
             raise ContractViolation("query is outside the frozen data scope")
         if args["offset"] >= len(groups[key]):

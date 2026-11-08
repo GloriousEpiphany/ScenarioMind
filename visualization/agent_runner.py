@@ -7,14 +7,13 @@ import os
 import threading
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from queue import Queue
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Agents_Experience.agents.qwen_agent import QwenAgent
-from Agents_Experience.core.simulator import TradingSimulator
 from Agents_Experience.core.data_provider import MarketDataProvider
 from Agents_Experience.core.tools import TradingTools
 from Agents_Experience.utils.logger import DualLogger

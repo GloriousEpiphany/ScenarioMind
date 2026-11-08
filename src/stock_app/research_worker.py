@@ -5,7 +5,7 @@ import sqlite3
 import time as wall_time
 
 from scenario_engine.agents.lease import advisory_lease
-from scenario_engine.agents.tools import canonical, fingerprint
+from scenario_engine.agents.tools import canonical
 from scenario_engine.data import MarketArtifactRepository
 from scenario_engine.errors import ContractViolation
 from scenario_engine.sqlite_transactions import atomic_write
@@ -192,8 +192,8 @@ def serve(db_path, *, interval_seconds=300, once=False, execute_feedback=False):
             wall_time.sleep(interval_seconds)
 
 
-def launch_worker(db_path):
-    """Recoverable singleton daemon; Windows never opens a console window."""
+def launch_worker(db_path, *, execute_feedback=False):
+    """Start monitoring; new model-bearing follow-ups require explicit opt-in."""
     from pathlib import Path
     import subprocess
     import sys
@@ -203,9 +203,11 @@ def launch_worker(db_path):
         lease=c.execute("SELECT expires_at FROM advisory_leases WHERE run_id='research-monitor-daemon'").fetchone() if exists else None
         if lease and datetime.fromisoformat(lease[0])>datetime.now(timezone.utc):return None
     logs=path.parent/'portfolio-research-logs';logs.mkdir(exist_ok=True)
+    command = [sys.executable, '-m', 'src.stock_app.cli', 'research-monitor-worker', '--db-path', str(path)]
+    if execute_feedback:
+        command.append('--execute-feedback')
     with (logs/'tracking-worker.log').open('ab') as log:
-        process=subprocess.Popen([sys.executable,'-m','src.stock_app.cli','research-monitor-worker',
-            '--db-path',str(path),'--execute-feedback'],cwd=Path(__file__).resolve().parents[2],
+        process=subprocess.Popen(command,cwd=Path(__file__).resolve().parents[2],
             stdout=log,stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0)
     return process.pid

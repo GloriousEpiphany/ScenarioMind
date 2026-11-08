@@ -6,7 +6,7 @@ import sqlite3
 
 from scenario_engine.agents.research_board import ResearchBoard
 from scenario_engine.data import MarketArtifactRepository
-from scenario_engine.errors import ContractViolation, DataUnavailable
+from scenario_engine.errors import DataUnavailable
 from scenario_engine.sqlite_transactions import atomic_write
 from src.stock_app.cninfo_disclosures import artifact
 from src.stock_app.disclosure_source_binding import _catalogue_metadata,read_disclosure_coverage

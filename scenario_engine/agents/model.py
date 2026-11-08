@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 from scenario_engine.errors import AdapterFailure, ContractViolation
 from .contracts import ToolCall
+from .tools import canonical
 
 
 class ToolCallingModel:
@@ -48,8 +49,14 @@ class ToolCallingModel:
                                     context={"tool_call_count": len(calls or [])})
         try:
             arguments = json.loads(calls[0].function.arguments)
-        except (TypeError, ValueError) as exc:
-            raise ContractViolation("agent tool arguments are not valid JSON") from exc
+            canonical(arguments)
+        except (TypeError, ValueError, ContractViolation) as exc:
+            raise ContractViolation("agent tool arguments are not finite JSON",
+                                    context={'protocol_error': 'invalid_tool_arguments_json'}) from exc
         continuation = getattr(response.choices[0].message, "reasoning_content", None)
         state = {"reasoning_content": continuation} if isinstance(continuation, str) else {}
-        return ToolCall(calls[0].id, calls[0].function.name, arguments, state)
+        try:
+            return ToolCall(calls[0].id, calls[0].function.name, arguments, state)
+        except ContractViolation as exc:
+            raise ContractViolation('agent tool call requires an identifier, name and object arguments',
+                                    context={'protocol_error': 'invalid_tool_call'}) from exc

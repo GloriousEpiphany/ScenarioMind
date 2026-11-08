@@ -18,6 +18,7 @@ from .research_board import ResearchBoard
 from .roles import RESEARCHER, CRITIC
 from .tools import ToolContext, canonical, fingerprint
 from .lease import advisory_lease
+from .dependencies import require_advisory_runtime
 
 
 class ResearchState(TypedDict):
@@ -34,6 +35,7 @@ class ResearchState(TypedDict):
     errors: dict
     reviews: list
     status: str
+    review_scope_version: str
 
 
 def control_tool(name, description, properties):
@@ -43,12 +45,10 @@ def control_tool(name, description, properties):
 
 class AgentRuntime:
     def __init__(self, *, db_path, model, policy, tools, role_prompts=None, repair_protocol=False):
-        try:
-            from langgraph.graph import StateGraph, START, END
-            from langgraph.checkpoint.sqlite import SqliteSaver
-            from langsmith.run_helpers import tracing_context
-        except ImportError as exc:
-            raise DataUnavailable("AgentRuntime requires requirements-advisory.txt; no fixed-workflow fallback is available") from exc
+        dependencies = require_advisory_runtime()
+        StateGraph, START, END, SqliteSaver, tracing_context = (
+            dependencies[name] for name in ("StateGraph", "START", "END", "SqliteSaver", "tracing_context")
+        )
         if model.policy != policy:
             raise ContractViolation("runtime and model policies differ")
         self.model, self.policy = model, policy
@@ -114,6 +114,19 @@ class AgentRuntime:
                     "tools": [{"descriptor": tool.descriptor(), "version": tool.version,
                                "critic_allowed": tool.critic_allowed,
                                "internal_ledger_only": getattr(tool, 'internal_ledger_only', False)} for tool in self.tools.values()]}
+        # Existing v3 requests may resume with protocol rejection/retry enabled.
+        # Preserve their exact business contract and append a separate amendment;
+        # never rewrite frozen prompts, evidence, model or budgets to upgrade them.
+        protocol_amendment = None
+        previous = self.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?',
+                                           (review_from_run or run_id,)).fetchone()
+        if self.repair_protocol and previous:
+            legacy = {**contract, 'runtime_version': 'langgraph-research-v3-internal-ledger'}
+            if json.loads(previous[0]) == legacy:
+                contract = legacy
+                protocol_amendment = {'version': 'reject-entire-response-retry-single-v1',
+                                      'base_contract_hash': fingerprint(contract),
+                                      'budget_reset': False, 'partial_calls_executed': False}
         seed = None
         if review_from_run is not None:
             source = self.connection.execute('SELECT contract_json FROM advisory_runs WHERE run_id=?', (review_from_run,)).fetchone()
@@ -125,6 +138,15 @@ class AgentRuntime:
                 raise ContractViolation('reserved review requires a validated proposal without unresolved data errors')
             contract = {**contract, 'reserved_review_handoff': {'source_run': review_from_run, 'source_hash': fingerprint(seed)}}
         self.board.register_run(run_id, contract)
+        if protocol_amendment is not None:
+            self.board.save(run_id, 'protocol-repair-amendment', contract, protocol_amendment)
+        if self.repair_protocol:
+            self.board.save(run_id, 'tool-arguments-repair-amendment', contract, {
+                'version': 'reject-invalid-json-object-retry-v1', 'base_contract_hash': fingerprint(contract),
+                'budget_reset': False, 'partial_calls_executed': False})
+        self.board.save(run_id, 'review-preflight-amendment', contract, {
+            'version': 'evidence-gates-before-critic-v1', 'base_contract_hash': fingerprint(contract),
+            'budget_reset': False, 'evidence_requirements_changed': False})
         config = {"configurable": {"thread_id": run_id}, "recursion_limit": 4 * (self.policy.max_model_calls + self.policy.max_tool_calls + 1)}
         snapshot = self.graph.get_state(config)
         if snapshot.values:
@@ -134,6 +156,7 @@ class AgentRuntime:
                 "run_id": run_id, "objective": objective, "as_of": as_of.isoformat(), "context": context,
                 "phase": "researcher", "step": 0, "pending": {}, "results": [], "errors": {}, "reviews": [],
                 "critic_messages": [], "status": "running",
+                "review_scope_version": "",
                 "messages": [{"role": "system", "content": self.role_prompts["researcher"]},
                              {"role": "user", "content": canonical({"objective": objective, "as_of": as_of.isoformat(), "context": context})}],
             }
@@ -171,6 +194,16 @@ class AgentRuntime:
         request = {"phase": phase, "messages": state[key], "tools": descriptors}
         task_id = f"decision:{state['step']}"
         saved = self.board.load(state["run_id"], task_id, request)
+        scope = self._review_scope(state)
+        if saved is None and scope and state.get('review_scope_version') != scope['version']:
+            # A separate graph step persists the clarification before any model
+            # request. Previously committed decisions retain their exact inputs.
+            contract_hash = self.connection.execute('SELECT contract_hash FROM advisory_runs WHERE run_id=?',
+                                                    (state['run_id'],)).fetchone()[0]
+            self.board.save(state['run_id'], 'review-scope-amendment', {'contract_hash': contract_hash},
+                            {'scope': scope, 'publication_gate_changed': False, 'budget_reset': False})
+            return {'pending': {}, 'review_scope_version': scope['version'],
+                    key: [*state[key], {'role': 'user', 'content': canonical({'research_review_scope': scope})}]}
         if saved is None:
             limit = self.policy.max_model_calls - (self.policy.critic_reserved_calls if phase == "researcher" else 0)
             if not self.board.reserve_attempt(state["run_id"], "model", task_id, limit):
@@ -178,14 +211,17 @@ class AgentRuntime:
             try:
                 call = self.model.next_call(state[key], descriptors)
             except ContractViolation as exc:
-                if not self.repair_protocol or 'tool_call_count' not in exc.context:
+                protocol_error = exc.context.get('protocol_error')
+                if not self.repair_protocol or ('tool_call_count' not in exc.context
+                        and protocol_error not in {'invalid_tool_arguments_json', 'invalid_tool_call'}):
                     raise
                 # Reject the entire malformed response. No partial calls execute,
                 # and the failed decision consumes the same model/global budget.
-                rejection={'code':'single_tool_call_required','tool_call_count':exc.context['tool_call_count']}
+                rejection = ({'code': protocol_error} if protocol_error else
+                             {'code': 'single_tool_call_required', 'tool_call_count': exc.context['tool_call_count']})
                 self.board.save(state['run_id'],'protocol-rejection:'+task_id,request,rejection)
                 return {'pending':{},'step':state['step']+1,key:[*state[key],{'role':'user','content':canonical({
-                    'protocol_rejection':rejection,'instruction':'上一响应未执行。每次只调用一个已批准函数；等待其结果后才能选择下一步。不要并行调用，不要用纯文本结束。'})}]}
+                    'protocol_rejection':rejection,'instruction':'上一响应未执行。每次只调用一个已批准函数，参数必须是完整合法的 JSON 对象，数值必须有限。等待其结果后才能选择下一步。不要并行调用，不要用纯文本结束。'})}]}
             saved = asdict(call)
             canonical(saved)
             self.board.save(state["run_id"], task_id, request, saved)
@@ -287,6 +323,14 @@ class AgentRuntime:
         if call.name == "request_review":
             if call.arguments:
                 raise ContractViolation("request_review accepts no model-authored conclusions")
+            readiness = self._evidence_review(state)
+            if not readiness['evidence_ready']:
+                feedback = {'review_preflight': readiness, 'next_required_reads': self._next_required_reads(state),
+                    'instruction': '尚未满足原冻结证据要求，未调用审查模型。先使用批准工具补齐所列证据、分页和计算；'
+                                   'next_required_reads 每项仅代表下一页，继续读取返回的 next_offset。全部完成后才能再次 request_review。'}
+                self.board.save(state['run_id'], f"review-preflight:{state['step']}", state['pending'], feedback)
+                return {'phase': 'researcher', 'messages': [*state['messages'],
+                    {'role': 'tool', 'tool_call_id': call.call_id, 'content': canonical(feedback)}]}
             proposals = [row for row in state["results"] if row.get("tool") == "propose_hypotheses"
                          and row.get("status") == "completed"]
             assessments = [row for row in state["results"] if row.get("tool") == "record_assessment"
@@ -299,6 +343,7 @@ class AgentRuntime:
                         "candidate_hypotheses": proposals[-1] if proposals else None,
                         **({"candidate_assessment": assessments[-1]} if assessments else {}),
                         "unresolved_errors": state["errors"],
+                        **({'research_review_scope': self._review_scope(state)} if self._review_scope(state) else {}),
                     })}]}
         args = call.arguments
         if (set(args) != {"passed", "findings", "blocking_findings"} or type(args["passed"]) is not bool
@@ -306,6 +351,60 @@ class AgentRuntime:
                        or not all(isinstance(item, str) and item.strip() for item in args[key])
                        for key in ("findings", "blocking_findings"))):
             raise ContractViolation("critic must return a boolean decision and verifiable findings")
+        review = self._evidence_review(state)
+        passed = review.pop('evidence_ready') and args['passed'] and not args['blocking_findings']
+        review.update(model_decision=args['passed'], accepted=passed, findings=args['findings'],
+                      blocking_findings=args['blocking_findings'])
+        if passed:
+            return {"status": "research_complete", "reviews": [*state["reviews"], review]}
+        return {"phase": "researcher", "reviews": [*state["reviews"], review],
+                "messages": [*state["messages"], {"role": "user", "content": canonical({"critic_findings": review,
+                    'next_required_reads': self._next_required_reads(state),
+                    "instruction": "Resolve the recorded evidence gaps through approved tools; research is not complete."})}]}
+
+    @staticmethod
+    def _review_scope(state):
+        context = state['context']
+        if context.get('specialist_role') != 'quantitative' or context.get('scope') != 'conditional_research_only':
+            return None
+        from .quantitative_tools import conditional_research_review_scope
+        return conditional_research_review_scope()
+
+    def _next_required_reads(self, state):
+        """Give actionable continuation offsets without treating a page as full coverage."""
+        required_ids = set(state['context'].get('required_artifact_ids', []))
+        required_groups = {tuple(item) for item in state['context'].get('required_evidence', [])}
+        pages, totals, read_ids = {}, {}, {}
+        for envelope in state['results']:
+            if envelope.get('status') != 'completed' or envelope.get('tool') != 'query_pit_data':
+                continue
+            result = envelope['result']
+            rows = result.get('artifacts', [])
+            if not rows or 'offset' not in result:
+                continue
+            group = tuple(rows[0][key] for key in ('domain', 'dataset', 'entity_id'))
+            pages.setdefault(group, {})[result['offset']] = len(rows)
+            totals[group] = result['total_rows']
+            read_ids.setdefault(group, set()).update(row['artifact_id'] for row in rows)
+        continuations = []
+        for group, offsets in sorted(pages.items()):
+            if not required_ids.intersection(read_ids[group]):
+                continue
+            offset = 0
+            for start, count in sorted(offsets.items()):
+                if start > offset:
+                    break
+                offset = max(offset, start + count)
+            if offset < totals[group]:
+                continuations.append(dict(zip(('domain', 'dataset', 'symbol'), group), offset=offset))
+        descriptor = self.tools.get('query_pit_data')
+        if descriptor and 'offset' in descriptor.descriptor()['function']['parameters']['properties']:
+            for group in sorted(required_groups - pages.keys()):
+                continuations.append(dict(zip(('domain', 'dataset', 'symbol'), group), offset=0))
+        return continuations
+
+    def _evidence_review(self, state):
+        """The same deterministic gates apply before and after independent review."""
         required = state["context"].get("required_evidence", [])
         covered = set()
         for result in state["results"]:
@@ -379,18 +478,18 @@ class AgentRuntime:
         missing_quant = [(name,experiment) for experiment in state['context'].get('required_quantitative_experiments', [])
                          for name in ('estimate_exposure','simulate_paths','optimize_portfolio','validate_proposal')
                          if (name,experiment) not in quant_pairs]
-        passed = (args["passed"] and not args["blocking_findings"] and bool(completed_tools)
+        ready = (bool(completed_tools)
                   and not state["errors"] and not missing and not missing_tools and not missing_ids
                   and not unread_citations and not unread_documents and not unindexed_documents and not missing_tasks and not missing_quant
                   and not missing_inspections and not unread_update_quotes)
-        review = {"model_decision": args["passed"], "accepted": passed, "findings": args["findings"],
+        review = {"evidence_ready": ready,
                   "missing_required_evidence": missing}
+        review['unresolved_errors'] = state['errors']
         review["missing_required_tools"] = missing_tools
         if state['context'].get('required_completed_tasks'):
             review['missing_required_tasks'] = missing_tasks
         if state['context'].get('required_quantitative_experiments'):
             review['missing_quantitative_experiments'] = missing_quant
-        review["blocking_findings"] = args["blocking_findings"]
         review["unread_cited_artifact_ids"] = unread_citations
         if state['context'].get('required_inspected_document_ids'):
             review['uninspected_documents']=missing_inspections
@@ -408,11 +507,7 @@ class AgentRuntime:
                        and row.get('status') == 'completed']
         if assessments:
             review['reviewed_assessment_input_hash'] = assessments[-1]['input_hash']
-        if passed:
-            return {"status": "research_complete", "reviews": [*state["reviews"], review]}
-        return {"phase": "researcher", "reviews": [*state["reviews"], review],
-                "messages": [*state["messages"], {"role": "user", "content": canonical({"critic_findings": review,
-                    "instruction": "Resolve the recorded evidence gaps through approved tools; research is not complete."})}]}
+        return review
 
     def _assert_lease(self):
         if self._lease_lost is None or self._lease_lost.is_set():

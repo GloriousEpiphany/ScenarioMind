@@ -161,7 +161,8 @@ def test_targeted_quotes_require_exact_source_and_actually_read_offsets(tmp_path
 
 
 @pytest.mark.parametrize('gap', ['unread_quote', 'unindexed_document'])
-def test_runtime_rejects_critic_approval_until_original_read_gap_is_repaired(tmp_path, gap):
+def test_runtime_blocks_critic_until_original_read_gap_is_repaired(tmp_path, gap):
+    import json
     from scenario_engine.agents.runtime import AgentRuntime
     db, _, manifest, item = fixture(tmp_path)
     policy = AgentModelPolicy('fixture', 'fixed', 'test-only', 16, 10, 4)
@@ -181,7 +182,6 @@ def test_runtime_rejects_critic_approval_until_original_read_gap_is_repaired(tmp
                 ToolCall('read', 'fetch_document', {'artifact_id': item.artifact_id, 'offset': 100 if gap == 'unread_quote' else 0}),
                 ToolCall('paths', 'propose_hypotheses', {'hypotheses': [path]}),
                 ToolCall('request', 'request_review', {}),
-                ToolCall('wrong-approval', 'submit_review', {'passed': True, 'findings': ['Claims approved'], 'blocking_findings': []}),
                 repair, ToolCall('request-again', 'request_review', {}),
                 ToolCall('approval', 'submit_review', {'passed': True, 'findings': ['Original gap repaired'], 'blocking_findings': []})]
         def next_call(self, messages, tools):
@@ -196,11 +196,15 @@ def test_runtime_rejects_critic_approval_until_original_read_gap_is_repaired(tmp
             result = runtime.execute(run_id='quoted-gap', objective='Test evidence review gates', as_of=AT,
                 context={'required_quoted_document_manifest': manifest,
                     'required_tools': ['search_evidence', 'fetch_document', 'propose_hypotheses']})
+            first = json.loads(runtime.connection.execute(
+                "SELECT payload_json FROM agent_artifacts WHERE artifact_key LIKE 'review-preflight:%'"
+            ).fetchone()[0])['review_preflight']
+            assert runtime.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE kind='model'").fetchone()[0] == 7
         finally:
             runtime.close()
     assert result['status'] == 'research_complete' and not model.calls
-    first, last = result['critic_reviews']
-    assert first['model_decision'] is True and first['accepted'] is False
+    [last] = result['critic_reviews']
+    assert not first['evidence_ready']
     assert first['unread_cited_documents' if gap == 'unread_quote' else 'unindexed_documents'] == (
         ['h1'] if gap == 'unread_quote' else [item.artifact_id])
     assert last['accepted'] is True

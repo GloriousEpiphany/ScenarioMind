@@ -1,15 +1,5 @@
-# Full Scenario Lab optional runtime.
-#
-# These dependencies are required only when enabling the full external V1/V2
-# roadmap surface from Docs/量化研究需求与金融逻辑.md. The core local engine remains usable
-# with requirements.txt.
-
--r requirements.txt
-
-pytest>=8.0.0
-langgraph>=0.2.0
-deepeval>=1.0.0
-ragas>=0.2.0
-opentelemetry-api>=1.25.0
-opentelemetry-sdk>=1.25.0
-pypdf>=4.0.0
+# Current holdings research, public acquisition and strict quantitative solver.
+# OCR acceleration is a separate opt-in: requirements-ocr.txt.
+-r requirements-scenario-public.txt
+-r requirements-advisory.txt
+-r requirements-quantitative.txt

@@ -141,6 +141,18 @@ def test_real_graph_runs_five_specialists_and_critics_then_reopens_without_calls
     assert all(v[-1]['accepted'] for v in result['specialist_reviews'].values())
     assert len(downloaded) == 5 and model.calls > 15
     assert result['assessment']['execution_status'] == 'requires_quantitative_and_trade_validation'
+    # Five independent critics still run. Exact frozen reads from accepted
+    # peers do not consume a second business-tool reservation.
+    root = 'portfolio-team:test'
+    assert engine.connection.execute(
+        "SELECT COUNT(*) FROM agent_call_attempts WHERE run_id=? AND kind='team_tool'", (root,)
+    ).fetchone()[0] == 13  # Eight distinct original queries and five proposals.
+    shared = engine.connection.execute(
+        "SELECT run_id,payload_json FROM agent_artifacts WHERE artifact_key LIKE 'shared-read:%'"
+    ).fetchall()
+    assert len(shared) == 5
+    assert {r[0] for r in shared} == {root + ':scenario', root + ':portfolio'}
+    assert all(json.loads(r[1])['source_run'] in {root + ':company', root + ':sentiment'} for r in shared)
     calls = model.calls
     assert run(engine) == result and model.calls == calls
     # Private account identity remains local, beyond the approved model payload.

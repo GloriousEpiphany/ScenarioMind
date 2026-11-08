@@ -34,13 +34,13 @@ def make_hypothesis_tool(repository, *, manifest, required_entities=(), require_
             if not set(path["entities"]).issubset(symbols) or not set(path["evidence_refs"]).issubset(sources):
                 raise ContractViolation("hypothesis exceeds the approved evidence or security scope")
             if not any(sources[ref]["domain"] in {"event", "fundamental", "industry", "flow"} for ref in path["evidence_refs"]):
-                raise ContractViolation("hypothesis cannot use only prices or derived sentiment as original mechanism evidence")
+                raise ContractViolation(f"hypothesis {path['hypothesis_id']!r} cannot use only prices or derived sentiment as original mechanism evidence")
             if require_entity_sources:
                 for entity in path['entities']:
                     if not any(sources[ref]['entity_id'] == entity
                                and sources[ref]['domain'] in {'event', 'fundamental', 'industry', 'flow'}
                                for ref in path['evidence_refs']):
-                        raise ContractViolation('each hypothesis entity requires its own original mechanism evidence')
+                        raise ContractViolation(f"hypothesis {path['hypothesis_id']!r}, entity {entity!r}: each hypothesis entity requires its own original mechanism evidence (event, fundamental, industry or flow)")
         if not set(required_entities).issubset({s for path in paths for s in path["entities"]}):
             raise ContractViolation("hypotheses must cover every required held security")
         if require_child and not any(path["parent_id"] for path in paths):

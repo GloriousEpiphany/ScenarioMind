@@ -1,7 +1,7 @@
 """Model-selected priorities over a validated research dependency graph."""
 from dataclasses import dataclass
 
-from scenario_engine.errors import ContractViolation
+from scenario_engine.errors import ContractViolation, ToolArgumentRejected
 from .tools import fingerprint
 
 ROLES = ('macro', 'company', 'sentiment', 'scenario', 'portfolio')
@@ -45,7 +45,8 @@ class ResearchPlan:
         required = {'all_tasks_audited', 'unresolved_gates_explicit', 'budget_exhaustion_is_incomplete'}
         if (not isinstance(conditions, list) or any(not isinstance(c, str) for c in conditions)
                 or set(conditions) != required or len(conditions) != len(required)):
-            raise ContractViolation('plan cannot weaken its completion or budget conditions')
+            raise ToolArgumentRejected('Plan was not recorded. stop_conditions must contain exactly: '
+                                       + ', '.join(sorted(required)) + '. Do not add or omit conditions.')
         if not isinstance(payload['revision_reason'], str) or not payload['revision_reason'].strip():
             raise ContractViolation('plan revision must explain the observable reason')
         return cls(tuple(by_id[k] for k in REQUIRED_TASKS), tuple(sorted(conditions)), payload['revision_reason'])

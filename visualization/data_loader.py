@@ -7,8 +7,6 @@ import os
 import pandas as pd
 import sqlite3
 from typing import Optional, List, Dict
-from datetime import datetime, timedelta
-from functools import lru_cache
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

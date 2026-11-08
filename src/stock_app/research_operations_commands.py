@@ -109,7 +109,7 @@ def register_research_operations(cli):
     @click.option('--db-path',required=True,type=click.Path(exists=True,dir_okay=False))
     @click.option('--once',is_flag=True)
     @click.option('--interval-seconds',default=300,type=click.IntRange(min=60,max=86400))
-    @click.option('--execute-feedback',is_flag=True,help='执行受原任务预算约束的模型复核，会使用已配置 API')
+    @click.option('--execute-feedback',is_flag=True,help='执行跟进模型复核；每次使用继承上限的独立预算，会产生额外 API 用量')
     def worker(db_path,once,interval_seconds,execute_feedback):
         """持续处理研究反馈和真实日历到期审计；--once 执行单次检查。"""
         from src.stock_app.research_worker import serve
