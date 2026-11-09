@@ -277,12 +277,12 @@ def derive_coverage(repo, refs, symbol, start, end, at, *, notice_refs=None, per
         ex=_day(date_text)
         if not start<=ex<=end or ex not in dividends or dividends[ex]['split']<=1:
             raise ContractViolation('implementation notice does not bind a transfer inside the coverage interval')
-        from src.stock_app.transfer_notice import transfer_notice
+        from src.stock_app.corporate_action_notices import transfer_notice
         notices[ex]=transfer_notice(repo,symbol,pair,dividends[ex],ex,at)
         source_items.extend(repo.get_visible(ref,at) for ref in pair.values())
     period_changes={}
     for date_text,pair in (period_refs or {}).items():
-        from src.stock_app.transfer_notice import period_exercise
+        from src.stock_app.corporate_action_notices import period_exercise
         day=_day(date_text)
         period_changes[day]=period_exercise(repo,symbol,pair,day,at)
         source_items.extend(repo.get_visible(ref,at) for ref in pair.values())
@@ -300,7 +300,7 @@ def derive_coverage(repo, refs, symbol, start, end, at, *, notice_refs=None, per
         source_items.append(equity_item)
     placements={}
     for date_text,pair in (placement_refs or {}).items():
-        from src.stock_app.placement_notice import placement_notice
+        from src.stock_app.corporate_action_notices import placement_notice
         day=_day(date_text)
         if not start<=day<=end:raise ContractViolation('placement notice falls outside coverage')
         placements[day]=placement_notice(repo,symbol,pair,day,at)

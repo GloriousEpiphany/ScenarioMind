@@ -132,6 +132,8 @@ def start_worker(db_path, run_id):
     job = load_job(db_path, run_id=run_id)
     if job is None:
         raise ContractViolation("cannot launch an unknown research job")
+    if 'feedback_context' in job['request']:
+        raise ContractViolation('automatic research feedback requires explicit --execute-feedback authorization')
     require_advisory_runtime()
     with sqlite3.connect(db_path, timeout=30) as connection:
         exists = connection.execute("SELECT 1 FROM sqlite_master WHERE name='advisory_leases'").fetchone()
@@ -155,11 +157,15 @@ def _latest_pending(db_path, account_id):
     connection = connect(db_path)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        pending = connection.execute("SELECT run_id FROM portfolio_research_jobs WHERE account_id=? AND status='queued' ORDER BY updated_at DESC LIMIT 1", (account_id,)).fetchone()
+        # Feedback has its own opt-in executor. This also isolates already queued
+        # follow-ups from older versions, without changing their frozen requests.
+        pending = [run_id for run_id, raw in connection.execute(
+            "SELECT run_id,request_json FROM portfolio_research_jobs WHERE account_id=? AND status='queued' ORDER BY updated_at DESC",
+            (account_id,)) if 'feedback_context' not in json.loads(raw)]
         target = pending[0] if pending else None
         if target:
-            connection.execute("UPDATE portfolio_research_jobs SET status='superseded',updated_at=? WHERE account_id=? AND status='queued' AND run_id<>?",
-                (datetime.now(timezone.utc).isoformat(), account_id, target))
+            connection.executemany("UPDATE portfolio_research_jobs SET status='superseded',updated_at=? WHERE run_id=? AND status='queued'",
+                [(datetime.now(timezone.utc).isoformat(), obsolete) for obsolete in pending[1:]])
         connection.commit()
         return target
     finally:
@@ -170,6 +176,8 @@ def worker_loop(db_path, run_id):
     job = load_job(db_path, run_id=run_id)
     if job is None:
         raise ContractViolation("unknown research worker request")
+    if 'feedback_context' in job['request']:
+        raise ContractViolation('automatic research feedback requires explicit --execute-feedback authorization')
     account_id = job["account_id"]
     result, last_error = None, None
     with advisory_lease(db_path, "portfolio-account:" + str(account_id)):
@@ -186,16 +194,24 @@ def worker_loop(db_path, run_id):
             target = _latest_pending(db_path, account_id)
             if target == executing and last_error is not None:
                 break
+    # A request can arrive after the final queue read while start_worker still
+    # observes our account lease. Recheck only after releasing it; otherwise
+    # both workers can assume the other one will drain the request.
+    pending = _latest_pending(db_path, account_id)
+    if pending and (last_error is None or pending != executing):
+        start_worker(db_path, pending)
     if last_error is not None:
         raise last_error
     return result
 
 
-def execute_job(db_path, run_id):
+def execute_job(db_path, run_id, *, execute_feedback=False):
     load_scenario_environment()
     job = load_job(db_path, run_id=run_id)
     if job is None:
         raise ContractViolation("unknown portfolio research job")
+    if 'feedback_context' in job['request'] and execute_feedback is not True:
+        raise ContractViolation('automatic research feedback requires explicit --execute-feedback authorization')
     with advisory_lease(db_path, "portfolio-job:" + run_id):
         request = job["request"]
         workflow = None

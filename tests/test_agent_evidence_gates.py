@@ -1,5 +1,6 @@
-from dataclasses import asdict
-from datetime import datetime, timezone
+from dataclasses import asdict, replace
+from datetime import datetime, timedelta, timezone
+import sqlite3
 
 import pytest
 
@@ -7,7 +8,7 @@ from scenario_engine.agents.contracts import ToolCall
 from scenario_engine.agents.runtime import AgentRuntime
 from scenario_engine.agents.deductive_tools import make_hypothesis_tool
 from scenario_engine.agents.tools import ToolContext
-from scenario_engine.errors import ContractViolation
+from scenario_engine.errors import ContractViolation, PointInTimeViolation
 
 
 def review(results, context=None, tools=('query_pit_data',)):
@@ -74,3 +75,30 @@ def test_hypothesis_cannot_claim_two_holdings_using_only_one_company_source():
         'trigger_conditions': ['Funding costs rise'], 'invalidation_conditions': ['Costs fall']}]}
     with pytest.raises(ContractViolation, match='each hypothesis entity'):
         tool.run(value, ToolContext('run', 'task', datetime.now(timezone.utc), 'p', 'h', 'i'))
+
+
+@pytest.mark.parametrize('kind', ['query', 'hypothesis', 'assessment'])
+def test_frozen_research_tools_reject_sources_received_after_cutoff(kind):
+    from scenario_engine.agents.pit_tools import make_frozen_pit_query_tool
+    from scenario_engine.agents.portfolio_assessment import make_assessment_tool
+    from scenario_engine.data import MarketArtifactRepository
+    from tests.test_portfolio_research import NOW, artifact, assessment, hypothesis
+
+    with sqlite3.connect(':memory:') as connection:
+        repo = MarketArtifactRepository(connection)
+        item = replace(artifact('fundamental', 'pit_financials'), ingested_at=NOW+timedelta(seconds=1))
+        repo.ingest_many((item,))
+        manifest = [{key: getattr(item, key) for key in
+                     ('artifact_id', 'domain', 'dataset', 'entity_id', 'payload_hash')}]
+        if kind == 'query':
+            tool = make_frozen_pit_query_tool(repo, manifest=manifest)
+            args = {'domain': item.domain, 'dataset': item.dataset, 'symbol': item.entity_id, 'offset': 0}
+        elif kind == 'hypothesis':
+            tool = make_hypothesis_tool(repo, manifest=manifest)
+            args = hypothesis('company')
+        else:
+            tool = make_assessment_tool(repo, manifest=manifest,
+                portfolio={'positions': [{'symbol': '000001'}]}, hypotheses=hypothesis('scenario')['hypotheses'])
+            args = assessment()
+        with pytest.raises(PointInTimeViolation):
+            tool.run(args, ToolContext('run', 'task', NOW, 'p', 'h', 'i'))

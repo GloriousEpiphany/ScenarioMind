@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from scenario_engine.decision_support import PortfolioDecisionSupport
+from scenario_engine.legacy.simulation.decision_support import PortfolioDecisionSupport
 
 
 @dataclass

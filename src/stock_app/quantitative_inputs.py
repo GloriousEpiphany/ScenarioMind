@@ -32,7 +32,7 @@ def build_total_return_panel(repo, *, coverage_refs, price_refs, benchmark_refs,
     if start >= end or not coverage_refs or not benchmark_refs:
         raise ContractViolation('return panel needs a nonempty explicit interval and source universe')
     assets, factors = tuple(sorted(coverage_refs)), tuple(sorted(benchmark_refs))
-    benchmarks = tuple(repo.get_visible(benchmark_refs[f], captured_at) for f in factors)
+    benchmarks = tuple(repo.get_visible(benchmark_refs[f], captured_at, strict_pit=True) for f in factors)
     calendars = []
     for item in benchmarks:
         bars = item.payload.get('bars', [])
@@ -50,7 +50,7 @@ def build_total_return_panel(repo, *, coverage_refs, price_refs, benchmark_refs,
     lo, hi = days.index(start), days.index(end)
     if hi <= lo:
         raise ContractViolation('return interval has no complete label')
-    prices = tuple(repo.get_visible(ref, captured_at) for ref in price_refs)
+    prices = tuple(repo.get_visible(ref, captured_at, strict_pit=True) for ref in price_refs)
     if len(price_refs) != len(set(price_refs)):
         raise ContractViolation('return input has duplicate price references')
     indexed = {}
@@ -84,7 +84,8 @@ def build_total_return_panel(repo, *, coverage_refs, price_refs, benchmark_refs,
             bind_benchmark_return((item,), factor_id=factor, session=day, previous_session=previous, claimed=value)
             row_refs.add(item.artifact_id); fvalues.append(value)
         values.append(tuple(row_returns)); factor_values.append(tuple(fvalues)); refs.append(tuple(sorted(row_refs)))
-        knowns.append(max(repo.get_visible(ref, captured_at).known_at for ref in row_refs))
+        knowns.append(max(max(source.known_at, source.ingested_at) for source in
+                         (repo.get_visible(ref, captured_at, strict_pit=True) for ref in row_refs)))
     definition = derived_artifact('return_definition', 'raw-close-gross-total-return-v1', RETURN_SPEC, captured_at)
     calendar = derived_artifact('trading_sessions', 'eastmoney-benchmark-calendar-v1',
         {'benchmark_ref': benchmarks[0].artifact_id,
@@ -109,7 +110,7 @@ def build_wealth_event_panel(repo, *, total_return_panel_ref, event_refs, captur
     from scenario_engine.quant.wealth_calibration import JointWealthReplayPanel
     from src.stock_app.wealth_source_binding import bind_document_tone, bind_wealth_panel_sources
     from src.stock_app.scenario_public_data import _lexicon_tone
-    item = repo.get_visible(total_return_panel_ref, captured_at)
+    item = repo.get_visible(total_return_panel_ref, captured_at, strict_pit=True)
     if (item.domain, item.dataset) != ('quant_validation', 'joint_total_return_panel'):
         raise ContractViolation('wealth construction needs a typed total-return panel')
     raw = dict(item.payload)
@@ -119,7 +120,7 @@ def build_wealth_event_panel(repo, *, total_return_panel_ref, event_refs, captur
     bind_total_return_panel_sources(repo, market, evaluation_start=captured_at, cutoff=captured_at)
     if len(event_refs) != len(set(event_refs)):
         raise ContractViolation('event acquisition pool has duplicate references')
-    documents = [repo.get_visible(ref, captured_at) for ref in event_refs]
+    documents = [repo.get_visible(ref, captured_at, strict_pit=True) for ref in event_refs]
     if any(d.domain != 'event' or d.dataset != 'observed_event_source' or d.entity_id not in market.asset_ids for d in documents):
         raise ContractViolation('wealth event pool contains unrelated source types or assets')
     grouped = {}
@@ -135,7 +136,7 @@ def build_wealth_event_panel(repo, *, total_return_panel_ref, event_refs, captur
     actions=VerifiedActionReader(repo)
     for i, stamp in enumerate(market.timestamps):
         day = stamp.astimezone(SHANGHAI).date()
-        rows = [repo.get_visible(ref, captured_at) for ref in market.row_source_refs[i]]
+        rows = [repo.get_visible(ref, captured_at, strict_pit=True) for ref in market.row_source_refs[i]]
         pv, sv, dv, av, ev, er = ([] for _ in range(6))
         for symbol in market.asset_ids:
             price = next(a for a in rows if a.domain == 'price' and a.entity_id == symbol
@@ -148,8 +149,8 @@ def build_wealth_event_panel(repo, *, total_return_panel_ref, event_refs, captur
             pv.append(price.payload['close']); sv.append(split); dv.append(dividend); av.append(coverage.artifact_id)
             ev.append(tone); er.extend(d.artifact_id for d in docs)
         prices.append(pv); splits.append(sv); dividends.append(dv); action_refs.append(av); events.append(ev); event_sources.append(er)
-        action_known.append(max(repo.get_visible(r, captured_at).known_at for r in av))
-        event_known.append(max(repo.get_visible(r, captured_at).known_at for r in er))
+        action_known.append(max(max(a.known_at, a.ingested_at) for a in rows if a.artifact_id in av))
+        event_known.append(max(max(d.known_at, d.ingested_at) for d in documents if d.artifact_id in er))
     manifest = derived_artifact('action_coverage_manifest', 'cninfo-action-coverage-manifest-v1',
         {'asset_ids': list(market.asset_ids), 'coverage_refs': sorted({r for row in action_refs for r in row})},
         captured_at, domain='corporate_action')

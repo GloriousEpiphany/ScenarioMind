@@ -19,7 +19,7 @@ import config
 from scenario_engine import RiskPolicy, ScenarioEngine, ScenarioMission
 from scenario_engine.errors import ScenarioEngineError
 from scenario_engine.ledger import MissionExecutionQueue, RunLedger
-from scenario_engine.llm import ScenarioLLMClient
+from scenario_engine.agents.scenario_client import ScenarioLLMClient
 from src.stock_app.holdings_import import (
     HoldingsImportError,
     editor_frame,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -58,6 +60,7 @@ def test_user_historical_documents_create_realized_samples_and_gate_model(tmp_pa
     start = datetime(2025, 1, 2, 15, 0, tzinfo=UTC)
     repo.ingest_many(_price_artifact(index, start + timedelta(days=index)) for index in range(220))
     connection.close()
+
     rows = []
     for index in range(25):
         event_time = start + timedelta(days=5 + index * 4, hours=1)
@@ -154,3 +157,170 @@ def test_immature_event_is_rejected_instead_of_filling_forward_returns(tmp_path)
         "SELECT COUNT(*) FROM market_artifacts WHERE dataset = 'event_study_observation'"
     ).fetchone()[0] == 0
     connection.close()
+
+
+@pytest.mark.parametrize('out_of_sample', ['false', 'true', 1])
+def test_registry_rejects_nonboolean_out_of_sample_claim(out_of_sample):
+    from scenario_engine.quant import ModelPolicy
+    from scenario_engine.errors import ContractViolation, UncalibratedModel
+    with sqlite3.connect(':memory:') as c:
+        registry = ModelRegistry(c)
+        policy = ModelPolicy('test-model', 'v1', '2026-01-01T00:00:00+00:00', 'cal-v1', {'factor_shock': 1.}, min_samples=5)
+        metrics = {'coverage': .8, 'sample_size': 20, 'out_of_sample': out_of_sample,
+                   'quantile_coverage_error': 0., 'cvar_exceedance_rate': .1,
+                   'validated_at': '2026-01-02T00:00:00+00:00'}
+        with pytest.raises((ContractViolation, UncalibratedModel)):
+            registry.register(policy, feature_schema={'state': 'test'}, calibration_metrics=metrics,
+                              artifact_uri='fixture://model', status='active')
+
+
+def test_registry_rejects_validation_before_training_and_orders_real_instants():
+    from scenario_engine.quant import ModelPolicy
+    from scenario_engine.errors import ContractViolation, UncalibratedModel
+    with sqlite3.connect(':memory:') as c:
+        registry = ModelRegistry(c)
+        metrics = {'coverage': .8, 'sample_size': 20, 'out_of_sample': True,
+                   'quantile_coverage_error': 0., 'cvar_exceedance_rate': .1,
+                   'validated_at': '2026-01-03T00:00:00+00:00'}
+        for version, training in [('older', '2026-01-02T01:00:00+08:00'), ('newer', '2026-01-01T23:00:00+00:00')]:
+            policy = ModelPolicy('test-model', version, training, 'cal-' + version, {'factor_shock': 1.}, min_samples=5)
+            registry.register(policy, feature_schema={'state': 'test'}, calibration_metrics=metrics,
+                              artifact_uri='fixture://model', status='active')
+        assert registry.active_as_of(datetime(2026, 1, 4, tzinfo=UTC)).version == 'newer'
+        invalid = ModelPolicy('test-model', 'future-training', '2026-01-05T00:00:00+00:00',
+                              'cal-invalid', {'factor_shock': 1.}, min_samples=5)
+        with pytest.raises((ContractViolation, UncalibratedModel)):
+            registry.register(invalid, feature_schema={'state': 'test'}, calibration_metrics=metrics,
+                              artifact_uri='fixture://model', status='active')
+
+
+def _calibration_event(index, event_time, *, bad_tail=False):
+    maturity = event_time + timedelta(days=60)
+    payload = {
+        'historical_event_id': f'event:{index}', 'event_type': 'financing',
+        'label_available_at': maturity.isoformat(), 'state': {'factor:market': 0.},
+        'returns': {symbol: {str(h): -2. if bad_tail and symbol == 'B' and h == 60 else 0.
+                             for h in (1, 5, 20, 60)} for symbol in ('A', 'B')},
+    }
+    return replace(_price_artifact(index, event_time), artifact_id=f'event:{index}',
+                   domain='event', dataset='event_study_observation', known_at=maturity,
+                   ingested_at=maturity, frequency=None, adjustment=None,
+                   payload=payload, payload_hash=canonical_payload_hash(payload))
+
+
+def _seed_calibration_and_stub_predictions(tmp_path, monkeypatch, *, spacing=90, bad_tail=False):
+    import src.stock_app.scenario_calibration as calibration
+
+    path = str(tmp_path / 'calibration-gates.db')
+    start = datetime(2010, 1, 1, tzinfo=UTC)
+    with sqlite3.connect(path) as connection:
+        repository = MarketArtifactRepository(connection)
+        repository.ingest_many(_calibration_event(i, start + timedelta(days=spacing * i), bad_tail=bad_tail)
+                               for i in range(40))
+
+    def predict(repository, training, sample, event_type, symbols, min_samples):
+        assets = tuple(SimpleNamespace(symbol=symbol, horizon=h, q10=-1., q90=1.)
+                       for symbol in symbols for h in (1, 5, 20, 60))
+        return SimpleNamespace(assets=assets), {
+            'training_artifact_ids': [item['artifact_id'] for item in training],
+            'validation_artifact_id': sample['artifact_id'], 'as_of': sample['event_time'].isoformat(),
+        }
+
+    monkeypatch.setattr(calibration, '_production_fold', predict)
+    return path
+
+
+def test_calibration_cannot_average_away_a_failed_symbol_horizon(tmp_path, monkeypatch):
+    path = _seed_calibration_and_stub_predictions(tmp_path, monkeypatch, bad_tail=True)
+    result = calibrate_event_analog_model(
+        path, event_type='financing', portfolio_symbols=('A', 'B'), min_samples=5,
+        validation_fraction=.25, max_quantile_coverage_error=.25, max_cvar_exceedance_rate=.15,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    # Seven passing groups would hide the failed group under the old pooled gate:
+    # overall coverage=.875 and tail=.125, both within the configured limits.
+    assert result.metrics['coverage'] == pytest.approx(.875)
+    assert result.status == 'rejected'
+    assert result.metrics['sample_size'] == 10
+    assert result.metrics['evaluation_count'] == 80
+    assert result.metrics['var_exceedance_rate'] == 1.
+    failed = [item for item in result.metrics['group_metrics'] if item['symbol'] == 'B' and item['horizon'] == 60]
+    assert failed[0]['coverage'] == 0.
+
+
+@pytest.mark.parametrize(('spacing', 'min_samples', 'fraction'), [(90, 10, .10), (1, 5, .25)])
+def test_calibration_requires_enough_nonoverlapping_holdout_events(tmp_path, monkeypatch, spacing, min_samples, fraction):
+    path = _seed_calibration_and_stub_predictions(tmp_path, monkeypatch, spacing=spacing)
+    with pytest.raises(DataUnavailable, match='不重叠'):
+        calibrate_event_analog_model(
+            path, event_type='financing', portfolio_symbols=('A', 'B'), min_samples=min_samples,
+            validation_fraction=fraction, max_quantile_coverage_error=.99, max_cvar_exceedance_rate=.99,
+            clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+
+def test_event_samples_obey_actual_timezone_and_ingestion_visibility():
+    from src.stock_app.scenario_calibration import _event_samples
+    cutoff = datetime(2026, 8, 18, 18, tzinfo=UTC)
+    earlier = datetime.fromisoformat('2026-08-19T00:30:00+08:00')
+    with sqlite3.connect(':memory:') as connection:
+        repository = MarketArtifactRepository(connection)
+        source = _calibration_event(1, datetime(2026, 1, 1, tzinfo=UTC))
+        repository.add(replace(source, known_at=earlier, ingested_at=earlier))
+        repository.add(replace(_calibration_event(2, datetime(2026, 1, 2, tzinfo=UTC)),
+                               known_at=earlier, ingested_at=cutoff + timedelta(hours=1)))
+        assert [item['artifact_id'] for item in _event_samples(connection, 'financing', cutoff)] == ['event:1']
+
+
+@pytest.mark.parametrize('failure', ['tail', 'sample_count', 'missing_horizon'])
+def test_registry_rechecks_cell_gates_even_if_pooled_summary_passes(failure):
+    from scenario_engine.quant import ModelPolicy
+    from scenario_engine.errors import UncalibratedModel
+    policy = ModelPolicy('event_analog_empirical', 'test', '2026-01-01T00:00:00+00:00',
+                         'cal-test', {'event_study': .5, 'analog_state': .5}, min_samples=5,
+                         training_artifact_ids=('training:1',))
+    groups = [{'symbol': 'A', 'horizon': h, 'sample_size': 5, 'coverage': .8, 'var_exceedance_rate': .1}
+              for h in (1, 5, 20, 60)]
+    if failure == 'tail':
+        groups[-1]['var_exceedance_rate'] = 1.
+    elif failure == 'sample_count':
+        groups[-1]['sample_size'] = 1
+    else:
+        groups.pop()
+    metrics = {'coverage': .8, 'sample_size': 5, 'out_of_sample': True,
+               'quantile_coverage_error': 0., 'cvar_exceedance_rate': .1,
+               'validated_at': '2026-01-02T00:00:00+00:00',
+               'validation_method': 'production_pit_event_holdout_v1',
+               'calibration_unit': 'nonoverlapping_events_by_symbol_horizon_v1', 'group_metrics': groups}
+    with pytest.raises(UncalibratedModel):
+        ModelRegistry._assert_calibrated(policy, metrics, {'portfolio_symbols': ['A']})
+
+
+@pytest.mark.parametrize('entrypoint', ['register', 'active_as_of'])
+def test_registry_rejects_an_entire_missing_symbol(entrypoint):
+    from scenario_engine.quant import ModelPolicy
+    from scenario_engine.errors import UncalibratedModel
+    policy = ModelPolicy('event_analog_empirical', 'test', '2026-01-01T00:00:00+00:00',
+                         'cal-test', {'event_study': .5, 'analog_state': .5}, min_samples=5,
+                         training_artifact_ids=('training:1',))
+    metrics = {'coverage': .8, 'sample_size': 5, 'out_of_sample': True,
+               'quantile_coverage_error': 0., 'cvar_exceedance_rate': .1,
+               'validated_at': '2026-01-02T00:00:00+00:00',
+               'validation_method': 'production_pit_event_holdout_v1',
+               'calibration_unit': 'nonoverlapping_events_by_symbol_horizon_v1',
+               'group_metrics': [{'symbol': 'A', 'horizon': h, 'sample_size': 5,
+                                  'coverage': .8, 'var_exceedance_rate': .1} for h in (1, 5, 20, 60)]}
+    with sqlite3.connect(':memory:') as connection:
+        registry = ModelRegistry(connection)
+        schema = {'portfolio_symbols': ['A', 'B']}
+        if entrypoint == 'register':
+            with pytest.raises(UncalibratedModel, match='registered symbols'):
+                registry.register(policy, feature_schema=schema, calibration_metrics=metrics,
+                                  artifact_uri='fixture://model', status='active')
+        else:
+            registry.register(policy, feature_schema=schema, calibration_metrics=metrics,
+                              artifact_uri='fixture://model', status='candidate')
+            # Simulate an existing active record created before this gate.
+            connection.execute("UPDATE model_versions SET status = 'active'")
+            with pytest.raises(UncalibratedModel, match='registered symbols'):
+                registry.active_as_of(datetime(2026, 1, 3, tzinfo=UTC))

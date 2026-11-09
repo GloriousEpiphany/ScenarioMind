@@ -7,7 +7,7 @@ from scenario_engine.agents.research_board import ResearchBoard
 from scenario_engine.data import MarketArtifactRepository
 from scenario_engine.errors import ContractViolation, DataUnavailable, ScenarioEngineError
 from scenario_engine.sqlite_transactions import atomic_write
-from src.stock_app.checkpointed_prices import CheckpointedEastmoneyReader
+from src.stock_app.eastmoney_prices import CheckpointedEastmoneyReader
 from src.stock_app.cninfo_actions import acquire_action_coverage
 from src.stock_app.eastmoney_prices import SHANGHAI
 from src.stock_app.market_context import _artifact

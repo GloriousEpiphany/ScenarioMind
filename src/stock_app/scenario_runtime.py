@@ -415,7 +415,7 @@ def probe_llm_live(*, prompt: str = "只返回 JSON：{\"ok\": true}") -> Runtim
     if not local.configured or not local.dependency_available:
         return local
     try:
-        from scenario_engine.llm import ScenarioLLMClient
+        from scenario_engine.agents.scenario_client import ScenarioLLMClient
 
         client = ScenarioLLMClient.from_environment()
         if client is None:

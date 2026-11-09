@@ -6,7 +6,7 @@ from scenario_engine.agents.planning import ResearchPlan, REQUIRED_TASKS, plan_s
 from scenario_engine.agents.quantitative_tools import make_quantitative_tools, QuantToolPolicy
 from scenario_engine.agents.runtime import AgentRuntime
 from scenario_engine.agents.tools import ApprovedTool
-from scenario_engine.errors import ContractViolation
+from scenario_engine.errors import ContractViolation, ToolArgumentRejected
 from src.stock_app.portfolio_research import PortfolioResearch, TeamBudgetExhausted, ROLES
 from src.stock_app.research_tracking import register_watch
 
@@ -144,6 +144,22 @@ class ResearchController(PortfolioResearch):
         jobs = frozen.get('quantitative_jobs', self.quantitative_jobs)
         quant_tools = make_quantitative_tools(self.db_path, frozen=frozen, jobs=jobs, clock=self.clock)
 
+        class BudgetedTool:
+            def __init__(self, tool): self.tool = tool
+            def __getattr__(self, name): return getattr(self.tool, name)
+            def run(self, arguments, context):
+                # Count the attempt before argument validation, just as domain
+                # specialists do. Rejected model plans still consume team budget.
+                if not parent.board.reserve_attempt(root, 'team_tool', self.tool.name, parent.policy.max_tool_calls):
+                    raise TeamBudgetExhausted('global controller/specialist tool budget exhausted')
+                return self.tool.run(arguments, context)
+
+        def validate_plan(args):
+            try:
+                return ResearchPlan.from_payload(args)
+            except ContractViolation as exc:
+                raise ToolArgumentRejected('Plan was not recorded: ' + str(exc)) from exc
+
         def state():
             records = parent._state(root)
             plans = sorted((int(k.rsplit(':',1)[1]),v) for k,v in records.items() if k.startswith('controller:plan:'))
@@ -158,7 +174,7 @@ class ResearchController(PortfolioResearch):
                 if key.startswith('controller:started:'):
                     task_id = key.rsplit(':',1)[1]
                     if next(t for t in plan.tasks if t['task_id'] == task_id) != entry['task']:
-                        raise ContractViolation('a revised plan cannot change a task already started')
+                        raise ToolArgumentRejected('Plan was not recorded: a revised plan cannot change a task already started')
             index = sum(k.startswith('controller:plan:') for k in records)
             parent.board.save(root, 'controller:plan:' + str(index), contract, plan.payload())
             return {'plan': plan.payload(), 'plan_hash': plan.digest}
@@ -167,12 +183,13 @@ class ResearchController(PortfolioResearch):
             task_id = args['task_id']
             records, plan = state()
             if plan is None:
-                raise ContractViolation('record a validated research plan before execution')
+                raise ToolArgumentRejected('Task was not started: record a validated research plan before execution')
             completed = {key.rsplit(':',1)[1] for key in records if key.startswith('controller:task:')}
             if task_id in completed:
                 return records['controller:task:' + task_id]
             if task_id not in plan.ready(completed):
-                raise ContractViolation('task dependencies are not yet independently audited')
+                raise ToolArgumentRejected('Task was not started: dependencies are not yet independently audited. '
+                                           'Ready tasks: ' + ', '.join(plan.ready(completed)))
             task = next(row for row in plan.tasks if row['task_id'] == task_id)
             parent.board.save(root, 'controller:started:' + task_id, contract, {'task': task})
             if task_id in ROLES:
@@ -190,16 +207,8 @@ class ResearchController(PortfolioResearch):
                             raise TeamBudgetExhausted('quantitative model budget exhausted')
                         return parent.model.next_call(messages, descriptors)
 
-                class QuantTool:
-                    def __init__(self, tool): self.tool = tool
-                    def __getattr__(self, name): return getattr(self.tool, name)
-                    def run(self, arguments, ctx):
-                        if not parent.board.reserve_attempt(root, 'team_tool', self.tool.name, parent.policy.max_tool_calls):
-                            raise TeamBudgetExhausted('quantitative tool budget exhausted')
-                        return self.tool.run(arguments, ctx)
-
                 quant_runtime = AgentRuntime(db_path=parent.db_path,model=QuantModel(),policy=parent.policy,
-                    tools=tuple(QuantTool(t) for t in quant_tools),role_prompts=QUANT_PROMPTS, repair_protocol=True)
+                    tools=tuple(BudgetedTool(t) for t in quant_tools),role_prompts=QUANT_PROMPTS, repair_protocol=True)
                 try:
                     stage = quant_runtime.execute(run_id=root + ':quantitative', objective=task['question'],
                         as_of=datetime.fromisoformat(frozen['as_of']), context={'specialist_role':'quantitative',
@@ -226,25 +235,19 @@ class ResearchController(PortfolioResearch):
                     raise TeamBudgetExhausted('global controller/specialist model budget exhausted')
                 return parent.model.next_call(messages, descriptors)
 
-        def bounded(fn):
-            def wrapped(args, context):
-                if not parent.board.reserve_attempt(root, 'team_tool', context.task_id, parent.policy.max_tool_calls):
-                    raise TeamBudgetExhausted('global controller/specialist tool budget exhausted')
-                return fn(args, context)
-            return wrapped
-
         def valid_task(args):
             if args['task_id'] not in REQUIRED_TASKS:
                 raise ContractViolation('unapproved controller task')
 
         tools = (
             ApprovedTool('record_plan', VERSION, 'Record or revise the validated research plan.', plan_schema(),
-                bounded(record), ResearchPlan.from_payload, lambda r,c: None, read_only=False, internal_ledger_only=True),
+                record, validate_plan, lambda r,c: None, read_only=False, internal_ledger_only=True),
             ApprovedTool('run_specialist', VERSION, 'Run one ready task; specialists and quantitative jobs retain original audits.',
                 {'type':'object','properties':{'task_id':{'type':'string','enum':list(REQUIRED_TASKS)}},
                  'required':['task_id'],'additionalProperties':False},
-                bounded(run), valid_task, lambda r,c: None, read_only=False, internal_ledger_only=True))
-        runtime = AgentRuntime(db_path=self.db_path, model=BudgetedModel(), policy=self.policy, tools=tools,
+                run, valid_task, lambda r,c: None, read_only=False, internal_ledger_only=True))
+        runtime = AgentRuntime(db_path=self.db_path, model=BudgetedModel(), policy=self.policy,
+                               tools=tuple(BudgetedTool(t) for t in tools),
                                role_prompts=PROMPTS, repair_protocol=True)
         try:
             result = runtime.execute(run_id=root + ':controller', objective=contract['objective'],
@@ -262,7 +265,9 @@ class ResearchController(PortfolioResearch):
     def _complete_output(self, output, root, contract):
         records = self._state(root)
         output['workflow'] = VERSION
-        output['research_plans'] = [v for k,v in sorted(records.items()) if k.startswith('controller:plan:')]
+        output['research_plans'] = [v for k,v in sorted(
+            ((k,v) for k,v in records.items() if k.startswith('controller:plan:')),
+            key=lambda row: int(row[0].rsplit(':', 1)[1]))]
         output['quantitative_tools'] = records['controller:task:quantitative']['results']
         output['quantitative_review'] = records['controller:task:quantitative']['critic_reviews']
         output['quantitative_preparation'] = self.board.load(root, 'team_inputs', contract).get('quantitative_preparation')
@@ -273,5 +278,6 @@ class ResearchController(PortfolioResearch):
             output['monitoring'] = register_watch(self.db_path, run_id=output['run_id'], account_id=contract['account_id'],
                 frozen=frozen, scenarios=output['scenarios'], assessment=output['assessment'], at=self.clock())
         else:
-            output['monitoring'] = {'status': 'parent_watch_retained', 'automatic_orders_enabled': False}
+            output['monitoring'] = {'status': 'parent_watch_retained' if self.feedback_context else 'disabled',
+                                    'automatic_orders_enabled': False}
         return output

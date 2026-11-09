@@ -194,8 +194,13 @@ class AgentRuntime:
         request = {"phase": phase, "messages": state[key], "tools": descriptors}
         task_id = f"decision:{state['step']}"
         saved = self.board.load(state["run_id"], task_id, request)
+        # A rejected provider response is a committed decision too. A crash
+        # before the graph checkpoint must replay its feedback before spending
+        # again, including when review-scope guidance has since been upgraded.
+        rejection = (self.board.load(state['run_id'], 'protocol-rejection:' + task_id, request)
+                     if saved is None else None)
         scope = self._review_scope(state)
-        if saved is None and scope and state.get('review_scope_version') != scope['version']:
+        if saved is None and rejection is None and scope and state.get('review_scope_version') != scope['version']:
             # A separate graph step persists the clarification before any model
             # request. Previously committed decisions retain their exact inputs.
             contract_hash = self.connection.execute('SELECT contract_hash FROM advisory_runs WHERE run_id=?',
@@ -204,7 +209,7 @@ class AgentRuntime:
                             {'scope': scope, 'publication_gate_changed': False, 'budget_reset': False})
             return {'pending': {}, 'review_scope_version': scope['version'],
                     key: [*state[key], {'role': 'user', 'content': canonical({'research_review_scope': scope})}]}
-        if saved is None:
+        if saved is None and rejection is None:
             limit = self.policy.max_model_calls - (self.policy.critic_reserved_calls if phase == "researcher" else 0)
             if not self.board.reserve_attempt(state["run_id"], "model", task_id, limit):
                 return {"status": "budget_exhausted", "pending": {}}
@@ -220,11 +225,13 @@ class AgentRuntime:
                 rejection = ({'code': protocol_error} if protocol_error else
                              {'code': 'single_tool_call_required', 'tool_call_count': exc.context['tool_call_count']})
                 self.board.save(state['run_id'],'protocol-rejection:'+task_id,request,rejection)
-                return {'pending':{},'step':state['step']+1,key:[*state[key],{'role':'user','content':canonical({
-                    'protocol_rejection':rejection,'instruction':'上一响应未执行。每次只调用一个已批准函数，参数必须是完整合法的 JSON 对象，数值必须有限。等待其结果后才能选择下一步。不要并行调用，不要用纯文本结束。'})}]}
-            saved = asdict(call)
-            canonical(saved)
-            self.board.save(state["run_id"], task_id, request, saved)
+            else:
+                saved = asdict(call)
+                canonical(saved)
+                self.board.save(state["run_id"], task_id, request, saved)
+        if rejection is not None:
+            return {'pending':{},'step':state['step']+1,key:[*state[key],{'role':'user','content':canonical({
+                'protocol_rejection':rejection,'instruction':'上一响应未执行。每次只调用一个已批准函数，参数必须是完整合法的 JSON 对象，数值必须有限。等待其结果后才能选择下一步。不要并行调用，不要用纯文本结束。'})}]}
         call = ToolCall(**saved)
         if call.name not in {item["function"]["name"] for item in descriptors}:
             raise ContractViolation(f"model requested an unauthorized {phase} tool: {call.name}")

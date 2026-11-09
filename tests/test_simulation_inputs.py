@@ -1,10 +1,11 @@
 from copy import deepcopy
+from datetime import timedelta
 
 import pytest
 
-from scenario_engine.errors import ContractViolation
+from scenario_engine.errors import ContractViolation, PointInTimeViolation
 from src.stock_app.quantitative_inputs import derived_artifact
-from src.stock_app.simulation_inputs import bind_simulation_portfolio
+from src.stock_app.quantitative_readiness import bind_simulation_portfolio
 from tests.test_action_source_binding import total_return_case, NOW
 
 
@@ -25,5 +26,18 @@ def test_simulation_uses_frozen_holdings_and_real_price_fields_without_custody_c
         research['portfolio']['positions'][0]['quantity'] = 200
         with pytest.raises(ContractViolation, match='differs'):
             bind_simulation_portfolio(repo, research, NOW)
+        research['portfolio'] = deepcopy(payload)
+        research['portfolio']['total_value'] += 100
+        with pytest.raises(ContractViolation, match='differs'):
+            bind_simulation_portfolio(repo, research, NOW)
+        research['portfolio'] = deepcopy(payload)
+        for ref in (price.artifact_id, item.artifact_id):
+            original = repo.get_visible(ref, NOW)
+            c.execute('UPDATE market_artifacts SET ingested_at=? WHERE artifact_id=?',
+                      ((NOW + timedelta(days=1)).isoformat(), ref))
+            with pytest.raises(PointInTimeViolation):
+                bind_simulation_portfolio(repo, research, NOW)
+            c.execute('UPDATE market_artifacts SET ingested_at=? WHERE artifact_id=?',
+                      (original.ingested_at.isoformat(), ref))
     finally:
         c.close()

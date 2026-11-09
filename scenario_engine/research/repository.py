@@ -8,7 +8,7 @@ from datetime import datetime, time, timezone
 from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo
 
-from scenario_engine.data_provider import ScenarioDataProvider
+from scenario_engine.legacy.data.data_provider import ScenarioDataProvider
 from scenario_engine.errors import ContractViolation
 
 from .models import ExternalEvidenceDocument, ResearchSourceConfig, SourceFetchStatus

@@ -28,24 +28,32 @@ def _table(connection):
     connection.commit()
 
 
-def pending_revision(connection, run_id):
+def latest_revision(connection, run_id):
+    """Read the latest correction, including a newer blocked/pending one."""
     if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='portfolio_report_revisions'").fetchone():
         return None
-    row = connection.execute("SELECT contract_json,status FROM portfolio_report_revisions WHERE run_id=? ORDER BY sequence DESC LIMIT 1", (run_id,)).fetchone()
-    return json.loads(row[0]) if row and row[1] != 'approved' else None
+    row = connection.execute("SELECT base_hash,status,result_json,contract_json FROM portfolio_report_revisions WHERE run_id=? ORDER BY sequence DESC LIMIT 1", (run_id,)).fetchone()
+    if row is None:
+        return None
+    return {'base_hash': row[0], 'status': row[1],
+            'result': json.loads(row[2]) if row[2] is not None else None,
+            'contract': json.loads(row[3])}
+
+
+def pending_revision(connection, run_id):
+    revision = latest_revision(connection, run_id)
+    return revision['contract'] if revision and revision['status'] != 'approved' else None
 
 
 def latest_report(connection, run_id, original):
-    if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='portfolio_report_revisions'").fetchone():
+    revision = latest_revision(connection, run_id)
+    if not revision:
         return original
-    row = connection.execute("SELECT base_hash,status,result_json,contract_json FROM portfolio_report_revisions WHERE run_id=? ORDER BY sequence DESC LIMIT 1", (run_id,)).fetchone()
-    if not row:
-        return original
-    if row[0] != fingerprint(original):
+    if revision['base_hash'] != fingerprint(original):
         raise ContractViolation("report revision does not belong to the immutable base report")
-    if row[1] == 'approved':
-        return json.loads(row[2])
-    contract = json.loads(row[3])
+    if revision['status'] == 'approved':
+        return revision['result']
+    contract = revision['contract']
     return {'run_id': run_id, 'status': 'budget_exhausted' if contract.get('blocked_reason') in {'original_budget_exhausted', 'scope_budget_exhausted'} else 'post_review_required',
             'publication_eligible': False, 'failed_stage': 'portfolio_post_review', 'findings': contract['findings']}
 

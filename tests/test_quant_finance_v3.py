@@ -220,6 +220,32 @@ def test_strict_engine_preflight_reports_all_cold_start_blockers_without_using_l
         engine.close()
 
 
+def test_readiness_uses_utc_visibility_and_ingestion_for_artifacts_and_samples(tmp_path):
+    engine = ScenarioEngine(db_path=str(tmp_path / 'readiness-time.db'), use_llm=False)
+    repo = engine.market_artifact_repository
+    cutoff = ts(20, 1)
+    try:
+        # 08:30 +08:00 is already visible at 01:00 UTC, despite lexical ordering.
+        visible_at = ts(20).replace(hour=8, minute=30, tzinfo=ZoneInfo('Asia/Shanghai'))
+        repo.add(artifact('visible', 'fundamental', 'pit_financials', '000001', visible_at,
+                          visible_at, {'revenue': 1}))
+        assert engine._has_visible_artifact('fundamental', 'pit_financials', '000001', cutoff)
+        # A negative offset can otherwise make a future receipt appear earlier.
+        future = (cutoff + timedelta(hours=2)).astimezone(timezone(-timedelta(hours=5)))
+        repo.add(artifact('future', 'fundamental', 'pit_financials', '000002', ts(19),
+                          future, {'revenue': 1}))
+        assert not engine._has_visible_artifact('fundamental', 'pit_financials', '000002', cutoff)
+        repo.add(replace(artifact('late', 'fundamental', 'pit_financials', '000003', ts(19),
+                                 ts(19), {'revenue': 1}), ingested_at=cutoff + timedelta(hours=1)))
+        assert not engine._has_visible_artifact('fundamental', 'pit_financials', '000003', cutoff)
+        payload = {'historical_event_id': 'e', 'returns': {'000001': {str(h): .01 for h in (1, 5, 20, 60)}}}
+        sample = artifact('sample', 'event', 'event_study_observation', 'MARKET', ts(19), ts(19), payload)
+        repo.add(replace(sample, ingested_at=cutoff + timedelta(hours=1)))
+        assert not engine._has_event_sample_coverage('event_study_observation', '000001', cutoff, min_samples=1)
+    finally:
+        engine.close()
+
+
 def test_strict_engine_facade_rejects_quarantined_v2_run(tmp_path):
     engine = ScenarioEngine(db_path=str(tmp_path / "strict-facade.db"), persist=False, use_llm=False)
     try:
@@ -227,6 +253,27 @@ def test_strict_engine_facade_rejects_quarantined_v2_run(tmp_path):
             engine.run("legacy proxy scenario", "2020-03-20", symbols=["000001"])
     finally:
         engine.close()
+
+
+def test_current_imports_do_not_eagerly_load_legacy_experiments():
+    import subprocess
+    import sys
+    from pathlib import Path
+    code = '''
+import sys
+from scenario_engine import ScenarioEngine, validate_runtime_environment
+from scenario_engine.agents.scenario_client import ScenarioLLMClient
+from scenario_engine.research.models import ExternalEvidenceDocument
+from scenario_engine.research.config import load_research_sources
+assert not any(name.startswith('scenario_engine.legacy') for name in sys.modules)
+from scenario_engine import LegacyScenarioEngine, get_scenario_report_schema
+assert callable(get_scenario_report_schema)
+assert LegacyScenarioEngine.execute is ScenarioEngine.execute
+assert LegacyScenarioEngine.deployment_readiness is ScenarioEngine.deployment_readiness
+'''
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                            cwd=Path(__file__).resolve().parents[1], timeout=60)
+    assert result.returncode == 0, result.stderr
 
 
 def test_mission_plan_keeps_current_industry_membership_beyond_price_lookback():
@@ -1165,3 +1212,29 @@ def test_full_strict_engine_commits_calibrated_run_bundle_after_readiness(tmp_pa
         lease_expires_at=claimed_at + timedelta(minutes=1),
     )
     assert claimed is None
+
+
+def test_cross_source_reconciliation_cannot_be_inherited_by_a_new_revision():
+    connection = sqlite3.connect(':memory:')
+    repository = MarketArtifactRepository(connection, clock=lambda: ts(20))
+    left = artifact('left-v1', 'price', 'equity_price', '000001', ts(18), ts(18),
+                    {'close': 10.}, adjustment='none', source_id='vendor_a')
+    right = replace(left, artifact_id='right-v1', source_id='vendor_b',
+                    known_at=ts(18) + timedelta(minutes=1), ingested_at=ts(18) + timedelta(minutes=1))
+    payload = {'close': 20.}
+    revised = replace(left, artifact_id='left-v2', revision_id='v2',
+                      known_at=ts(18) + timedelta(minutes=2), ingested_at=ts(18) + timedelta(minutes=2),
+                      payload=payload, payload_hash=canonical_payload_hash(payload))
+    repository.add_many((left, right, revised))
+    repository.record_reconciliation(reconciliation_id='original', dataset='equity_price',
+        left_artifact_id=left.artifact_id, right_artifact_id=right.artifact_id,
+        comparison_rule_version='test-v1', difference={}, status='resolved', resolved_artifact_id=left.artifact_id)
+    request = DataRequest('price', 'equity_price', ('000001',), ts(17), ts(20), ts(20),
+                          frequency='1d', adjustment='none')
+    with pytest.raises(DataConflict):
+        repository.query(request)
+    repository.record_reconciliation(reconciliation_id='revised', dataset='equity_price',
+        left_artifact_id=revised.artifact_id, right_artifact_id=right.artifact_id,
+        comparison_rule_version='test-v1', difference={'close': 10.}, status='resolved', resolved_artifact_id=revised.artifact_id)
+    assert repository.query(request) == (revised,)
+    connection.close()

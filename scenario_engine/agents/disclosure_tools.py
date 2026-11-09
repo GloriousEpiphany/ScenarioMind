@@ -1,6 +1,6 @@
 """Bounded exact-text reads of verified frozen disclosure originals."""
 from copy import deepcopy
-from scenario_engine.errors import ContractViolation, DataUnavailable, ToolArgumentRejected
+from scenario_engine.errors import ContractViolation, ToolArgumentRejected
 from .tools import ApprovedTool, fingerprint
 
 
@@ -18,13 +18,11 @@ def make_disclosure_tools(repository, *, manifest, chunk_chars=12000, targeted=F
         version = 'frozen-disclosure-spans-v2:' + fingerprint({'manifest': manifest, 'chunk_chars': chunk_chars})
 
     def source(ref, context):
-        item = repository.get_visible(ref, context.as_of)
+        item = repository.get_visible(ref, context.as_of, strict_pit=True)
         row = sources[ref]
         if (item.payload_hash != row['payload_hash'] or
                 (item.domain, item.dataset, item.entity_id) != (row['domain'], row['dataset'], row['entity_id'])):
             raise ContractViolation('frozen disclosure differs from source manifest')
-        if item.ingested_at > context.as_of:
-            raise DataUnavailable('disclosure was not ingested at the frozen cutoff')
         if item.schema_version not in {'cninfo-disclosure-pdf-v1', 'cninfo-disclosure-ocr-pdf-v1'}:
             raise ContractViolation('unsupported verified disclosure schema')
         return item
@@ -175,7 +173,7 @@ def make_quoted_hypothesis_tool(repository, *, manifest, required_entities=(), r
         for path, original in zip(output['hypotheses'], args['hypotheses']):
             quotes = []
             for row in original['evidence_quotes']:
-                item = repository.get_visible(row['artifact_id'], context.as_of)
+                item = repository.get_visible(row['artifact_id'], context.as_of, strict_pit=True)
                 end = row['offset'] + len(row['quote'])
                 if item.payload['content'][row['offset']:end] != row['quote']:
                     raise ToolArgumentRejected('quote text differs from the original at the declared offset')

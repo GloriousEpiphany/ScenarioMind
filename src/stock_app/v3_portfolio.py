@@ -406,14 +406,9 @@ class CurrentPortfolioSnapshotModule:
             strict_pit=True,
         )
         latest: dict[str, MarketArtifact] = {}
-        artifacts = (tuple(self.repository.get_visible(ref, known_at) for ref in self.price_artifact_ids)
-                     if self.price_artifact_ids is not None else self.repository.query(request, source_id=self.price_source_id))
+        artifacts = self.repository.query(request, source_id=self.price_source_id,
+            latest_per_entity=True, artifact_ids=self.price_artifact_ids)
         for artifact in artifacts:
-            if self.price_source_id and (artifact.domain != "price" or artifact.dataset != "equity_price"
-                    or artifact.source_id != self.price_source_id or artifact.adjustment != "none" or artifact.frequency != "1d"):
-                raise ContractViolation("portfolio price artifact violates the frozen source plan")
-            if artifact.entity_id not in symbols:
-                continue
             previous = latest.get(artifact.entity_id)
             if previous is None or (artifact.event_time, artifact.known_at) > (
                 previous.event_time,

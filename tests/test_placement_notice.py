@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from dataclasses import replace
 import pytest
 from scenario_engine.errors import ContractViolation,DataUnavailable
-from src.stock_app.placement_notice import placement_notice
+from src.stock_app.corporate_action_notices import placement_notice
 from src.stock_app.cninfo_actions import _check_capital
 
 
@@ -22,7 +22,7 @@ def test_release_requires_original_partition_conservation_and_catalogue_total(mo
     day=date(2008,8,12);at=datetime(2026,11,8,tzinfo=timezone.utc)
     doc=SimpleNamespace(artifact_id='notice',event_time=datetime(2008,8,6,tzinfo=timezone.utc),
         payload={'title':'网下配售股票上市流通的提示性公告','content':TEXT})
-    monkeypatch.setattr('src.stock_app.placement_notice.read_disclosure_coverage',lambda *args:(None,None,None,[doc]))
+    monkeypatch.setattr('src.stock_app.corporate_action_notices.read_disclosure_coverage',lambda *args:(None,None,None,[doc]))
     refs={'coverage_ref':'coverage','document_ref':'notice'}
     release=placement_notice(None,'002230',refs,day,at)
     assert release.total_shares==107166000 and release.released_shares==5360000

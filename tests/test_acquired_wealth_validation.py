@@ -28,7 +28,7 @@ def inputs():
     artifact('protocol', 'joint_wealth_event_protocol', encode(policy), policy.risk.registered_at)
     artifact('archive', 'joint_origin_forecast_archive', {'forecast_refs': []}, cutoff)
     refs = {'wealth_panel': 'panel', 'wealth_protocol': 'protocol', 'origin_projections': 'archive'}
-    repo = SimpleNamespace(get_visible=lambda ref, at: values[ref])
+    repo = SimpleNamespace(get_visible=lambda ref, at, *, strict_pit=False: values[ref])
     return panel, policy, projections, cutoff, values, artifact, refs, repo, encode
 
 

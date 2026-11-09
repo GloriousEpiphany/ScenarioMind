@@ -97,6 +97,38 @@ def _account(connection: sqlite3.Connection, account_id: int = 1) -> None:
     connection.commit()
 
 
+def test_current_valuation_ignores_old_conflicts_but_keeps_latest_conflicts():
+    from dataclasses import replace
+    from scenario_engine.errors import DataConflict
+    connection = _connection()
+    _account(connection)
+    repo = MarketArtifactRepository(connection)
+    latest = _price_artifact('000001', 10., artifact_id='latest')
+    old = replace(latest, artifact_id='old', event_time=latest.event_time - timedelta(days=1))
+    other = replace(old, artifact_id='other-old', source_id='eastmoney_http')
+    repo.add_many((old, other, latest))
+    module = CurrentPortfolioSnapshotModule(connection, clock=lambda: CAPTURED_AT)
+    assert module.preview(1).positions[0].price_artifact_id == 'latest'
+    assert module.publish(1).total_value == 30000.
+    from scenario_engine.data import DataRequest
+    history = DataRequest('price', 'equity_price', ('000001',), old.event_time,
+                          CAPTURED_AT, CAPTURED_AT, frequency='1d', adjustment='none')
+    with pytest.raises(DataConflict):
+        repo.query(history)
+    # A future quote must not hide a conflict at the latest visible observation.
+    repo.add(replace(latest, artifact_id='future', event_time=CAPTURED_AT + timedelta(days=1),
+                     known_at=CAPTURED_AT + timedelta(days=1), ingested_at=CAPTURED_AT + timedelta(days=1)))
+    repo.add(replace(latest, artifact_id='other-latest', source_id='eastmoney_http'))
+    with pytest.raises(DataConflict):
+        module.preview(1)
+    repo.clock = lambda: CAPTURED_AT
+    repo.record_reconciliation(reconciliation_id='latest-price-check', dataset='equity_price',
+        left_artifact_id='latest', right_artifact_id='other-latest', comparison_rule_version='test-v1',
+        difference={'close': 0}, status='resolved', resolved_artifact_id='latest')
+    assert module.preview(1).positions[0].price_artifact_id == 'latest'
+    connection.close()
+
+
 def test_automatic_account_selection_never_guesses_between_active_accounts():
     empty = AccountSummary(1, "空仓", 100.0, "2026-08-13", 0, None)
     active = AccountSummary(2, "实盘", 100.0, "2026-08-13", 2, "2026-08-13T18:00:00")
@@ -240,7 +272,7 @@ def test_explicit_frozen_price_plan_does_not_mix_old_sources_or_later_revisions(
         ingested_at=old.ingested_at + timedelta(hours=1),
         payload=selected_payload, payload_hash=canonical_payload_hash(selected_payload))
     later_payload = {'close': 99.0}
-    later = replace(selected, artifact_id='later-eastmoney', known_at=selected.known_at + timedelta(hours=1),
+    later = replace(selected, artifact_id='later-eastmoney', revision_id='later', known_at=selected.known_at + timedelta(hours=1),
         ingested_at=selected.ingested_at + timedelta(hours=1),
         payload=later_payload, payload_hash=canonical_payload_hash(later_payload))
     repository.ingest_many((old, selected, later))
@@ -259,4 +291,58 @@ def test_explicit_frozen_price_plan_does_not_mix_old_sources_or_later_revisions(
     with pytest.raises(ContractViolation, match='source plan'):
         bad.publish(1, portfolio_ref='bad-plan')
     assert connection.execute("SELECT COUNT(*) FROM market_artifacts WHERE domain='portfolio'").fetchone()[0] == 1
+    connection.close()
+
+
+@pytest.mark.parametrize('field', ['event_time', 'ingested_at'])
+def test_frozen_prices_cannot_bypass_strict_point_in_time_visibility(field):
+    from dataclasses import replace
+    from scenario_engine.errors import PointInTimeViolation
+    connection = _connection()
+    _account(connection)
+    original = _price_artifact('000001', 10., artifact_id='future-price')
+    future = replace(original, **{field: CAPTURED_AT + timedelta(days=1)})
+    MarketArtifactRepository(connection).add(future)
+    module = CurrentPortfolioSnapshotModule(connection, clock=lambda: CAPTURED_AT,
+        price_source_id=future.source_id, price_artifact_ids=(future.artifact_id,))
+    with pytest.raises(PointInTimeViolation):
+        module.publish(1)
+    assert connection.execute("SELECT COUNT(*) FROM market_artifacts WHERE domain='portfolio'").fetchone()[0] == 0
+    connection.close()
+
+
+def test_frozen_prices_reject_conflicting_revisions_in_the_frozen_scope():
+    from dataclasses import replace
+    from scenario_engine.errors import DataConflict
+    connection = _connection()
+    _account(connection)
+    first = _price_artifact('000001', 10., artifact_id='first')
+    payload = {'close': 20.}
+    second = replace(first, artifact_id='second', revision_id='v2',
+                     payload=payload, payload_hash=canonical_payload_hash(payload))
+    MarketArtifactRepository(connection).add_many((first, second))
+    module = CurrentPortfolioSnapshotModule(connection, clock=lambda: CAPTURED_AT,
+        price_source_id=first.source_id, price_artifact_ids=(first.artifact_id, second.artifact_id))
+    with pytest.raises(DataConflict):
+        module.preview(1)
+    connection.close()
+
+
+def test_cyclic_source_reconciliation_cannot_silently_select_a_price():
+    from dataclasses import replace
+    from scenario_engine.data import DataRequest
+    from scenario_engine.errors import DataConflict
+    connection = _connection()
+    repo = MarketArtifactRepository(connection, clock=lambda: CAPTURED_AT)
+    base = _price_artifact('000001', 10., artifact_id='A')
+    for name in ('A', 'B', 'C'):
+        repo.add(replace(base, artifact_id=name, source_id=name))
+    for left, right, winner in (('A', 'B', 'B'), ('B', 'C', 'C'), ('A', 'C', 'A')):
+        repo.record_reconciliation(reconciliation_id=left + right, dataset='equity_price',
+            left_artifact_id=left, right_artifact_id=right, comparison_rule_version='test-v1',
+            difference={}, status='resolved', resolved_artifact_id=winner)
+    request = DataRequest('price', 'equity_price', ('000001',), base.event_time,
+                          CAPTURED_AT, CAPTURED_AT, frequency='1d', adjustment='none')
+    with pytest.raises(DataConflict, match='inconsistent'):
+        repo.query(request)
     connection.close()

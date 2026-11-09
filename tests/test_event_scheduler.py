@@ -1,4 +1,4 @@
-from scenario_engine.event_scheduler import EventPollingScheduler
+from scenario_engine.legacy.monitoring.event_scheduler import EventPollingScheduler
 
 
 class Report:

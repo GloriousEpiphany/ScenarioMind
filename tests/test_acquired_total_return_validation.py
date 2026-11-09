@@ -61,3 +61,45 @@ def test_unbound_total_returns_never_enter_fitting_or_receive_certificate(tmp_pa
         assert engine.connection.execute('SELECT COUNT(*) FROM quantitative_validation_runs').fetchone()[0] == 1
     finally:
         engine.close()
+
+
+def test_total_return_protocol_cannot_backdate_its_immutable_registration(tmp_path):
+    engine, refs = _acquired_baseline(tmp_path)
+    try:
+        protocol = engine.repository.get_visible(refs['protocol'], engine.clock())
+        engine.connection.execute('UPDATE market_artifacts SET ingested_at=? WHERE artifact_id=?',
+            ((protocol.known_at + timedelta(hours=1)).isoformat(), refs['protocol']))
+        engine.connection.commit()
+        result = validate_quantitative_release(engine.db_path, 'test', input_refs=refs)
+        stage = result['stages']['joint_calibration']
+        assert stage['status'] == 'blocked'
+        assert 'registration time' in stage['reason']
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize('defect', ['missing', 'late'])
+@pytest.mark.parametrize('scope', ['release', 'prediction_simulation'])
+def test_unreadable_frozen_manifest_persists_blocked_diagnostic(tmp_path, defect, scope):
+    from src.stock_app.quantitative_validation import latest_quantitative_validation
+    engine, original = prepare(tmp_path)
+    try:
+        if defect == 'missing':
+            original['evidence'][0]['artifact_id'] = 'missing-frozen-original'
+            engine.connection.execute('UPDATE portfolio_research_jobs SET result_json=? WHERE run_id=?',
+                                      (json.dumps(original), 'test'))
+        else:
+            engine.connection.execute('UPDATE market_artifacts SET ingested_at=? WHERE artifact_id=?',
+                ((engine.clock() + timedelta(days=1)).isoformat(), original['evidence'][0]['artifact_id']))
+        engine.connection.commit()
+        result = validate_quantitative_release(engine.db_path, 'test', validation_scope=scope)
+        assert result['status'] == 'blocked' and not result['publication_eligible']
+        assert result['evidence_readiness']['evidence_complete'] is False
+        error = result['evidence_readiness']['error_code']
+        assert error in {'data_unavailable', 'point_in_time_violation'}
+        assert result['stages']['joint_calibration']['error_code'] == error
+        if scope == 'prediction_simulation':
+            assert result['stages']['simulation_inputs']['error_code'] == error
+        assert latest_quantitative_validation(engine.db_path, 'test') == result
+    finally:
+        engine.close()

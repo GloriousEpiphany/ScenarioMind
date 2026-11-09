@@ -11,6 +11,66 @@ from scenario_engine.agents.tools import canonical,fingerprint
 from src.stock_app.portfolio_research_jobs import connect
 
 
+def test_tracking_waits_for_latest_revision_and_uses_sequence_not_timestamp(tmp_path):
+    from src.stock_app.research_tracking import register_watch
+    from src.stock_app.portfolio_report_revision import _table
+    db = tmp_path / 'revision-watch.db'
+    frozen = {'as_of': NOW.isoformat(), 'portfolio': {'positions': [{'symbol': '000001'}]}, 'manifest': []}
+    register_watch(db, run_id='parent', account_id=1, frozen=frozen,
+                   scenarios=['original'], assessment={'view': 'original'}, at=NOW)
+    with sqlite3.connect(db) as c:
+        _table(c)
+        for status, root, stamp in [('approved', 'old', NOW + timedelta(days=1)),
+                                     ('pending', 'new', NOW)]:
+            c.execute('INSERT INTO portfolio_report_revisions(run_id,revision_root,base_hash,contract_json,status,result_json,created_at) VALUES(?,?,?,?,?,?,?)',
+                ('parent', root, 'base', '{}', status, canonical({'scenarios': [root], 'assessment': {'view': root}}), stamp.isoformat()))
+    assert scan_watches(db, now=NOW + timedelta(days=2)) == []
+    with sqlite3.connect(db) as c:
+        assert c.execute('SELECT cycles FROM research_watches').fetchone()[0] == 0
+        c.execute("UPDATE portfolio_report_revisions SET status='approved' WHERE revision_root='new'")
+    feedback = scan_watches(db, now=NOW + timedelta(days=2))
+    assert feedback[0]['prior_scenarios'] == ['new']
+    assert feedback[0]['prior_assessment'] == {'view': 'new'}
+
+
+def test_pending_feedback_rebinds_new_study_but_never_rewrites_old_trigger(tmp_path, monkeypatch):
+    from src.stock_app import portfolio_research_jobs as jobs
+    from src.stock_app.research_tracking import register_watch
+    from src.stock_app.portfolio_report_revision import _table
+    db = tmp_path / 'revision-feedback.db'
+    request = {'account_id': 1, 'policy': {'max_model_calls': 80, 'max_tool_calls': 60},
+               'objective': 'recheck', 'preferences': {}}
+    parent = jobs.enqueue(db, request)
+    frozen = {'as_of': NOW.isoformat(), 'portfolio': {'positions': [{'symbol': '000001'}]}, 'manifest': []}
+    register_watch(db, run_id=parent, account_id=1, frozen=frozen,
+                   scenarios=['original'], assessment={'view': 'original'}, at=NOW)
+    now = NOW + timedelta(days=2)
+    trigger = scan_watches(db, now=now)[0]
+    corrected = {'scenarios': ['corrected'], 'assessment': {'view': 'corrected'}}
+    with sqlite3.connect(db) as c:
+        _table(c)
+        c.execute('INSERT INTO portfolio_report_revisions(run_id,revision_root,base_hash,contract_json,status,result_json,created_at) VALUES(?,?,?,?,?,?,?)',
+                  (parent, 'revision', 'base', '{}', 'pending', canonical(corrected), now.isoformat()))
+    def forbidden(*a, **kw):
+        raise AssertionError('pending correction must prevent new model work')
+    monkeypatch.setattr(jobs, 'build_request', forbidden)
+    assert process_feedback(db, now=now, execute=True)[0]['status'] == 'awaiting_report_revision'
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE portfolio_report_revisions SET status='approved'")
+    monkeypatch.setattr(jobs, 'build_request', lambda *a, **kw: dict(request))
+    monkeypatch.setattr(jobs, 'execute_job', lambda *a, **kw: {'status': 'failed'})
+    child = process_feedback(db, now=now, execute=True)[0]['followup_run_id']
+    ctx = jobs.load_job(db, run_id=child)['request']['feedback_context']
+    assert ctx['prior_scenarios'] == corrected['scenarios']
+    assert ctx['prior_report_hash'] == fingerprint(corrected)
+    with sqlite3.connect(db) as c:
+        assert json.loads(c.execute('SELECT payload_json FROM research_feedback').fetchone()[0]) == trigger
+        c.execute('INSERT INTO portfolio_report_revisions(run_id,revision_root,base_hash,contract_json,status,result_json,created_at) VALUES(?,?,?,?,?,?,?)',
+            (parent, 'newer', 'base', '{}', 'approved', canonical({**corrected, 'scenarios': ['newer']}), now.isoformat()))
+    monkeypatch.setattr(jobs, 'execute_job', forbidden)
+    assert process_feedback(db, now=now, execute=True)[0]['status'] == 'blocked_stale_report_revision'
+
+
 def test_model_feedback_failure_cannot_prevent_maturity_audit(tmp_path, monkeypatch):
     import pytest
     import src.stock_app.research_worker as worker
@@ -34,7 +94,7 @@ def test_worker_never_turns_weekend_into_forecast_and_retries_are_bounded(tmp_pa
         def __init__(self,*a):pass
         def read(self,code,start,end):
             return {date(2026,11,5):{'close':100.},date(2026,11,6):{'close':101.}},BASE+code
-    monkeypatch.setattr('src.stock_app.checkpointed_prices.CheckpointedEastmoneyReader',Reader)
+    monkeypatch.setattr('src.stock_app.eastmoney_prices.CheckpointedEastmoneyReader',Reader)
     def forbidden(*a,**kw):raise AssertionError('must not issue forecasts on invented sessions')
     result=tick_forward(db,clock=lambda:at,outlook=forbidden)
     assert result[0]['status']=='exchange_session_not_closed'
@@ -47,7 +107,8 @@ def test_worker_never_turns_weekend_into_forecast_and_retries_are_bounded(tmp_pa
         assert c.execute('SELECT COUNT(*) FROM issuer_forward_ticks').fetchone()[0]==3
 
 
-def test_feedback_enqueues_once_retains_budget_and_disables_recursive_watches(tmp_path,monkeypatch):
+def test_feedback_waits_for_opt_in_then_retains_budget_and_disables_recursive_watches(tmp_path,monkeypatch):
+    from src.stock_app import portfolio_research_jobs as jobs
     engine,_,_=controller(tmp_path)
     try:
         original=run(engine)
@@ -64,12 +125,25 @@ def test_feedback_enqueues_once_retains_budget_and_disables_recursive_watches(tm
         assert len(scan_watches(engine.db_path,now=now))==1
         first=process_feedback(engine.db_path,now=now)
         second=process_feedback(engine.db_path,now=now)
-        assert first==second and first[0]['status']=='queued'
+        assert first==second and first[0]['status']=='awaiting_execution_approval'
+        assert first[0]['followup_run_id'] is None
         with sqlite3.connect(engine.db_path) as c:
             rows=c.execute("SELECT request_json FROM portfolio_research_jobs WHERE status='queued'").fetchall()
-            assert len(rows)==1
-            followup=json.loads(rows[0][0])
-            assert followup['tracking_enabled'] is False and followup['feedback_context']['parent_run_id']=='test'
+            assert not rows
+        executed=[]
+        def execute(db,run_id,*,execute_feedback=False):
+            assert execute_feedback is True
+            executed.append(run_id)
+            value={'run_id':run_id,'status':'conditional_research_complete'}
+            jobs.update_job(db,run_id,value['status'],result=value)
+            return value
+        monkeypatch.setattr(jobs,'execute_job',execute)
+        approved=process_feedback(engine.db_path,now=now,execute=True)
+        assert approved[0]['status']=='conditional_research_complete'
+        assert executed==[approved[0]['followup_run_id']]
+        followup=jobs.load_job(engine.db_path,run_id=executed[0])['request']
+        assert followup['tracking_enabled'] is False and followup['feedback_context']['parent_run_id']=='test'
+        assert process_feedback(engine.db_path,now=now,execute=True)==[]
     finally:engine.close()
 
 
@@ -82,7 +156,7 @@ def test_maturity_audit_runs_before_close_without_issuing_or_advancing_time(tmp_
         def read(self,code,start,end):
             assert end==date(2026,11,7)
             return {date(2026,11,5):{'close':100.},date(2026,11,6):{'close':101.}},BASE+code
-    monkeypatch.setattr('src.stock_app.checkpointed_prices.CheckpointedEastmoneyReader',Reader)
+    monkeypatch.setattr('src.stock_app.eastmoney_prices.CheckpointedEastmoneyReader',Reader)
     def acquire(db,run,symbol,start,end,**kw):
         assert end==date(2026,11,6) and kw['dates_only']
         return {'coverage_ref':'actual-dates'}

@@ -87,6 +87,41 @@ def test_malformed_calls_are_rejected_then_repaired_with_budget_counted(tmp_path
     finally:runtime.close()
 
 
+def test_committed_protocol_rejection_replays_after_crash_without_another_call(tmp_path):
+    p = policy()
+    path = tmp_path / 'rejection-commit.db'
+    first = ScriptedModel(p, [ContractViolation('malformed', context={'tool_call_count': 2})])
+    runtime = AgentRuntime(db_path=path, model=first, policy=p, tools=(tool(),), repair_protocol=True)
+    original_save = runtime.board.save
+    def crash(run_id, key, request, payload):
+        original_save(run_id, key, request, payload)
+        if key.startswith('protocol-rejection:'):
+            raise RuntimeError('crash after rejection commit')
+    runtime.board.save = crash
+    try:
+        with pytest.raises(RuntimeError, match='rejection commit'):
+            execute(runtime)
+        assert len(first.contexts) == 1
+    finally:
+        runtime.close()
+    # A distinct second invalid response used to overwrite decision:0's first
+    # rejection. It belongs to decision:1 after the committed rejection replays.
+    second = ScriptedModel(p, [ContractViolation('different malformed', context={'protocol_error': 'invalid_tool_arguments_json'}),
+        ToolCall('1', 'search_evidence', {'query': 'original'}), ToolCall('2', 'request_review', {}),
+        ToolCall('3', 'submit_review', {'passed': True, 'findings': ['Verified'], 'blocking_findings': []})])
+    resumed = AgentRuntime(db_path=path, model=second, policy=p, tools=(tool(),), repair_protocol=True)
+    try:
+        assert execute(resumed)['status'] == 'research_complete'
+        assert 'single_tool_call_required' in second.contexts[0][-1]['content']
+        assert len(second.contexts) == 4
+        assert resumed.connection.execute("SELECT COUNT(*) FROM agent_call_attempts WHERE kind='model'").fetchone()[0] == 5
+        assert [r[0] for r in resumed.connection.execute(
+            "SELECT artifact_key FROM agent_artifacts WHERE artifact_key LIKE 'protocol-rejection:%' ORDER BY artifact_key"
+        )] == ['protocol-rejection:decision:0', 'protocol-rejection:decision:1']
+    finally:
+        resumed.close()
+
+
 def test_v3_protocol_recovery_preserves_contract_tools_and_spent_budget(tmp_path):
     import json
     path = tmp_path / 'legacy-protocol.db'

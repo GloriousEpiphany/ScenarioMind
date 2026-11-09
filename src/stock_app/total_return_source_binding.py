@@ -20,14 +20,14 @@ RETURN_SPEC = {'algorithm': 'raw_close_action_log_return_v1',
 
 def bound_calendar(repo, ref, at):
     """Rebuild the exact session list from the acquired benchmark series."""
-    calendar = repo.get_visible(ref, at)
+    calendar = repo.get_visible(ref, at, strict_pit=True)
     if ((calendar.domain, calendar.dataset, calendar.schema_version)
             != ('calendar', 'trading_sessions', 'eastmoney-benchmark-calendar-v1')):
         raise DataUnavailable('total-return calendar lacks an implemented provider-specific numerical verifier')
     raw = calendar.payload
     if set(raw) != {'benchmark_ref', 'sessions'}:
         raise ContractViolation('total-return calendar schema changed')
-    benchmark = repo.get_visible(raw['benchmark_ref'], at)
+    benchmark = repo.get_visible(raw['benchmark_ref'], at, strict_pit=True)
     from src.stock_app.wealth_source_binding import bind_benchmark_return
     bars = benchmark.payload.get('bars', [])
     if len(bars) < 2:
@@ -53,8 +53,7 @@ def bind_total_return_panel_sources(repo, panel, *, evaluation_start, cutoff):
     ``verified`` field or infer zero corporate actions from missing records.
     """
     panel.validate()
-    definition = repo.get_visible(panel.return_definition_ref, min(evaluation_start, cutoff))
-    repo.get_visible(panel.calendar_ref, min(evaluation_start, cutoff))
+    definition = repo.get_visible(panel.return_definition_ref, min(evaluation_start, cutoff), strict_pit=True)
     if ((definition.domain, definition.dataset, definition.schema_version)
             != ('quant_validation', 'return_definition', 'raw-close-gross-total-return-v1')
             or definition.payload != RETURN_SPEC):
@@ -71,9 +70,7 @@ def bind_total_return_panel_sources(repo, panel, *, evaluation_start, cutoff):
             raise ContractViolation('total-return source rows need unique immutable references')
         rows = []
         for ref in refs:
-            source = repo.get_visible(ref, known_at)
-            if source.known_at > known_at or source.event_time > known_at:
-                raise ContractViolation('total-return row predates its underlying observation')
+            source = repo.get_visible(ref, known_at, strict_pit=True)
             rows.append(source)
         day, index = panel.timestamps[i].astimezone(SHANGHAI).date(), panel.session_indices[i]
         if type(index) is not int or not 0 < index < len(days) or days[index] != day:

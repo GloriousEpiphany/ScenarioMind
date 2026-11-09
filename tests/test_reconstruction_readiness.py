@@ -48,7 +48,11 @@ def test_late_ingestion_blocks_only_prefixes_before_receipt_and_not_later_outcom
         args['reconstruction_plan'].update(development_end_session=129,holdout_start_session=131,
                                            holdout_end_session=137,horizons=[1,5])
         args['statistical_limits']['horizons']=[1,5]
+        frozen = repo.get_visible(ref, at)
         result=audit_reconstruction_readiness(repo,**args)['checks']
+        assert result['source_values']['status'] == 'source_bound'
+        assert result['historical_visibility']['status'] == 'blocked'
+        assert repo.get_visible(ref, at) == frozen
         window=result['long_holdout']['horizons']
         assert window['1']['mature_market_windows']==6
         assert [f['origin_session_index'] for f in window['1']['folds'] if f['market_pit_usable']]==[133,134,135,136]

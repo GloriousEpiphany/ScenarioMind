@@ -3,6 +3,7 @@
 This report cannot certify PIT, probability calibration or publication. In
 particular a blocked disclosure page must not hide the other independent gaps.
 """
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from scenario_engine.agents.tools import fingerprint
@@ -163,9 +164,15 @@ def audit_reconstruction_readiness(repo, *, total_return_panel_ref, reconstructi
         for key in ('timestamps','row_known_at'):raw[key]=tuple(map(datetime.fromisoformat,raw[key]))
         for key in ('asset_ids','factor_ids','session_indices'):raw[key]=tuple(raw[key])
         panel=JointReplayPanel(**raw)
-        bind_total_return_panel_sources(repo,panel,evaluation_start=at,cutoff=at)
-        result['checks']['source_values']={'status':'source_bound','rows':len(panel.timestamps),'panel_hash':item.payload_hash}
+        panel.validate()
         visibility, available = _audit_label_origins(repo, panel, plan)
+        # Numerical provenance is checked at actual receipt, separately from
+        # the historical availability audit above. A late capture blocks the
+        # affected origins, not all later windows. Keep the frozen panel and
+        # its claimed timestamps unchanged; this view grants no PIT certificate.
+        bind_total_return_panel_sources(repo,replace(panel,row_known_at=tuple(available)),
+            evaluation_start=at,cutoff=at)
+        result['checks']['source_values']={'status':'source_bound','rows':len(panel.timestamps),'panel_hash':item.payload_hash}
         result['checks']['historical_visibility'] = visibility
         result['checks']['long_holdout'] = _audit_holdout(panel, plan, risk, visibility['origins'], available, at)
     except (ScenarioEngineError,KeyError,TypeError,ValueError,IndexError) as exc:

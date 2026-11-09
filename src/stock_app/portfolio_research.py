@@ -117,7 +117,7 @@ class PortfolioResearch:
                 if (self.pipeline_factory is DeductiveResearchPipeline
                         and self.source_policy.get("price_request_checkpoint") == "same-source-price-request-checkpoint-v1"
                         and self.source_policy["price"] == "eastmoney_http"):
-                    from src.stock_app.checkpointed_prices import CheckpointedEastmoneyReader
+                    from src.stock_app.eastmoney_prices import CheckpointedEastmoneyReader
                     from src.stock_app.eastmoney_prices import prepare_eastmoney_prices
                     reader = CheckpointedEastmoneyReader(self.db_path, root + ":price-requests")
                     options["prices"] = lambda db, symbols, **kw: prepare_eastmoney_prices(db, symbols, reader=reader, **kw)
@@ -144,7 +144,7 @@ class PortfolioResearch:
                             checkpoint_policy=self.source_policy['cctv_page_checkpoint'])
                     if (self.context_acquirer is acquire_market_context
                             and self.source_policy.get("price_request_checkpoint") == "same-source-price-request-checkpoint-v1"):
-                        from src.stock_app.checkpointed_prices import CheckpointedEastmoneyReader
+                        from src.stock_app.eastmoney_prices import CheckpointedEastmoneyReader
                         context_options["benchmark"] = CheckpointedEastmoneyReader(self.db_path, root + ":context-requests")
                     for attempt in range(self.source_policy.get("max_task_attempts", 1)):
                         if lost.is_set():

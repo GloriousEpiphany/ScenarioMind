@@ -57,7 +57,7 @@ def make_hypothesis_tool(repository, *, manifest, required_entities=(), require_
     def execute(args, context):
         for path in args["hypotheses"]:
             for ref in path["evidence_refs"]:
-                item = repository.get_visible(ref, context.as_of)
+                item = repository.get_visible(ref, context.as_of, strict_pit=True)
                 if item.payload_hash != sources[ref]["payload_hash"]:
                     raise ContractViolation("hypothesis evidence hash differs from the frozen source")
         return {"hypotheses": args["hypotheses"], "support_status": "unvalidated_hypotheses",

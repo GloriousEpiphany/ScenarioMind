@@ -12,6 +12,7 @@ from scenario_engine.data import MarketArtifactRepository
 from scenario_engine.data.contracts import require_aware
 from scenario_engine.errors import ContractViolation, DataUnavailable, ScenarioEngineError
 from scenario_engine.sqlite_transactions import atomic_write, create_tables
+from src.stock_app.portfolio_report_revision import latest_revision
 
 VERSION = 'research-feedback-v1'
 
@@ -73,6 +74,11 @@ def scan_watches(db_path, *, now=None):
             for watch_id, raw, next_at, cycles in c.execute(
                     'SELECT watch_id,contract_json,next_review_at,cycles FROM research_watches WHERE active=1').fetchall():
                 spec = json.loads(raw)
+                revision = latest_revision(c, spec['run_id'])
+                if revision and revision['status'] != 'approved':
+                    # A newer blocking correction withdraws the prior thesis.
+                    # Waiting does not consume a watch cycle or mark evidence seen.
+                    continue
                 # One outstanding follow-up per watch; retries do not consume another cycle.
                 if c.execute("SELECT 1 FROM research_feedback WHERE watch_id=? AND status IN ('pending','queued','running')",
                              (watch_id,)).fetchone():
@@ -85,10 +91,10 @@ def scan_watches(db_path, *, now=None):
                 new = []
                 for (ref,) in refs:
                     try:
-                        item = repo.get_visible(ref, now)
+                        item = repo.get_visible(ref, now, strict_pit=True)
                     except ScenarioEngineError:
                         continue
-                    if item.known_at > datetime.fromisoformat(spec['as_of']):
+                    if max(item.known_at, item.ingested_at) > datetime.fromisoformat(spec['as_of']):
                         new.append({'artifact_id': ref, 'payload_hash': item.payload_hash,
                                     'known_at': item.known_at.isoformat()})
                 due = now >= datetime.fromisoformat(next_at)
@@ -104,13 +110,10 @@ def scan_watches(db_path, *, now=None):
                     'prior_assessment': spec['assessment'], 'publication_eligible': False}
                 # A correction is a new immutable report; feedback must track the
                 # latest accepted thesis, without rewriting the watch contract.
-                if c.execute("SELECT 1 FROM sqlite_master WHERE name='portfolio_report_revisions'").fetchone():
-                    revised = c.execute("SELECT result_json FROM portfolio_report_revisions WHERE run_id=? AND status='approved' ORDER BY created_at DESC LIMIT 1",
-                                        (spec['run_id'],)).fetchone()
-                    if revised:
-                        latest = json.loads(revised[0])
-                        payload.update(prior_scenarios=latest['scenarios'], prior_assessment=latest['assessment'],
-                                       prior_report_hash=fingerprint(latest))
+                if revision:
+                    latest = revision['result']
+                    payload.update(prior_scenarios=latest['scenarios'], prior_assessment=latest['assessment'],
+                                   prior_report_hash=fingerprint(latest))
                 c.execute('INSERT INTO research_feedback VALUES(?,?,?,?,NULL,NULL)',
                     (feedback_id, watch_id, canonical(payload), 'pending'))
                 c.executemany('INSERT OR IGNORE INTO research_watch_seen VALUES(?,?)', [(watch_id,r['artifact_id']) for r in new])
@@ -121,10 +124,12 @@ def scan_watches(db_path, *, now=None):
 
 
 def process_feedback(db_path, *, execute=False, now=None):
-    """Queue/execute one bounded follow-up. Failures stay visible and retryable."""
+    """Keep feedback pending until explicitly authorized to run a follow-up."""
     from scenario_engine.agents.lease import advisory_lease
     from src.stock_app.portfolio_research_jobs import build_request, enqueue, load_job, execute_job
     now = require_aware(now or datetime.now(timezone.utc), 'feedback time')
+    if type(execute) is not bool:
+        raise ContractViolation('feedback execution authorization must be boolean')
     results = []
     with advisory_lease(db_path, 'research-feedback-worker'), sqlite3.connect(db_path, timeout=30) as c:
         initialize(c)
@@ -132,6 +137,33 @@ def process_feedback(db_path, *, execute=False, now=None):
         for feedback_id, raw, followup in rows:
             payload = json.loads(raw)
             try:
+                revision = latest_revision(c, payload['parent_run_id'])
+                if revision and revision['status'] != 'approved':
+                    results.append({'feedback_id': feedback_id, 'followup_run_id': followup,
+                                    'status': 'awaiting_report_revision'})
+                    continue
+                terminal_statuses = {'conditional_research_complete','budget_exhausted','superseded','requires_new_request'}
+                job = load_job(db_path, run_id=followup) if followup else None
+                if followup and job is None:
+                    raise DataUnavailable('registered follow-up job is missing')
+                if revision:
+                    latest = revision['result']
+                    report_hash = fingerprint(latest)
+                    if job and job['status'] not in terminal_statuses and (
+                            job['request'].get('feedback_context', {}).get('prior_report_hash') != report_hash):
+                        results.append({'feedback_id': feedback_id, 'followup_run_id': followup,
+                                        'status': 'blocked_stale_report_revision'})
+                        continue
+                    # The trigger receipt stays immutable. A newly created study
+                    # reassesses the latest approved thesis, not a withdrawn one.
+                    payload.update(prior_scenarios=latest['scenarios'], prior_assessment=latest['assessment'],
+                                   prior_report_hash=report_hash)
+                if not execute and (job is None or job['status'] not in terminal_statuses):
+                    # Do not put an unapproved model budget into the ordinary
+                    # account queue, where a running UI worker could drain it.
+                    results.append({'feedback_id': feedback_id, 'followup_run_id': followup,
+                                    'status': 'awaiting_execution_approval'})
+                    continue
                 if not followup:
                     parent = load_job(db_path, run_id=payload['parent_run_id'])
                     if parent is None:
@@ -152,13 +184,12 @@ def process_feedback(db_path, *, execute=False, now=None):
                 job = load_job(db_path, run_id=followup)
                 result = job.get('result')
                 evidence_review=None
-                terminal_statuses = {'conditional_research_complete','budget_exhausted','superseded','requires_new_request'}
                 if execute and payload['evidence'] and job['status'] not in terminal_statuses:
                     from src.stock_app.tracking_evidence_review import review_feedback_originals
                     evidence_review=review_feedback_originals(db_path,payload,followup)
                 if execute and job['status'] not in terminal_statuses:
                     with advisory_lease(db_path, 'portfolio-account:' + str(payload['account_id'])):
-                        result = execute_job(db_path, followup)
+                        result = execute_job(db_path, followup, execute_feedback=True)
                 status = (result or {}).get('status', job['status'])
                 done = status == 'conditional_research_complete'
                 terminal = status in {'budget_exhausted','superseded','requires_new_request'}

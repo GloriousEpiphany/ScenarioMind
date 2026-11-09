@@ -99,26 +99,57 @@ def calibrate_event_analog_model(
             raise ContractViolation(
                 f"事件样本 state 字段集合不一致: {sorted(state_key_sets)}"
             )
-        evaluations: list[tuple[float, float, float]] = []
+        evaluations: dict[tuple[str, int], list[tuple[float, float, float]]] = {
+            (symbol, horizon): [] for symbol in symbols for horizon in HORIZONS
+        }
         fold_records = []
+        independent_events = 0
+        validation_window_end = None
         repository = MarketArtifactRepository(connection)
         for sample in validation:
             distribution, record = _production_fold(
                 repository, training, sample, event_type, symbols, sample_floor,
             )
+            label_time = sample.get("label_available_at")
+            if not label_time:
+                raise ContractViolation("validation requires explicit label_available_at")
+            label_time = datetime.fromisoformat(label_time)
+            require_aware(label_time, "label_available_at")
+            # Shared realized windows are dependent observations, regardless of
+            # how many securities or horizons are evaluated in that window.
+            included = validation_window_end is None or sample["event_time"] > validation_window_end
+            record["included_in_calibration"] = included
             fold_records.append(record)
+            if not included:
+                continue
+            independent_events += 1
+            validation_window_end = label_time
+            expected = set(evaluations)
+            observed = [(asset.symbol, asset.horizon) for asset in distribution.assets]
+            if len(observed) != len(expected) or set(observed) != expected:
+                raise ContractViolation("production fold must cover every requested symbol and horizon exactly once")
             for asset in distribution.assets:
                 actual = _return_value(sample, asset.symbol, asset.horizon)
-                evaluations.append((actual, asset.q10, asset.q90))
-        if len(evaluations) < sample_floor:
-            raise DataUnavailable("样本外评估单元少于模型 min_samples")
-        inside = [q10 <= actual <= q90 for actual, q10, q90 in evaluations]
-        lower_tail = [actual < q10 for actual, q10, _ in evaluations]
-        coverage = float(np.mean(inside))
-        quantile_error = abs(coverage - 0.80)
-        cvar_exceedance = float(np.mean(lower_tail))
+                evaluations[(asset.symbol, asset.horizon)].append((actual, asset.q10, asset.q90))
+        if independent_events < sample_floor:
+            raise DataUnavailable(
+                f"不重叠的样本外事件只有 {independent_events} 个，少于模型 min_samples={sample_floor}"
+            )
+        group_metrics = []
+        for (symbol, horizon), values in evaluations.items():
+            group_coverage = float(np.mean([low <= actual <= high for actual, low, high in values]))
+            group_metrics.append({
+                "symbol": symbol, "horizon": horizon, "sample_size": len(values),
+                "coverage": group_coverage, "quantile_coverage_error": abs(group_coverage - 0.80),
+                "var_exceedance_rate": float(np.mean([actual < low for actual, low, _ in values])),
+            })
+        coverage = float(np.mean([item["coverage"] for item in group_metrics]))
+        quantile_error = max(item["quantile_coverage_error"] for item in group_metrics)
+        cvar_exceedance = max(item["var_exceedance_rate"] for item in group_metrics)
         source_ids = [sample["artifact_id"] for sample in samples]
         frozen_training_ids = tuple(sorted({identifier for fold in fold_records for identifier in fold["training_artifact_ids"]}))
+        training_artifacts = [repository.get_visible(identifier, validated_at, strict_pit=True) for identifier in frozen_training_ids]
+        training_cutoff = max(max(item.event_time, item.known_at, item.ingested_at) for item in training_artifacts)
         digest = hashlib.sha256(json.dumps({
             "sources": source_ids, "folds": fold_records,
             "symbols": symbols, "min_samples": sample_floor,
@@ -126,6 +157,7 @@ def calibrate_event_analog_model(
             "max_quantile_coverage_error": max_q_error,
             "max_var_exceedance_rate": max_cvar,
             "algorithm": "production_pit_event_holdout_v1",
+            "calibration_unit": "nonoverlapping_events_by_symbol_horizon_v1",
         }, sort_keys=True).encode("utf-8")).hexdigest()
         model_id = "event_analog_empirical"
         version = f"{event_type}:{digest[:16]}"
@@ -133,7 +165,10 @@ def calibrate_event_analog_model(
         metrics = {
             "coverage": coverage,
             "interval_coverage_oos": coverage,
-            "sample_size": len(evaluations),
+            "sample_size": independent_events,
+            "evaluation_count": sum(len(values) for values in evaluations.values()),
+            "calibration_unit": "nonoverlapping_events_by_symbol_horizon_v1",
+            "group_metrics": group_metrics,
             "out_of_sample": True,
             "quantile_coverage_error": quantile_error,
             "cvar_exceedance_rate": cvar_exceedance,
@@ -153,7 +188,7 @@ def calibrate_event_analog_model(
         policy = ModelPolicy(
             model_id=model_id,
             version=version,
-            training_cutoff=validated_at.isoformat(),
+            training_cutoff=training_cutoff.isoformat(),
             calibration_version=calibration_version,
             adapter_weights={"event_study": 0.5, "analog_state": 0.5},
             horizons=HORIZONS,
@@ -181,10 +216,10 @@ def calibrate_event_analog_model(
             status=status,
         )
         detail = (
-            "样本外覆盖率与下尾超限率通过闸门，已登记 active"
+            "每个证券/期限的样本外覆盖率与下尾超限率均通过闸门，已登记 active"
             if passed
             else (
-                f"校准未过闸门：quantile_error={quantile_error:.4f}/{max_q_error:.4f}, "
+                f"证券/期限校准未过闸门（最差组）：quantile_error={quantile_error:.4f}/{max_q_error:.4f}, "
                 f"tail_exceedance={cvar_exceedance:.4f}/{max_cvar:.4f}；已登记 rejected"
             )
         )
@@ -197,32 +232,42 @@ def calibrate_event_analog_model(
 
 
 def _event_samples(connection, event_type: str, known_at: datetime) -> list[dict[str, Any]]:
-    rows = connection.execute(
+    entities = tuple(row[0] for row in connection.execute(
         """
-        SELECT artifact_id, event_time, known_at, payload_json
+        SELECT DISTINCT entity_id
         FROM market_artifacts
         WHERE domain = 'event' AND dataset = 'event_study_observation'
-          AND known_at <= ?
-        ORDER BY event_time, known_at
-        """,
-        (known_at.isoformat(),),
-    ).fetchall()
+        """
+    ).fetchall())
+    if not entities:
+        return []
+    rows = MarketArtifactRepository(connection).query(DataRequest(
+        "event", "event_study_observation", entities,
+        datetime.min.replace(tzinfo=timezone.utc), known_at, known_at,
+    ))
     latest: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        if datetime.fromisoformat(str(row[2])) > known_at:
-            continue
-        payload = json.loads(row[3])
+    for row in sorted(rows, key=lambda item: (item.known_at, item.ingested_at, item.artifact_id)):
+        payload = row.payload
         if payload.get("event_type") != event_type:
             continue
         historical_id = str(payload.get("historical_event_id") or "")
         state = payload.get("state")
         returns = payload.get("returns")
         if not historical_id or not isinstance(state, dict) or not isinstance(returns, dict):
-            raise ContractViolation(f"event study artifact {row[0]} has invalid calibration schema")
+            raise ContractViolation(f"event study artifact {row.artifact_id} has invalid calibration schema")
+        label_time = payload.get("label_available_at")
+        if label_time:
+            label_time = datetime.fromisoformat(label_time)
+            require_aware(label_time, "label_available_at")
+            if label_time > known_at:
+                continue
+            if label_time < row.event_time:
+                raise ContractViolation("calibration label cannot mature before its event")
         latest[historical_id] = {
-            "artifact_id": str(row[0]),
-            "event_time": datetime.fromisoformat(str(row[1])),
-            "known_at": datetime.fromisoformat(str(row[2])),
+            "artifact_id": row.artifact_id,
+            "event_time": row.event_time,
+            "known_at": row.known_at,
+            "ingested_at": row.ingested_at,
             "label_available_at": payload.get("label_available_at"),
             "source_event_artifact_id": payload.get("source_event_artifact_id"),
             "historical_event_id": historical_id,
@@ -241,7 +286,7 @@ def _production_fold(repository, training, sample, event_type, symbols, min_samp
             raise ContractViolation("calibration requires explicit label_available_at; re-import legacy samples")
         label_time = datetime.fromisoformat(raw_label_time)
         require_aware(label_time, "label_available_at")
-        if max(label_time, item["known_at"], item["event_time"]) < cutoff:
+        if max(label_time, item["known_at"], item["ingested_at"], item["event_time"]) < cutoff:
             eligible.append(item)
     if len(eligible) < min_samples:
         raise DataUnavailable(

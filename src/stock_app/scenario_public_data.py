@@ -684,20 +684,6 @@ def _industry_taxonomy_priority(row: pd.Series) -> int:
     return 10
 
 
-def _money_flow_payload(row: pd.Series) -> dict[str, Any]:
-    return {
-        "security_name": str(row["股票简称"]).strip(),
-        "last_price": _positive(row["最新价"], "资金流最新价"),
-        "pct_change": _percent(row["涨跌幅"]),
-        "turnover_rate": _percent(row["换手率"]),
-        "inflow_cny": _cn_amount(row["流入资金"]),
-        "outflow_cny": _cn_amount(row["流出资金"]),
-        "net_inflow_cny": _cn_amount(row["净额"]),
-        "turnover_cny": _cn_amount(row["成交额"]),
-        "snapshot_kind": "intraday_ranking",
-    }
-
-
 def _cluster_id(title: str) -> str:
     normalized = re.sub(r"\d+(?:\.\d+)?", "#", title.casefold())
     normalized = re.sub(r"\s+", "", normalized)
@@ -756,34 +742,6 @@ def _finite_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if isfinite(result) else None
-
-
-def _positive(value: Any, field: str) -> float:
-    result = _finite_or_none(value)
-    if result is None or result <= 0:
-        raise ContractViolation(f"{field} 必须是有限正数")
-    return result
-
-
-def _percent(value: Any) -> float:
-    text = str(value).strip().replace("%", "")
-    result = _finite_or_none(text)
-    if result is None:
-        raise ContractViolation(f"无法解析百分比: {value!r}")
-    return result / 100.0
-
-
-def _cn_amount(value: Any) -> float:
-    text = str(value).strip().replace(",", "")
-    multipliers = {"万": 10_000.0, "亿": 100_000_000.0}
-    multiplier = 1.0
-    if text and text[-1] in multipliers:
-        multiplier = multipliers[text[-1]]
-        text = text[:-1]
-    result = _finite_or_none(text)
-    if result is None:
-        raise ContractViolation(f"无法解析人民币金额: {value!r}")
-    return result * multiplier
 
 
 def _blank(value: Any) -> bool:

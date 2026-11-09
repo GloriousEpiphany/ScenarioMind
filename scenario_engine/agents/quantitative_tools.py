@@ -57,10 +57,10 @@ class QuantToolPolicy:
             raise ContractViolation('quantitative tool policy violates sample, horizon or resource bounds')
 
 
-def _fit(repo, panel_ref, as_of, symbols, policy):
+def _fit_inputs(repo, panel_ref, as_of, symbols):
     if not panel_ref:
         raise DataUnavailable('source-bound joint_total_return_panel reference is required')
-    item = repo.get_visible(panel_ref, as_of)
+    item = repo.get_visible(panel_ref, as_of, strict_pit=True)
     if (item.domain, item.dataset) != ('quant_validation', 'joint_total_return_panel'):
         raise ContractViolation('quantitative tool requires a typed total-return panel')
     raw = dict(item.payload)
@@ -74,7 +74,12 @@ def _fit(repo, panel_ref, as_of, symbols, policy):
     refs = tuple(sorted({ref for row in panel.row_source_refs for ref in row}
                         | {panel.return_definition_ref, panel.calendar_ref, panel_ref}))
     for ref in refs:
-        repo.get_visible(ref, as_of)
+        repo.get_visible(ref, as_of, strict_pit=True)
+    return panel, refs
+
+
+def _fit(repo, panel_ref, as_of, symbols, policy):
+    panel, refs = _fit_inputs(repo, panel_ref, as_of, symbols)
     return fit_joint_factor_model(asset_ids=panel.asset_ids, factor_ids=panel.factor_ids,
         timestamps=panel.timestamps, session_indices=panel.session_indices, row_known_at=panel.row_known_at,
         asset_log_total_returns=panel.asset_log_total_returns, factor_returns=panel.factor_returns,
@@ -93,6 +98,9 @@ def make_quantitative_tools(db_path, *, frozen, jobs=None, policy=None, clock=No
                 or not isinstance(job.get('validation_refs', {}), dict)
                 or any(not isinstance(v, str) or not v for v in job.get('validation_refs', {}).values())):
             raise ContractViolation('quantitative jobs accept immutable references, not model-authored arrays')
+        validation_panel = job.get('validation_refs', {}).get('joint_panel')
+        if job.get('panel_ref') and validation_panel and job['panel_ref'] != validation_panel:
+            raise ContractViolation('fit and validation must use the same total-return panel')
     cutoff = datetime.fromisoformat(frozen['as_of'])
     symbols = tuple(p['symbol'] for p in frozen['portfolio']['positions'])
     contract = {'version': policy.version, 'jobs': jobs, 'frozen': fingerprint(frozen), 'policy': asdict(policy)}
@@ -113,17 +121,21 @@ def make_quantitative_tools(db_path, *, frozen, jobs=None, policy=None, clock=No
             root = 'quant-tools:' + context.run_id
             board.register_run(root, contract)
             key = fingerprint(request)
+            for row in frozen.get('manifest', frozen.get('evidence', [])):
+                if repo.get_visible(row['artifact_id'], cutoff, strict_pit=True).payload_hash != row['payload_hash']:
+                    raise ContractViolation('quantitative source manifest changed')
             cached = board.load(root, key, request)
             if cached is not None:
+                # Preserve the frozen contract and result, but never replay a
+                # formerly accepted fit whose sources violate the PIT boundary.
+                if cached.get('status') == 'computed_research_only':
+                    _fit_inputs(repo, job.get('panel_ref'), cutoff, symbols)
                 return cached
             receipt = board.load(root, 'receipt:' + key, request)
             if receipt is None:
                 receipt = {'at': clock().isoformat()}
                 board.save(root, 'receipt:' + key, request, receipt)
             received_at = datetime.fromisoformat(receipt['at'])
-            for row in frozen.get('manifest', frozen.get('evidence', [])):
-                if repo.get_visible(row['artifact_id'], cutoff).payload_hash != row['payload_hash']:
-                    raise ContractViolation('quantitative source manifest changed')
             try:
                 if name in {'estimate_exposure', 'simulate_paths'}:
                     fitted = _fit(repo, job.get('panel_ref'), cutoff, symbols, policy)

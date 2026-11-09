@@ -1,6 +1,6 @@
 """Production ScenarioEngine facade for the strict Quant-Finance V3 path.
 
-The legacy V2 engine intentionally lives in :mod:`scenario_engine.engine` and is
+The legacy V2 engine intentionally lives in :mod:`scenario_engine.legacy.engine` and is
 loaded only when ``LegacyScenarioEngine`` is requested.  Keeping this module
 small prevents production imports from constructing or even importing the
 rule/proxy/fallback stack that V3 explicitly quarantines.
@@ -468,12 +468,18 @@ class ScenarioEngine:
             SELECT payload_json
             FROM market_artifacts
             WHERE domain = 'event' AND dataset = ?
-              AND event_time >= ? AND event_time <= ? AND known_at <= ?
-              AND (published_at IS NULL OR published_at <= ?)
+              AND pit_utc(event_time) >= pit_utc(?) AND pit_utc(event_time) <= pit_utc(?)
+              AND pit_utc(known_at) <= pit_utc(?) AND pit_utc(ingested_at) <= pit_utc(?)
+              AND (published_at IS NULL OR pit_utc(published_at) <= pit_utc(?))
+              AND (valid_from IS NULL OR pit_utc(valid_from) <= pit_utc(?))
+              AND (valid_to IS NULL OR pit_utc(valid_to) > pit_utc(?))
             """,
             (
                 dataset,
                 (as_of - timedelta(days=lookback)).isoformat(),
+                as_of.isoformat(),
+                as_of.isoformat(),
+                as_of.isoformat(),
                 as_of.isoformat(),
                 as_of.isoformat(),
                 as_of.isoformat(),
@@ -503,10 +509,11 @@ class ScenarioEngine:
             """
             SELECT 1 FROM market_artifacts
             WHERE domain = ? AND dataset = ? AND entity_id = ?
-              AND event_time >= ? AND event_time <= ? AND known_at <= ?
-              AND (published_at IS NULL OR published_at <= ?)
-              AND (valid_from IS NULL OR valid_from <= ?)
-              AND (valid_to IS NULL OR valid_to > ?)
+              AND pit_utc(event_time) >= pit_utc(?) AND pit_utc(event_time) <= pit_utc(?)
+              AND pit_utc(known_at) <= pit_utc(?) AND pit_utc(ingested_at) <= pit_utc(?)
+              AND (published_at IS NULL OR pit_utc(published_at) <= pit_utc(?))
+              AND (valid_from IS NULL OR pit_utc(valid_from) <= pit_utc(?))
+              AND (valid_to IS NULL OR pit_utc(valid_to) > pit_utc(?))
             LIMIT 1
             """,
             (
@@ -514,6 +521,7 @@ class ScenarioEngine:
                 dataset,
                 entity_id,
                 start.isoformat(),
+                as_of.isoformat(),
                 as_of.isoformat(),
                 as_of.isoformat(),
                 as_of.isoformat(),

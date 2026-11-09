@@ -73,11 +73,12 @@ def test_controller_runs_dynamic_plan_quant_audit_watch_and_replays(tmp_path):
         assert scan_watches(engine.db_path,now=NOW+timedelta(hours=1)) == []
         later = NOW+timedelta(hours=2)
         new = replace(artifact('event','observed_event_source',suffix='new'), known_at=later,ingested_at=later)
+        late = replace(artifact('event','observed_event_source',suffix='late'), known_at=NOW,ingested_at=later)
         future = replace(artifact('event','observed_event_source',suffix='future'),known_at=later+timedelta(days=5),ingested_at=later+timedelta(days=5))
         with sqlite3.connect(engine.db_path) as c:
-            MarketArtifactRepository(c).ingest_many((new,future))
+            MarketArtifactRepository(c).ingest_many((new,late,future))
         events = scan_watches(engine.db_path,now=later)
-        assert len(events) == 1 and [r['artifact_id'] for r in events[0]['evidence']] == [new.artifact_id]
+        assert len(events) == 1 and {r['artifact_id'] for r in events[0]['evidence']} == {new.artifact_id, late.artifact_id}
         assert events[0]['thesis_outcome'] == 'requires_independent_review'
         assert scan_watches(engine.db_path,now=later) == []
     finally:
@@ -190,3 +191,65 @@ def test_final_validation_receives_automatically_prepared_panel(monkeypatch):
     _ensure_quantitative_check('unused','run',{'quantitative_preparation':{'status':'source_bound_total_returns','joint_panel':'panel'}},
                               {'quantitative_input_refs':{'protocol':'protocol'}})
     assert captured==[{'input_refs':{'protocol':'protocol','joint_panel':'panel'},'validation_scope':'prediction_simulation'}]
+
+
+@pytest.mark.parametrize('mistake', ['missing_plan', 'dependency', 'invalid_plan', 'started_task'])
+def test_controller_repairs_scheduling_errors_without_executing_rejected_task(tmp_path, mistake):
+    class RepairingScheduler(PlanningModel):
+        def next_call(self, messages, descriptors):
+            context = json.loads(messages[1]['content'])['context']
+            if 'specialist_role' not in context and not any(
+                    d['function']['name'] == 'submit_review' for d in descriptors):
+                index = sum(m['role'] == 'assistant' for m in messages)
+                insertion = {'missing_plan': 0, 'invalid_plan': 0, 'dependency': 1, 'started_task': 2}[mistake]
+                if index == insertion:
+                    if mistake in {'invalid_plan', 'started_task'}:
+                        revised = plan()
+                        if mistake == 'invalid_plan':
+                            next(t for t in revised['tasks'] if t['task_id'] == 'portfolio')['depends_on'] = []
+                        else:
+                            next(t for t in revised['tasks'] if t['task_id'] == 'sentiment')['question'] = 'Replace frozen task'
+                        return ToolCall('bad-plan', 'record_plan', revised)
+                    return ToolCall('premature-task', 'run_specialist', {'task_id': 'portfolio'})
+                if index > insertion:
+                    rejected = json.loads(messages[3 + 2 * insertion]['content'])
+                    assert rejected['status'] == 'failed' and rejected['input_rejected_before_read']
+                    messages = [*messages[:2 + 2 * insertion], *messages[4 + 2 * insertion:]]
+            return super().next_call(messages, descriptors)
+
+    engine, _, _ = controller(tmp_path)
+    engine.model = RepairingScheduler()
+    try:
+        result = run(engine)
+        assert result['status'] == 'conditional_research_complete'
+        assert result['controller_review'][-1]['accepted']
+        assert len(result['research_plans']) == 1
+        records = engine._state('portfolio-team:test')
+        assert len([k for k in records if k.startswith('controller:started:')]) == 7
+        assert records['controller:started:sentiment']['task'] == next(
+            t for t in plan()['tasks'] if t['task_id'] == 'sentiment')
+        controller_result = records['controller:review']
+        assert not controller_result['unresolved_errors']
+        assert sum(r['status'] == 'failed' for r in controller_result['tool_results']) == 1
+        team_tools = engine.connection.execute(
+            "SELECT COUNT(*) FROM agent_call_attempts WHERE run_id='portfolio-team:test' AND kind='team_tool'"
+        ).fetchone()[0]
+        local_tools = engine.connection.execute(
+            "SELECT COUNT(*) FROM agent_call_attempts WHERE run_id LIKE 'portfolio-team:test:%' AND kind='tool'"
+        ).fetchone()[0]
+        assert team_tools == local_tools, 'rejected planning attempts must count against the global tool budget'
+    finally:
+        engine.close()
+
+
+def test_disabled_tracking_does_not_claim_a_parent_watch(tmp_path):
+    engine, _, _ = controller(tmp_path)
+    engine.tracking_enabled = False
+    try:
+        result = run(engine)
+        assert result['monitoring'] == {'status': 'disabled', 'automatic_orders_enabled': False}
+        assert engine.connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='research_watches'"
+        ).fetchone()[0] == 0
+    finally:
+        engine.close()

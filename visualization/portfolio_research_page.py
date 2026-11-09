@@ -261,6 +261,17 @@ def render_report(result, db_path):
                 if item['status'] in {'blocked', 'data_incomplete'}:
                     st.caption(quantitative.get('evidence_readiness', {}).get('summaries', {}).get(
                         key, missing.get(key, '本次输入尚未完整。')))
+                if key == 'joint_calibration' and item.get('protocol_registered_at'):
+                    registered = datetime.fromisoformat(item['protocol_registered_at']).astimezone(ZoneInfo('Asia/Shanghai'))
+                    st.caption('前瞻协议登记：' + registered.strftime('%Y-%m-%d %H:%M 北京时间') + '；原报告截止时间保持不变。')
+                    st.write(item['reason'])
+                    st.dataframe(pd.DataFrame([
+                        {'期限（交易日）': int(h), '有效成熟窗口': row['eligible_nonoverlapping_windows'],
+                         '要求窗口': row['required_nonoverlapping_windows'], '缺少窗口': row['missing_windows']}
+                        for h, row in sorted(item['sample_diagnostics'].items(), key=lambda pair: int(pair[0]))
+                    ]), hide_index=True, use_container_width=True)
+                    for finding in item['blocking_findings']:
+                        st.caption(finding)
             st.caption('检查时点：' + quantitative['checked_at'] + '；未通过的检查不会被条件研究结果替代。')
     tabs = st.tabs(["持仓与应对", "情景与触发", "对冲与观察", "证据与审查"])
     with tabs[0]:

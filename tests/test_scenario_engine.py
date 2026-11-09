@@ -16,12 +16,12 @@ from scenario_engine import (
     get_v2_2_recursive_contract_schemas,
     validate_runtime_environment,
 )
-from scenario_engine.schema_contracts import validate_required_contract
-from scenario_engine.parser import ScenarioParser
-from scenario_engine.templates import SCENARIO_TEMPLATES
-from scenario_engine.news_connectors import GdeltDocNewsConnector
+from scenario_engine.legacy.scenarios.schema_contracts import validate_required_contract
+from scenario_engine.legacy.scenarios.parser import ScenarioParser
+from scenario_engine.legacy.scenarios.templates import SCENARIO_TEMPLATES
+from scenario_engine.legacy.data.news_connectors import GdeltDocNewsConnector
 from scenario_engine.research.models import ExternalEvidenceDocument
-from scenario_engine.schemas import ScenarioMemoryRecord
+from scenario_engine.legacy.scenarios.schemas import ScenarioMemoryRecord
 from Agents_Experience.core.scenario_tools import LegacyScenarioTools as ScenarioTools
 from src.stock_app.database import Database
 

@@ -5,7 +5,7 @@ import pytest
 
 from scenario_engine.agents.quantitative_tools import make_quantitative_tools
 from scenario_engine.agents.tools import ToolContext
-from scenario_engine.errors import ContractViolation
+from scenario_engine.errors import ContractViolation, PointInTimeViolation
 from tests.test_historical_projection import complete_source_fixture
 
 
@@ -37,6 +37,63 @@ def test_source_bound_fit_and_paths_run_real_math_and_replay(tmp_path):
 def test_registered_quant_jobs_reject_model_numbers(tmp_path):
     with pytest.raises(ContractViolation):
         make_quantitative_tools(tmp_path/'x.db',frozen={},jobs={'bad':{'asset_returns':[[1.]]}})
+
+
+def test_completed_controller_report_reopens_without_recomputing_or_model_calls(tmp_path):
+    from tests.test_research_controller import controller
+    from tests.test_portfolio_research import run
+
+    engine, _, _ = controller(tmp_path)
+    try:
+        original = run(engine)
+        contract = engine.connection.execute(
+            "SELECT contract_json FROM advisory_runs WHERE run_id='portfolio-team:test'").fetchone()[0]
+    finally:
+        engine.close()
+    reopened, model, downloaded = controller(tmp_path)
+    try:
+        assert run(reopened) == original
+        assert model.calls == 0 and downloaded == []
+        assert reopened.connection.execute(
+            "SELECT contract_json FROM advisory_runs WHERE run_id='portfolio-team:test'").fetchone()[0] == contract
+    finally:
+        reopened.close()
+
+
+def test_registered_quant_job_cannot_fit_and_validate_different_panels(tmp_path):
+    frozen = {'as_of': '2026-11-09T00:00:00+00:00', 'portfolio': {'positions': [{'symbol': '002230'}]}}
+    with pytest.raises(ContractViolation, match='same total-return panel'):
+        make_quantitative_tools(tmp_path/'x.db', frozen=frozen, jobs={'bad': {
+            'panel_ref': 'fit-panel', 'validation_refs': {'joint_panel': 'other-panel'}}})
+
+
+@pytest.mark.parametrize('cached', [False, True])
+@pytest.mark.parametrize('late_input', ['panel', 'manifest'])
+def test_quantitative_inputs_require_receipt_before_frozen_cutoff(tmp_path, cached, late_input):
+    c, repo, _, _, _, now = complete_source_fixture(n=145, random_prices=True)
+    panel = c.execute("SELECT artifact_id FROM market_artifacts WHERE dataset='joint_total_return_panel'").fetchone()[0]
+    source = repo.get_visible('d-1', now)
+    frozen = {'as_of': now.isoformat(), 'portfolio': {'positions': [{'symbol': '002230'}]},
+              'manifest': [{'artifact_id': source.artifact_id, 'payload_hash': source.payload_hash}]}
+    path = tmp_path/'quant.db'
+    with sqlite3.connect(path) as dest:
+        c.backup(dest)
+    c.close()
+    tool = make_quantitative_tools(path, frozen=frozen, jobs={'bound': {'panel_ref': panel}},
+                                  clock=lambda: now+timedelta(seconds=1))[0]
+    ctx = ToolContext('run', tool.name, now, 'policy', 'input', 'key')
+    if cached:
+        assert tool.run({'experiment_id': 'bound'}, ctx)['result']['status'] == 'computed_research_only'
+    with sqlite3.connect(path) as dest:
+        dest.execute('UPDATE market_artifacts SET ingested_at=? WHERE artifact_id=?',
+                     ((now+timedelta(seconds=1)).isoformat(), panel if late_input == 'panel' else source.artifact_id))
+    if cached or late_input == 'manifest':
+        with pytest.raises(PointInTimeViolation):
+            tool.run({'experiment_id': 'bound'}, ctx)
+    else:
+        result = tool.run({'experiment_id': 'bound'}, ctx)['result']
+        assert result['status'] == 'blocked'
+        assert result['error_code'] == 'point_in_time_violation'
 
 
 @pytest.mark.parametrize('failures,component,expected_calls', [(0, 'prices', 1), (1, 'prices', 2), (3, 'prices', 3), (3, 'panel', 1)])

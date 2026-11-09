@@ -80,7 +80,7 @@ def make_assessment_tool(repository, *, manifest, portfolio, hypotheses):
     def execute(args, context):
         for row in [*args["holdings"], *args["hedges"]]:
             for ref in row["evidence_refs"]:
-                if repository.get_visible(ref, context.as_of).payload_hash != sources[ref]["payload_hash"]:
+                if repository.get_visible(ref, context.as_of, strict_pit=True).payload_hash != sources[ref]["payload_hash"]:
                     raise ContractViolation("assessment evidence hash changed")
         return {"assessment": args, "advice_kind": "conditional_research",
             "probability_status": "uncalibrated", "numeric_impact_status": "not_estimated",

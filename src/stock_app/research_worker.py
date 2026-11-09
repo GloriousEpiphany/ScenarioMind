@@ -50,7 +50,7 @@ def tick_forward(db_path, *, clock=None, outlook=None):
     from src.stock_app.issuer_outlook import run_issuer_outlook
     from src.stock_app.issuer_event_forecast import _calendar
     from src.stock_app.market_context import _artifact
-    from src.stock_app.checkpointed_prices import CheckpointedEastmoneyReader
+    from src.stock_app.eastmoney_prices import CheckpointedEastmoneyReader
     clock=clock or (lambda:datetime.now(timezone.utc))
     outlook=outlook or run_issuer_outlook
     at=clock();local=at.astimezone(SHANGHAI)
@@ -116,7 +116,7 @@ def audit_forward_watches(db_path, *, clock=None):
     Only observed exchange sessions and fully ended disclosure dates are used.
     An audit is separate from issuing a forecast and never fills missed origins.
     """
-    from src.stock_app.checkpointed_prices import CheckpointedEastmoneyReader
+    from src.stock_app.eastmoney_prices import CheckpointedEastmoneyReader
     from src.stock_app.cninfo_disclosures import acquire_disclosure_archive
     from src.stock_app.issuer_event_forecast import _calendar
     from src.stock_app.market_context import _artifact

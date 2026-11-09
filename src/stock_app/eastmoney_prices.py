@@ -12,6 +12,8 @@ import sqlite3
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+from scenario_engine.agents.research_board import ResearchBoard
+from scenario_engine.agents.tools import fingerprint
 from scenario_engine.data import DataRequest, DailyPriceRowSchema, MarketArtifactRepository, normalize_daily_price_rows
 from scenario_engine.data.baostock_adapter import baostock_code
 from scenario_engine.errors import ContractViolation, DataUnavailable
@@ -95,6 +97,32 @@ class EastmoneyDailyReader:
         artifacts = normalize_daily_price_rows(request, rows, schema=SCHEMA,
             adapter_version="stockm1-eastmoney-daily/1.0.0", ingested_at=received)
         return tuple(replace(item, source_uri=uris[item.event_time.astimezone(SHANGHAI).date()]) for item in artifacts)
+
+
+CHECKPOINT_VERSION = "same-source-price-request-checkpoint-v1"
+
+
+class CheckpointedEastmoneyReader(EastmoneyDailyReader):
+    def __init__(self, db_path, run_id, *, get=None):
+        super().__init__(get=get)
+        self.db_path, self.run_id = str(db_path), run_id
+
+    def read(self, secid, first, last):
+        request = {"version": CHECKPOINT_VERSION, "secid": secid, "first": first.isoformat(),
+                   "last": last.isoformat(), "profile": self.profile}
+        key = "price-http:" + fingerprint(request)
+        with sqlite3.connect(self.db_path, timeout=30) as connection:
+            board = ResearchBoard(connection)
+            saved = board.load(self.run_id, key, request)
+        if saved is not None:
+            return {date.fromisoformat(day): row for day, row in saved["rows"].items()}, saved["source_uri"]
+        rows, uri = super().read(secid, first, last)
+        # Only a parsed, security/range/schema-checked response is checkpointed.
+        # Final symbol ingestion still verifies both exchange calendars and gaps.
+        saved = {"rows": {day.isoformat(): row for day, row in rows.items()}, "source_uri": uri}
+        with sqlite3.connect(self.db_path, timeout=30) as connection:
+            ResearchBoard(connection).save(self.run_id, key, request, saved)
+        return rows, uri
 
 
 def prepare_eastmoney_prices(db_path, symbols, *, start_date, end_date, reader=None, clock=None):

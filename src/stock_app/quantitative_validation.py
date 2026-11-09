@@ -21,7 +21,7 @@ from scenario_engine.quant.wealth_calibration import (
 )
 from src.stock_app.portfolio_research_jobs import load_job
 
-VALIDATOR_VERSION = 'quantitative-prerequisites-v8-recorded-origin'
+VALIDATOR_VERSION = 'quantitative-prerequisites-v11-readiness-diagnostics'
 
 
 def _time(value):
@@ -50,7 +50,7 @@ def problem_from_payload(payload):
 def _payload(repo, ref, asof, dataset):
     if not ref:
         raise DataUnavailable('missing acquired artifact: ' + dataset)
-    artifact = repo.get_visible(ref, asof)
+    artifact = repo.get_visible(ref, asof, strict_pit=True)
     if artifact.domain != 'quant_validation' or artifact.dataset != dataset:
         raise ContractViolation('validation artifact domain/dataset mismatch: ' + dataset)
     return dict(artifact.payload), artifact
@@ -157,10 +157,19 @@ def validate_quantitative_release(db_path, run_id, *, input_refs=None, now=None,
             return None
     try:
         from src.stock_app.quantitative_readiness import quantitative_readiness
-        result['evidence_readiness'] = quantitative_readiness(repo, research, refs)
-        if job['status'] not in {'conditional_research_complete', 'evidence_prepared'}:
+        readiness_error = None
+        try:
+            result['evidence_readiness'] = quantitative_readiness(repo, research, refs)
+        except (ScenarioEngineError, KeyError, TypeError, ValueError) as exc:
+            readiness_error = {'status': 'blocked', 'error_code': getattr(exc, 'code', 'invalid_validation_schema'),
+                               'reason': str(exc)}
+            result['evidence_readiness'] = {'evidence_complete': False, **readiness_error}
+        if readiness_error or job['status'] not in {'conditional_research_complete', 'evidence_prepared'}:
             for name in ('joint_calibration', 'multiperiod_optimization', 'trade_eligibility'):
-                result['stages'][name] = {'status': 'blocked', 'error_code': job['status'], 'reason': '本次输入尚未完整，不能用旧报告或旧行情替代。'}
+                result['stages'][name] = dict(readiness_error) if readiness_error else {
+                    'status': 'blocked', 'error_code': job['status'], 'reason': '本次输入尚未完整，不能用旧报告或旧行情替代。'}
+            if readiness_error and validation_scope == 'prediction_simulation':
+                result['stages']['simulation_inputs'] = dict(readiness_error)
         else:
             symbols = {p['symbol'] for p in research['portfolio']['positions']}
             cutoff = _time(research['as_of'])
@@ -178,9 +187,14 @@ def validate_quantitative_release(db_path, run_id, *, input_refs=None, now=None,
                         or any(key in refs for key in ('wealth_panel', 'wealth_protocol', 'origin_projections'))):
                     return _wealth_calibration(repo, refs, cutoff, symbols, weights)
                 raw, artifact = _payload(repo, refs.get('joint_panel'), cutoff, 'joint_total_return_panel')
+                if not refs.get('protocol'):
+                    from src.stock_app.quantitative_readiness import register_and_diagnose_joint_calibration
+                    return register_and_diagnose_joint_calibration(repo, panel_ref=artifact.artifact_id,
+                        weights=weights, cutoff=cutoff, now=now)
                 policy_raw, protocol_artifact = _payload(repo, refs.get('protocol'), cutoff, 'joint_calibration_protocol')
                 # Registration is the immutable artifact visibility time, not an editable JSON claim.
-                if _time(policy_raw['registered_at']) != protocol_artifact.known_at:
+                if (_time(policy_raw['registered_at']) != protocol_artifact.known_at
+                        or protocol_artifact.ingested_at != protocol_artifact.known_at):
                     raise ContractViolation('protocol registration time differs from its immutable capture')
                 panel = JointReplayPanel(**{**raw, 'timestamps': tuple(map(_time, raw['timestamps'])), 'row_known_at': tuple(map(_time, raw['row_known_at']))})
                 if set(panel.asset_ids) != symbols:
@@ -218,7 +232,7 @@ def validate_quantitative_release(db_path, run_id, *, input_refs=None, now=None,
                     'custody, permissions, market rules and account-specific broker fees; '
                     'existing source references alone cannot validate trading eligibility')
             if validation_scope == 'prediction_simulation':
-                from src.stock_app.simulation_inputs import bind_simulation_portfolio
+                from src.stock_app.quantitative_readiness import bind_simulation_portfolio
                 stage('simulation_inputs', lambda: bind_simulation_portfolio(repo, research, cutoff))
                 execution = None
                 result['stages']['trade_eligibility'] = {'status': 'not_applicable',

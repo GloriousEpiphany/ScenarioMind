@@ -168,6 +168,43 @@ def test_total_returns_recomputed_from_two_raw_closes_and_per_new_share_cash():
         connection.close()
 
 
+@pytest.mark.parametrize('part', ['price', 'definition', 'calendar', 'benchmark', 'catalogue'])
+def test_total_return_binding_rejects_sources_ingested_after_claimed_availability(part):
+    connection, repo, result, panel = total_return_case()
+    try:
+        refs = {'price': 'raw-0', 'definition': panel.return_definition_ref,
+                'calendar': panel.calendar_ref, 'benchmark': 'benchmark'}
+        coverage = connection.execute("SELECT payload_json FROM market_artifacts WHERE dataset='action_coverage'").fetchone()
+        import json
+        refs['catalogue'] = json.loads(coverage[0])['catalogue_refs']['dividend']
+        # This source was publicly known earlier, but arrived in our store later.
+        connection.execute('UPDATE market_artifacts SET ingested_at=? WHERE artifact_id=?',
+                           ((NOW + timedelta(days=1)).isoformat(), refs[part]))
+        with pytest.raises((ContractViolation, PointInTimeViolation)):
+            bind_total_return_panel_sources(repo, panel, evaluation_start=NOW, cutoff=NOW + timedelta(days=2))
+    finally:
+        connection.close()
+
+
+def test_new_total_return_panel_records_late_receipt_without_backdating_old_panel():
+    connection, repo, original, panel = total_return_case()
+    try:
+        receipt, capture = NOW + timedelta(hours=1), NOW + timedelta(hours=2)
+        connection.execute('UPDATE market_artifacts SET ingested_at=? WHERE artifact_id=?',
+                           (receipt.isoformat(), 'raw-0'))
+        coverage = connection.execute("SELECT artifact_id FROM market_artifacts WHERE dataset='action_coverage'").fetchone()[0]
+        result = build_total_return_panel(repo, coverage_refs={'002230': coverage},
+            price_refs=['raw-0', 'raw-1', 'raw-2'], benchmark_refs={'1.000001': 'benchmark'},
+            start=START, end=END, captured_at=capture)
+        payload = repo.get_visible(result['panel_ref'], capture, strict_pit=True).payload
+        assert payload['row_known_at'] == [receipt.isoformat(), NOW.isoformat()]
+        assert repo.get_visible(original['panel_ref'], capture).payload['row_known_at'] == [NOW.isoformat()] * 2
+        with pytest.raises(PointInTimeViolation):
+            bind_total_return_panel_sources(repo, panel, evaluation_start=NOW, cutoff=capture)
+    finally:
+        connection.close()
+
+
 def test_announced_future_actions_are_conditional_not_future_observed_absence():
     from src.stock_app.cninfo_actions import announced_action_scenario
     cutoff = datetime(2026, 10, 26, 8, tzinfo=timezone.utc)

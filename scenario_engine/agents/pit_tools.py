@@ -42,7 +42,7 @@ def make_pit_query_tool(repository, *, allowed_datasets, allowed_symbols, lookba
 
     def validate_result(result, context):
         for row in result["artifacts"]:
-            artifact = repository.get_visible(row["artifact_id"], context.as_of)
+            artifact = repository.get_visible(row["artifact_id"], context.as_of, strict_pit=True)
             if artifact.payload_hash != row["payload_hash"]:
                 raise ContractViolation("PIT tool result differs from its immutable source")
 
@@ -92,7 +92,7 @@ def make_frozen_pit_query_tool(repository, *, manifest, page_size=40):
         offset = args["offset"]
         rows = []
         for artifact_id in ids[offset:offset + page_size]:
-            item = repository.get_visible(artifact_id, context.as_of)
+            item = repository.get_visible(artifact_id, context.as_of, strict_pit=True)
             if item.payload_hash != source_hashes[artifact_id]:
                 raise ContractViolation("frozen PIT manifest hash differs from source artifact")
             rows.append({"artifact_id": item.artifact_id, "domain": item.domain, "dataset": item.dataset,
@@ -109,7 +109,7 @@ def make_frozen_pit_query_tool(repository, *, manifest, page_size=40):
 
     def validate_result(result, context):
         for row in result["artifacts"]:
-            item = repository.get_visible(row["artifact_id"], context.as_of)
+            item = repository.get_visible(row["artifact_id"], context.as_of, strict_pit=True)
             if (row["payload_hash"] != item.payload_hash
                     or (item.domain, item.dataset, item.entity_id) not in groups):
                 raise ContractViolation("frozen PIT result differs from source manifest")

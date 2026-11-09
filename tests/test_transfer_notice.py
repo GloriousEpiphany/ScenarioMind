@@ -5,17 +5,17 @@ from types import SimpleNamespace
 import pytest
 
 from scenario_engine.errors import ContractViolation,DataUnavailable
-from src.stock_app.transfer_notice import transfer_notice
+from src.stock_app.corporate_action_notices import transfer_notice
 
 
 def test_period_exercise_must_account_for_the_exact_share_change(monkeypatch):
-    from src.stock_app.transfer_notice import period_exercise
+    from src.stock_app.corporate_action_notices import period_exercise
     from src.stock_app.cninfo_actions import _check_capital
     start,end=date(2015,4,16),date(2015,6,30)
     financial=SimpleNamespace(artifact_id='report',event_time=datetime(2015,8,12,tzinfo=timezone.utc),payload={'title':'半年度财务报告','content':
         '一、公司基本情况股票代码“002230”。2015年4月17日至2015年6月30日，公司首期股票期权激励对象行权缴纳出资款'
         '增加公司股本7股，截至2015年6月30日止，公司总股本为107股。公司经营范围'})
-    monkeypatch.setattr('src.stock_app.transfer_notice.read_disclosure_coverage',lambda *args:(None,None,None,[financial]))
+    monkeypatch.setattr('src.stock_app.corporate_action_notices.read_disclosure_coverage',lambda *args:(None,None,None,[financial]))
     refs={'coverage_ref':'evidence','document_ref':'report'}
     change=period_exercise(None,'002230',refs,end,datetime.now(timezone.utc))
     rows=[{'VARYDATE':str(d),'DECLAREDATE':str(d),'F001V':'015019','F002V':'定期报告','F003N':v}
@@ -36,7 +36,7 @@ def test_original_share_counts_and_dated_option_exercise_must_match(monkeypatch)
     fin=SimpleNamespace(artifact_id='history',event_time=datetime(2015,8,12,tzinfo=timezone.utc),
         payload={'title':'半年度财务报告','content':history})
     docs={'coverage':notice,'financials':fin}
-    monkeypatch.setattr('src.stock_app.transfer_notice.read_disclosure_coverage',
+    monkeypatch.setattr('src.stock_app.corporate_action_notices.read_disclosure_coverage',
         lambda repo,ref,symbol,at:(None,None,None,[docs[ref]]))
     refs={'coverage_ref':'coverage','document_ref':'notice','exercise_coverage_ref':'financials','exercise_document_ref':'history'}
     dividend={'notice_date':date(2014,4,10),'record_date':date(2014,4,15),

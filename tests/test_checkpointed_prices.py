@@ -2,8 +2,7 @@ from datetime import date
 
 import pytest
 
-from src.stock_app.checkpointed_prices import CheckpointedEastmoneyReader
-from src.stock_app.eastmoney_prices import EastmoneyDailyReader
+from src.stock_app.eastmoney_prices import CheckpointedEastmoneyReader, EastmoneyDailyReader
 
 
 def test_successful_range_survives_later_failure_and_reopen(tmp_path, monkeypatch):

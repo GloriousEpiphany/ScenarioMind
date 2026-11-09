@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
-import re
 from urllib.parse import urlsplit, urlunsplit
 
 from .models import ExternalEvidenceDocument, ResearchSourceConfig
@@ -61,10 +60,6 @@ def make_evidence_id(source_id: str, title: str, url: str = "", guid: str = "", 
     identity = guid or normalize_url(url) or f"{title}|{published_at}"
     digest = hashlib.sha1(f"{source_id}|{identity}".encode("utf-8")).hexdigest()[:16]
     return f"external_{digest}"
-
-
-def tokenize(text: str) -> list[str]:
-    return [item.lower() for item in re.findall(r"[\w\u4e00-\u9fff]+", text or "") if len(item.strip()) >= 2]
 
 
 def keyword_overlap_score(text: str, keywords: list[str]) -> float:

@@ -7,7 +7,7 @@ import json
 import sqlite3
 from typing import Iterable
 
-from scenario_engine.errors import ContractViolation, DataConflict
+from scenario_engine.errors import ContractViolation, DataConflict, PointInTimeViolation
 from scenario_engine.sqlite_transactions import atomic_write, create_tables, read_snapshot
 
 from .contracts import (
@@ -194,20 +194,53 @@ class MarketArtifactRepository:
             artifact.frequency,
         )
 
-    def get_visible(self, artifact_id: str, as_of: datetime) -> MarketArtifact:
+    def get_visible(self, artifact_id: str, as_of: datetime, *, strict_pit: bool = False) -> MarketArtifact:
+        """Read publication-visible archives, or require actual system receipt.
+
+        Recorded-origin computations use strict_pit; archive reconstruction may
+        inspect records received later while retaining that separate provenance.
+        """
         row = self.connection.execute("SELECT * FROM market_artifacts WHERE artifact_id = ?", (artifact_id,)).fetchone()
         if row is None:
             from scenario_engine.errors import DataUnavailable
             raise DataUnavailable(f"referenced artifact does not exist: {artifact_id}")
         artifact = self._from_row(row)
         artifact.assert_visible(as_of)
+        if strict_pit and max(artifact.event_time, artifact.ingested_at) > as_of:
+            raise PointInTimeViolation('artifact observation or ingestion is after the cutoff',
+                                       context={'artifact_id': artifact_id})
         return artifact
 
-    def query(self, request: DataRequest, *, source_id: str | None = None) -> tuple[MarketArtifact, ...]:
+    def query(self, request: DataRequest, *, source_id: str | None = None,
+              latest_per_entity: bool = False,
+              artifact_ids: tuple[str, ...] | None = None) -> tuple[MarketArtifact, ...]:
         with read_snapshot(self.connection):
-            return self._query(request, source_id=source_id)
+            if artifact_ids is not None:
+                # Frozen manifests must use the same visibility and revision
+                # rules as a database query, without admitting later captures.
+                if not artifact_ids or len(set(artifact_ids)) != len(artifact_ids):
+                    raise ContractViolation('frozen artifact scope requires unique nonempty references')
+                artifacts = [self.get_visible(ref, request.known_at, strict_pit=request.strict_pit)
+                             for ref in artifact_ids]
+                for item in artifacts:
+                    if (item.domain != request.domain or item.dataset != request.dataset
+                            or item.entity_id not in request.entities
+                            or (source_id is not None and item.source_id != source_id)
+                            or (request.adjustment is not None and item.adjustment != request.adjustment)
+                            or (request.frequency is not None and item.frequency != request.frequency)):
+                        raise ContractViolation('frozen artifact violates the source plan')
+                    if not request.start <= item.event_time <= request.end:
+                        raise PointInTimeViolation('frozen artifact falls outside the visible request window',
+                                                   context={'artifact_id': item.artifact_id})
+                if latest_per_entity:
+                    newest = {}
+                    for item in artifacts:
+                        newest[item.entity_id] = max(newest.get(item.entity_id, item.event_time), item.event_time)
+                    artifacts = [item for item in artifacts if item.event_time == newest[item.entity_id]]
+                return self._resolve_revisions(artifacts, request.known_at)
+            return self._query(request, source_id=source_id, latest_per_entity=latest_per_entity)
 
-    def _query(self, request, *, source_id):
+    def _query(self, request, *, source_id, latest_per_entity=False):
         placeholders = ",".join("?" for _ in request.entities)
         clauses = [
             "domain = ?",
@@ -237,14 +270,29 @@ class MarketArtifactRepository:
         if request.frequency is not None:
             clauses.append("frequency = ?")
             params.append(request.frequency)
+        query = f"SELECT * FROM market_artifacts WHERE {' AND '.join(clauses)}"
+        if latest_per_entity:
+            # A current valuation needs only each entity's latest *visible*
+            # observation. Keep every source/revision there for reconciliation;
+            # conflicts in unrelated historical observations belong to history queries.
+            query = f"""WITH candidates AS ({query})
+                SELECT c.* FROM candidates c JOIN (
+                    SELECT entity_id, MAX(pit_utc(event_time)) AS latest
+                    FROM candidates GROUP BY entity_id
+                ) newest ON c.entity_id = newest.entity_id AND pit_utc(c.event_time) = newest.latest"""
         rows = self.connection.execute(
-            f"SELECT * FROM market_artifacts WHERE {' AND '.join(clauses)} ORDER BY pit_utc(event_time), pit_utc(known_at)",
-            tuple(params),
+            query + " ORDER BY pit_utc(event_time), pit_utc(known_at)", tuple(params)
         ).fetchall()
         artifacts = [self._from_row(row) for row in rows]
-        latest: dict[tuple[str, str, str, str | None, str | None], MarketArtifact] = {}
-        for artifact in artifacts:
-            artifact.assert_visible(request.known_at)
+        return self._resolve_revisions(artifacts, request.known_at)
+
+    def _resolve_revisions(self, artifacts, cutoff):
+        # Resolve each source's revisions before comparing sources. Otherwise
+        # an old reconciliation can discard a rival before a newer, unreviewed
+        # revision replaces the selected artifact.
+        by_observation = {}
+        for artifact in sorted(artifacts, key=lambda item: (item.event_time, item.known_at, item.artifact_id)):
+            artifact.assert_visible(cutoff)
             identity = (
                 artifact.dataset,
                 artifact.entity_id,
@@ -258,11 +306,8 @@ class MarketArtifactRepository:
                     ("event", "cctv_news"),
                 } else None,
             )
-            previous = latest.get(identity)
-            if previous is not None and artifact.source_id != previous.source_id:
-                resolved_id = self._resolved_cross_source(previous, artifact, request.known_at)
-                latest[identity] = previous if resolved_id == previous.artifact_id else artifact
-                continue
+            sources = by_observation.setdefault(identity, {})
+            previous = sources.get(artifact.source_id)
             if (
                 previous is not None
                 and artifact.known_at == previous.known_at
@@ -282,8 +327,22 @@ class MarketArtifactRepository:
                     f"same-source payload changed without a new revision_id: {artifact.artifact_id}"
                 )
             if previous is None or artifact.known_at > previous.known_at:
-                latest[identity] = artifact
-        return tuple(sorted(latest.values(), key=lambda item: (item.event_time, item.entity_id)))
+                sources[artifact.source_id] = artifact
+        selected = []
+        for sources in by_observation.values():
+            candidates = [sources[key] for key in sorted(sources)]
+            winner = candidates[0]
+            for candidate in candidates[1:]:
+                if self._resolved_cross_source(winner, candidate, cutoff) == candidate.artifact_id:
+                    winner = candidate
+            # A tournament alone can hide a contradictory or missing pair if
+            # a later winner replaces the artifact previously compared.
+            for candidate in candidates:
+                if candidate != winner and self._resolved_cross_source(winner, candidate, cutoff) != winner.artifact_id:
+                    raise DataConflict('cross-source reconciliations select inconsistent artifacts',
+                                       context={'left': winner.artifact_id, 'right': candidate.artifact_id})
+            selected.append(winner)
+        return tuple(sorted(selected, key=lambda item: (item.event_time, item.entity_id)))
 
     def record_reconciliation(
         self,
@@ -335,7 +394,8 @@ class MarketArtifactRepository:
 
     def _resolved_cross_source(self, left: MarketArtifact, right: MarketArtifact, as_of: datetime) -> str:
         if not self._has_reconciliation_receipts():
-            raise DataConflict("cross-source artifacts require an explicit resolved reconciliation with capture time")
+            raise DataConflict("cross-source artifacts require an explicit resolved reconciliation with capture time",
+                               context={"left": left.artifact_id, "right": right.artifact_id})
         rows = self.connection.execute(
             """
             SELECT status, resolved_artifact_id, pit_utc(captured_at) FROM artifact_reconciliations

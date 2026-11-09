@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from scenario_engine.data import AvailabilityStatus, DataRequest, TuShareAdapter
-from scenario_engine.llm import ScenarioLLMClient, ScenarioLLMUnavailable
+from scenario_engine.agents.scenario_client import ScenarioLLMClient, ScenarioLLMUnavailable
 from src.stock_app import scenario_data_prep, scenario_runtime
 
 
@@ -24,6 +24,20 @@ class _FakeCompletions:
 def _fake_openai_client(*responses):
     completions = _FakeCompletions(responses)
     return SimpleNamespace(chat=SimpleNamespace(completions=completions)), completions
+
+
+def test_relocated_scenario_client_still_loads_project_environment(monkeypatch):
+    from pathlib import Path
+    import dotenv
+    calls = []
+    for key in ('SCENARIO_LLM_API_KEY', 'QWEN_API_KEY', 'OPENAI_API_KEY'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(Path, 'exists', lambda path: path.name == '.env')
+    monkeypatch.setattr(dotenv, 'load_dotenv', lambda path, **kw: calls.append((path, kw)))
+    assert ScenarioLLMClient.from_environment() is None
+    root = Path(__file__).resolve().parents[1]
+    assert calls == [(root / '.env', {'override': False}),
+                     (root / 'Agents_Experience' / '.env', {'override': False})]
 
 
 def test_deepseek_structured_call_disables_thinking_and_retries_empty_content():

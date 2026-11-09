@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import asdict
 from typing import Any
 
-from scenario_engine.schemas import Evidence, PortfolioSnapshot, ScenarioSpec
+from scenario_engine.legacy.scenarios.schemas import Evidence, PortfolioSnapshot, ScenarioSpec
 from scenario_engine.errors import ContractViolation
 
 from .ai_filter import ScenarioEvidenceClassifier
